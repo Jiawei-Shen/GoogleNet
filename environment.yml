@@ -1,0 +1,11 @@
+name: googlenet_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pytorch
+  - torchvision
+  - numpy
+  - matplotlib
+  - pillow
