@@ -1,37 +1,33 @@
-# Base image with Miniconda and CUDA support
-FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
+# Use NVIDIA CUDA base image
+FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu20.04
 
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
-ENV CONDA_DIR=/opt/conda
-ENV PATH=$CONDA_DIR/bin:$PATH
-SHELL ["/bin/bash", "-c"]
+# Set environment variables to avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC \
+    PATH="/opt/conda/bin:$PATH"
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     wget \
     git \
     curl \
-    unzip \
+    ca-certificates \
+    libgl1-mesa-glx \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Miniconda
-RUN wget -O /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh && \
-    bash /tmp/miniconda.sh -b -p $CONDA_DIR && \
-    rm /tmp/miniconda.sh
+WORKDIR /opt
+RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh && \
+    bash miniconda.sh -b -p /opt/conda && \
+    rm miniconda.sh
 
-# Create and activate the Conda environment
+# Set the default shell to bash for Conda
+SHELL ["/bin/bash", "-c"]
+
+# Create and activate a minimal Conda environment with Python 3.8
 RUN conda create -n googlenet_env python=3.8 -y && \
-    conda init && \
-    echo "conda activate googlenet_env" >> ~/.bashrc
-
-# Set default shell
-SHELL ["conda", "run", "-n", "googlenet_env", "/bin/bash", "-c"]
-
-# Install Python dependencies
-COPY environment.yml /workspace/environment.yml
-RUN conda env update --name googlenet_env --file /workspace/environment.yml && conda clean --all -y
-
+    conda clean --all -y
+    
 # Set workspace as working directory
 WORKDIR /workspace
 
@@ -41,8 +37,12 @@ COPY . .
 # Ensure scripts are executable
 RUN chmod +x scripts/*.py
 
-# Install the project as an editable package
-RUN pip install -e .
+# Activate Conda environment and install dependencies via pip
+#COPY requirements.txt /workspace/requirements.txt
+RUN /opt/conda/envs/googlenet_env/bin/python -m pip install --no-cache-dir -r /workspace/requirements.txt
 
-# Set entry point for the container
-ENTRYPOINT ["/bin/bash"]
+# Set the container entrypoint to activate Conda environment
+#ENTRYPOINT ["/bin/bash", "-c", "cd /workspace/ && source /opt/conda/bin/activate googlenet_env && bash"]
+CMD ["/bin/bash"]
+
+

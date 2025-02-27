@@ -16,7 +16,7 @@ import os
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def train_model(data_path, num_epochs=10, learning_rate=0.001, batch_size=64):
+def train_model(data_path, output_path, num_epochs=10, learning_rate=0.001, batch_size=64):
     train_loader = get_data_loader(data_path, batch_size=batch_size, train=True)
     model = GoogLeNet(num_classes=len(train_loader.dataset.classes)).to(device)
 
@@ -39,8 +39,8 @@ def train_model(data_path, num_epochs=10, learning_rate=0.001, batch_size=64):
 
         print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {running_loss / len(train_loader)}")
 
-    os.makedirs("../models", exist_ok=True)
-    model_path = "../models/googlenet_imagenet.pth"
+    os.makedirs(f"{output_path}", exist_ok=True)
+    model_path = f"{output_path}/googlenet_imagenet.pth"
     torch.save(model.state_dict(), model_path)
     print(f"Training complete. Model saved at {model_path}")
 
@@ -48,9 +48,10 @@ def train_model(data_path, num_epochs=10, learning_rate=0.001, batch_size=64):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train GoogLeNet on ImageNet-1K")
     parser.add_argument("data_path", type=str, help="Path to the ImageNet-1K dataset")
+    parser.add_argument("-o", "--output_path", default="../models", type=str, help="Path to the output model")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
 
     args = parser.parse_args()
-    train_model(args.data_path, num_epochs=args.epochs, learning_rate=args.lr, batch_size=args.batch_size)
+    train_model(args.data_path, output_path=args.output_path, num_epochs=args.epochs, learning_rate=args.lr, batch_size=args.batch_size)
