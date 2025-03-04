@@ -93,9 +93,9 @@ def organize_dataset(input_dir, output_dir, train_ratio=0.7, val_ratio=0.15, inc
 
 
 if __name__ == "__main__":
-    input_dir = "/home/jiawei/Documents/Dockers/GoogleNet/data/output_pileups"  # Change this to your dataset directory
-    output_dir = "/home/jiawei/Documents/Dockers/GoogleNet/data/organized_pileups_dataset"
-    train_ratio = 0.7
+    input_dir = "/home/jiawei/PycharmProjects/TensorBuild/output_pileups_6channels"  # Change this to your dataset directory
+    output_dir = "/home/jiawei/Documents/Dockers/GoogleNet/data/organized_pileups_dataset_6channels"
+    train_ratio = 0.8
     val_ratio = 0.1
     include_png = True  # Set to False if you don’t need .png files
 

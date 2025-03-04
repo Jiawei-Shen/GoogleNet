@@ -11,7 +11,8 @@ from test import test_model
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from googlenet import GoogLeNet
-from dataset import get_data_loader
+from dataset_own_data_6channels import get_data_loader
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -24,8 +25,8 @@ def init_weights(m):
 
 
 def train_model(data_path, output_path, num_epochs=100, learning_rate=0.0001, batch_size=32, milestone=50):
-    train_loader, genotype_map = get_data_loader(data_path, batch_size=batch_size, train="train")
-    val_loader, _ = get_data_loader(data_path, batch_size=batch_size, train="val")
+    train_loader, genotype_map = get_data_loader(data_path, batch_size=batch_size, dataset_type="train")
+    val_loader, _ = get_data_loader(data_path, batch_size=batch_size, dataset_type="val")
     num_classes = len(genotype_map)
 
     model = GoogLeNet(num_classes=num_classes).to(device)
@@ -140,7 +141,7 @@ def evaluate_model(model, data_loader, criterion, genotype_map):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train GoogLeNet on custom pileup dataset")
     parser.add_argument("data_path", type=str, help="Path to the pileup dataset")
-    parser.add_argument("-o", "--output_path", default="../models", type=str, help="Path to save the model")
+    parser.add_argument("-o", "--output_path", default="../models_6channels", type=str, help="Path to save the model")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
