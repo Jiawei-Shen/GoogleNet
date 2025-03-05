@@ -2,6 +2,7 @@ import os
 import shutil
 import random
 import json
+import argparse
 
 
 def organize_dataset(input_dir, output_dir, train_ratio=0.7, val_ratio=0.15, include_png=False):
@@ -10,11 +11,10 @@ def organize_dataset(input_dir, output_dir, train_ratio=0.7, val_ratio=0.15, inc
 
     :param input_dir: Directory containing the dataset files.
     :param output_dir: Directory where the organized dataset will be saved.
-    :param train_ratio: Proportion of data to use for training (default: 0.7).
-    :param val_ratio: Proportion of data to use for validation (default: 0.15).
-    :param include_png: Whether to include corresponding .png files (default: False).
+    :param train_ratio: Proportion of data to use for training.
+    :param val_ratio: Proportion of data to use for validation.
+    :param include_png: Whether to include corresponding .png files.
     """
-    # Ensure sum of ratios is not greater than 1
     test_ratio = 1.0 - (train_ratio + val_ratio)
     assert test_ratio >= 0, "Invalid split ratios! Ensure train + val <= 1.0"
 
@@ -34,10 +34,8 @@ def organize_dataset(input_dir, output_dir, train_ratio=0.7, val_ratio=0.15, inc
     for file in files:
         parts = file.split("_")
         genotype = parts[-1].replace(".npy", "")  # Extract GT info (e.g., GT0|1)
-
         if genotype not in genotype_samples:
             genotype_samples[genotype] = []
-
         genotype_samples[genotype].append(file)
 
     # Split data into train, val, and test
@@ -93,10 +91,16 @@ def organize_dataset(input_dir, output_dir, train_ratio=0.7, val_ratio=0.15, inc
 
 
 if __name__ == "__main__":
-    input_dir = "/home/jiawei/PycharmProjects/TensorBuild/output_pileups_6channels"  # Change this to your dataset directory
-    output_dir = "/home/jiawei/Documents/Dockers/GoogleNet/data/organized_pileups_dataset_6channels"
-    train_ratio = 0.8
-    val_ratio = 0.1
-    include_png = True  # Set to False if you don’t need .png files
+    parser = argparse.ArgumentParser(description="Organize dataset into train, val, and test directories.")
+    parser.add_argument("input_dir", type=str, help="Path to the input directory containing .npy files.")
+    parser.add_argument("output_dir", type=str,
+                        help="Path to the output directory where organized dataset will be saved.")
+    parser.add_argument("--train_ratio", type=float, default=0.7, help="Proportion of data for training (default: 0.7)")
+    parser.add_argument("--val_ratio", type=float, default=0.15,
+                        help="Proportion of data for validation (default: 0.15)")
+    parser.add_argument("--include_png", action="store_true",
+                        help="Include .png files corresponding to .npy files (default: False)")
 
-    organize_dataset(input_dir, output_dir, train_ratio, val_ratio, include_png)
+    args = parser.parse_args()
+
+    organize_dataset(args.input_dir, args.output_dir, args.train_ratio, args.val_ratio, args.include_png)
