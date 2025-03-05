@@ -101,6 +101,9 @@ if __name__ == "__main__":
     parser.add_argument("--include_png", action="store_true",
                         help="Include .png files corresponding to .npy files (default: False)")
 
+    # input_dir = "/home/jiawei/PycharmProjects/TensorBuild/output_pileups_6channels"  # Change this to your dataset directory
+    # output_dir = "/home/jiawei/Documents/Dockers/GoogleNet/data/organized_pileups_dataset_6channels"
+
     args = parser.parse_args()
 
     organize_dataset(args.input_dir, args.output_dir, args.train_ratio, args.val_ratio, args.include_png)

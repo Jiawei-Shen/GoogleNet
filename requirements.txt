@@ -4,5 +4,6 @@ torchvision==0.16.0+cu121
 numpy
 matplotlib
 pillow
+tqdm
 timm==0.5.4
 -f https://download.pytorch.org/whl/torch_stable.html
