@@ -13,7 +13,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from googlenet import GoogLeNet
 from dataset_own_data_6channels import get_data_loader
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -24,20 +23,39 @@ def init_weights(m):
             nn.init.constant_(m.bias, 0)
 
 
-def train_model(data_path, output_path, num_epochs=100, learning_rate=0.0001, batch_size=32, milestone=50):
+def train_model(data_path, output_path, num_epochs=100, learning_rate=0.0001, batch_size=32, milestone=50, resume=None):
     train_loader, genotype_map = get_data_loader(data_path, batch_size=batch_size, dataset_type="train")
     val_loader, _ = get_data_loader(data_path, batch_size=batch_size, dataset_type="val")
     num_classes = len(genotype_map)
 
     model = GoogLeNet(num_classes=num_classes).to(device)
-    model.apply(init_weights)  # Apply to entire model
-    criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.CrossEntropyLoss()
+
+    start_epoch = 0  # Track where to resume
+
+    # 🔹 Resume training from checkpoint if provided
+    if resume:
+        if os.path.exists(resume):
+            print(f"Resuming training from checkpoint: {resume}")
+            checkpoint = torch.load(resume, map_location=device, weights_only=False)
+
+            # 🔹 Ensure the checkpoint contains the expected keys
+            if "model_state" in checkpoint and "optimizer_state" in checkpoint and "epoch" in checkpoint:
+                model.load_state_dict(checkpoint["model_state"])
+                optimizer.load_state_dict(checkpoint["optimizer_state"])
+                start_epoch = checkpoint["epoch"]  # Resume from saved epoch
+            else:
+                print("Invalid checkpoint format. Starting training from scratch.")
+        else:
+            print(f"Checkpoint {resume} not found. Starting from scratch.")
+    else:
+        model.apply(init_weights)  # Apply weight initialization only if not resuming
 
     print(f"Using device: {device}")
     os.makedirs(output_path, exist_ok=True)
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):  # Start from checkpoint epoch
         model.train()
         running_loss = 0.0
         correct = 0
@@ -53,10 +71,9 @@ def train_model(data_path, output_path, num_epochs=100, learning_rate=0.0001, ba
 
             optimizer.zero_grad()
             outputs = model(images)
-            # If the model returns a tuple (i.e., contains auxiliary outputs), extract the main output
-            if isinstance(outputs, tuple):
-                outputs, aux1, aux2 = outputs  # Extracting main output and auxiliary outputs
-            loss = criterion(outputs, labels)  # Compute loss only on the main output
+            if isinstance(outputs, tuple):  # Handle auxiliary outputs
+                outputs = outputs[0]
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
 
@@ -85,15 +102,21 @@ def train_model(data_path, output_path, num_epochs=100, learning_rate=0.0001, ba
         print(f"Epoch {epoch + 1}/{num_epochs} - Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%, "
               f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_acc:.2f}%\n")
 
+        # 🔹 Save checkpoint every milestone epochs
         if (epoch + 1) % milestone == 0:
-            milestone_path = os.path.join(output_path, f"googlenet_epoch_{epoch + 1}.pth")
-            torch.save(model.state_dict(), milestone_path)
-            print(f"Milestone model saved at {milestone_path}")
+            checkpoint_path = os.path.join(output_path, f"googlenet_epoch_{epoch + 1}.pth")
+            torch.save({
+                "epoch": epoch + 1,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+            }, checkpoint_path)
+            print(f"Checkpoint saved at {checkpoint_path}")
 
             # Run test_model function from test.py
             print("Running test_model on milestone model...")
-            test_model("/home/jiawei/Documents/Dockers/GoogleNet/data/organized_pileups_dataset")
+            test_model(data_path, checkpoint_path)
 
+    # 🔹 Save final model
     final_model_path = os.path.join(output_path, "googlenet_final.pth")
     torch.save(model.state_dict(), final_model_path)
     print(f"Training complete. Final model saved at {final_model_path}")
@@ -111,6 +134,8 @@ def evaluate_model(model, data_loader, criterion, genotype_map):
         for images, labels in data_loader:
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]  # Extract main output
             loss = criterion(outputs, labels)
 
             running_loss += loss.item()
@@ -145,7 +170,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--milestone", type=int, default=30, help="Save model every N epochs")
+    parser.add_argument("--milestone", type=int, default=25, help="Save model every N epochs")
+    parser.add_argument("--resume", type=str, default=None, help="Path to resume training from a checkpoint")
 
     args = parser.parse_args()
-    train_model(args.data_path, args.output_path, args.epochs, args.lr, args.batch_size, args.milestone)
+    train_model(args.data_path, args.output_path, args.epochs, args.lr, args.batch_size, args.milestone, args.resume)

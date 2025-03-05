@@ -1,12 +1,15 @@
 import torch
 import torch.nn as nn
+import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from googlenet import GoogLeNet
 from dataset import get_data_loader
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def test_model(data_path):
+def test_model(data_path, model_path="/home/jiawei/Documents/Dockers/GoogleNet/models/googlenet_pileup.pth"):
     # Load test dataset and class mapping
     test_loader, genotype_map = get_data_loader(data_path, batch_size=32, train="test")
 
@@ -15,7 +18,7 @@ def test_model(data_path):
 
     # Initialize GoogLeNet
     model = GoogLeNet(num_classes=len(class_names)).to(device)
-    model.load_state_dict(torch.load("/home/jiawei/Documents/Dockers/GoogleNet/models/googlenet_pileup.pth"))
+    model.load_state_dict(torch.load(model_path))
     model.eval()
 
     # Overall test accuracy tracking

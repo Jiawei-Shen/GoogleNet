@@ -91,7 +91,7 @@ def train_model(data_path, output_path, num_epochs=100, learning_rate=0.0001, ba
 
             # Run test_model function from test.py
             print("Running test_model on milestone model...")
-            test_model("/home/jiawei/Documents/Dockers/GoogleNet/data/organized_pileups_dataset")
+            test_model(data_path, milestone_path)
 
     final_model_path = os.path.join(output_path, "googlenet_final.pth")
     torch.save(model.state_dict(), final_model_path)
