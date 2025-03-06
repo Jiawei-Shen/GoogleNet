@@ -11,7 +11,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def test_model(data_path, model_path="/home/jiawei/Documents/Dockers/GoogleNet/models/googlenet_pileup.pth", dataloader="default"):
     # Load test dataset and class mapping
-    test_loader, genotype_map = get_data_loader(data_path, batch_size=32, train="test")
+    test_loader, genotype_map = get_data_loader(data_path, dataset_type="test", batch_size=32)
 
     # Get class names from dataset
     class_names = list(genotype_map.keys())  # Assuming genotype_map is a dictionary of class labels
