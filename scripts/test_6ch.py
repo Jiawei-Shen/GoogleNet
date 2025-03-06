@@ -4,7 +4,7 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from googlenet import GoogLeNet
-from dataset import get_data_loader
+from dataset_own_data_6channels import get_data_loader
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

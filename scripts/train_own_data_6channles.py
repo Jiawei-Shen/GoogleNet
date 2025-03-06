@@ -7,7 +7,7 @@ import os
 from tqdm import tqdm
 from collections import defaultdict
 import subprocess
-from test import test_model
+from test_6ch import test_model
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from googlenet import GoogLeNet
@@ -166,11 +166,11 @@ def evaluate_model(model, data_loader, criterion, genotype_map):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train GoogLeNet on custom pileup dataset")
     parser.add_argument("data_path", type=str, help="Path to the pileup dataset")
-    parser.add_argument("-o", "--output_path", default="../models_6channels", type=str, help="Path to save the model")
+    parser.add_argument("-o", "--output_path", default="./models_6channels", type=str, help="Path to save the model")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--milestone", type=int, default=25, help="Save model every N epochs")
+    parser.add_argument("--milestone", type=int, default=50, help="Save model every N epochs")
     parser.add_argument("--resume", type=str, default=None, help="Path to resume training from a checkpoint")
 
     args = parser.parse_args()
