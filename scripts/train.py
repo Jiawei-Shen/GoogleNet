@@ -7,9 +7,7 @@ import os
 
 # Add the root directory to Python's module search path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from googlenet import GoogLeNet  # Now it should work
-
 from dataset import get_data_loader
 import os
 

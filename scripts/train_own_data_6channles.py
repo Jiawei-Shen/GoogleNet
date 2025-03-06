@@ -114,7 +114,7 @@ def train_model(data_path, output_path, num_epochs=100, learning_rate=0.0001, ba
 
             # Run test_model function from test.py
             print("Running test_model on milestone model...")
-            test_model(data_path, checkpoint_path)
+            test_model(data_path, checkpoint_path, dataloader="6ch")
 
     # 🔹 Save final model
     final_model_path = os.path.join(output_path, "googlenet_final.pth")

@@ -1,9 +1,9 @@
-pip
+-f https://download.pytorch.org/whl/torch_stable.html
+
 torch==2.1.0+cu121
 torchvision==0.16.0+cu121
 numpy
 matplotlib
 pillow
-tqdm
 timm==0.5.4
--f https://download.pytorch.org/whl/torch_stable.html
+tqdm

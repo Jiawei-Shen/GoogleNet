@@ -32,17 +32,15 @@ RUN conda create -n googlenet_env python=3.8 -y && \
 WORKDIR /workspace
 
 # Copy project files into the container
-COPY . .
-
-# Ensure scripts are executable
-RUN chmod +x scripts/*.py
+# COPY . .
+COPY requirements.txt /workspace/requirements.txt
 
 # Activate Conda environment and install dependencies via pip
 #COPY requirements.txt /workspace/requirements.txt
-RUN /opt/conda/envs/googlenet_env/bin/python -m pip install --no-cache-dir -r /workspace/requirements.txt
+RUN conda run -n googlenet_env pip install --no-cache-dir -r /workspace/requirements.txt
 
 # Set the container entrypoint to activate Conda environment
-#ENTRYPOINT ["/bin/bash", "-c", "cd /workspace/ && source /opt/conda/bin/activate googlenet_env && bash"]
-CMD ["/bin/bash"]
+ENTRYPOINT ["/bin/bash", "-c", "cd /workspace/ && source /opt/conda/bin/activate googlenet_env && bash"]
+# CMD ["/bin/bash"]
 
 
