@@ -56,11 +56,11 @@ class AuxiliaryClassifier(nn.Module):
 
 
 class GoogLeNet(nn.Module):
-    def __init__(self, num_classes=1000, aux_logits=True):
+    def __init__(self, num_classes=1000, aux_logits=True, in_channels=3):
         super(GoogLeNet, self).__init__()
         self.aux_logits = aux_logits
 
-        self.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3)
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3)
         self.maxpool1 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.conv2 = nn.Conv2d(64, 64, kernel_size=1)
         self.conv3 = nn.Conv2d(64, 192, kernel_size=3, padding=1)
@@ -124,5 +124,5 @@ class GoogLeNet(nn.Module):
 
 
 if __name__ == "__main__":
-    model = GoogLeNet(num_classes=10, aux_logits=False)
+    model = GoogLeNet(num_classes=2, aux_logits=False, in_channels=3)
     print(model)

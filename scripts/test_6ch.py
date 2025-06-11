@@ -11,7 +11,7 @@ from dataset_own_data_6channels import get_data_loader
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def test_model(data_path, model_path="/home/jiawei/Documents/Dockers/GoogleNet/models/googlenet_pileup.pth",
+def test_model(data_path, model_path="/home/jiawei/Documents/Dockers/GoogleNet/saved_models/googlenet_pileup.pth",
                dataloader="default"):
     # Load test dataset and class mapping
     test_loader, genotype_map = get_data_loader(data_path, dataset_type="test", batch_size=32)

@@ -13,4 +13,4 @@ dependencies:
   - numpy
   - matplotlib
   - pillow
-  - timm=0.5.4  # Added for Transformer models in PyTorch
+  - timm=0.5.4  # Added for Transformer saved_models in PyTorch

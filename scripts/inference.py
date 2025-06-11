@@ -8,7 +8,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def predict(image_path, class_labels):
     model = GoogLeNet(num_classes=len(class_labels)).to(device)
-    model.load_state_dict(torch.load("../models/googlenet_imagenet.pth"))
+    model.load_state_dict(torch.load("../saved_models/googlenet_imagenet.pth"))
     model.eval()
 
     transform = transforms.Compose([
