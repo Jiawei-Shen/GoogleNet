@@ -91,7 +91,8 @@ class ConvNeXtBlock(nn.Module):
         if in_channels == out_channels:
             self.proj = nn.Identity()
         else:
-            self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+            self.proj = nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size=1),
+                                      nn.GELU())
 
     def forward(self, x):
         shortcut = x  # save for shortcut
@@ -104,9 +105,9 @@ class ConvNeXtBlock(nn.Module):
         x = self.pwconv2(x)
         x = x.permute(0, 3, 1, 2)  # shape now [B, out_channels, H, W]
 
-        # x = self.cbam(x)
+        x = self.cbam(x)
 
-        # shortcut = self.proj(shortcut)  # match to out_channels
+        shortcut = self.proj(shortcut)  # match to out_channels
         return self.act(shortcut + x)
 
 
@@ -127,11 +128,11 @@ class ConvNeXtCBAMClassifier(nn.Module):
             nn.GELU()
         )
 
-        self.stage1 = nn.Sequential(*[ConvNeXtBlock(64, 64) for _ in range(4)])
+        self.stage1 = nn.Sequential(*[ConvNeXtBlock(64, 64) for _ in range(1)])
         self.down1 = DownsampleLayer(64, 128)
-        self.stage2 = nn.Sequential(*[ConvNeXtBlock(128, 128) for _ in range(4)])
+        self.stage2 = nn.Sequential(*[ConvNeXtBlock(128, 128) for _ in range(2)])
         self.down2 = DownsampleLayer(128, 256)
-        self.stage3 = nn.Sequential(*[ConvNeXtBlock(256, 256) for _ in range(4)])
+        self.stage3 = nn.Sequential(*[ConvNeXtBlock(256, 256) for _ in range(3)])
         self.down3 = DownsampleLayer(256, 512)
         self.stage4 = nn.Sequential(*[ConvNeXtBlock(512, 512) for _ in range(4)])
 

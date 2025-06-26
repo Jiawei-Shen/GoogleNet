@@ -74,7 +74,7 @@ def train_model(data_path, output_path, num_epochs=100, learning_rate=0.0001,
     sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
 
     # model = GoogLeNet(num_classes=num_classes, in_channels=4).to(device)
-    model = ConvNeXtCBAMClassifier(in_channels=4, class_num=num_classes).to(device)
+    model = ConvNeXtCBAMClassifier(in_channels=3, class_num=num_classes).to(device)
 
     model.apply(init_weights)
     criterion = nn.CrossEntropyLoss()
