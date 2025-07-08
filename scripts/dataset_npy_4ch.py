@@ -8,7 +8,8 @@ import numpy as np
 class NpyDataset(Dataset):
     """
     Custom PyTorch Dataset to load 4-channel .npy files.
-    Assumes .npy files are loaded with shape (4, Height, Width), e.g., (4, 201, 100).
+    Accepts .npy files with shapes (4, H, W) or (H, W, 4).
+    Files with shape (H, W, 4) will be automatically transposed to (4, H, W).
     """
 
     def __init__(self, root_dir, transform=None):
@@ -54,8 +55,17 @@ class NpyDataset(Dataset):
         if not isinstance(image_np, np.ndarray):
             raise TypeError(f"File {file_path} did not load as a NumPy array (loaded type: {type(image_np)}).")
 
+        # MODIFIED: Check for (H, W, C) format and transpose it to (C, H, W)
+        if image_np.ndim == 3 and image_np.shape[-1] == 4:
+            # Transpose from (H, W, 4) to (4, H, W)
+            image_np = image_np.transpose((2, 0, 1))
+
+        # Final validation to ensure the shape is now (4, H, W)
         if image_np.ndim != 3 or image_np.shape[0] != 4:
-            raise ValueError(f"Loaded .npy file {file_path} has unexpected shape {image_np.shape}. Expected (4, H, W), e.g., (4, 201, 100).")
+            raise ValueError(
+                f"Loaded .npy file {file_path} has an unsupported shape {image_np.shape}. "
+                f"Expected shape is (4, H, W) or (H, W, 4)."
+            )
 
         image_tensor = torch.from_numpy(image_np.copy()).float()
         if self.transform:
@@ -63,53 +73,41 @@ class NpyDataset(Dataset):
         return image_tensor, label
 
 
-# MODIFIED: Added 'shuffle' parameter with a default
 def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=4, shuffle: bool = False):
     """
     Load dataset from the given path using NpyDataset.
     Returns a DataLoader and a class-to-index mapping.
-
-    :param data_dir: Path to the dataset directory (should contain "train", "val", "test")
-    :param dataset_type: One of "train", "val", or "test"
-    :param batch_size: Batch size for the DataLoader
-    :param num_workers: Number of worker processes for data loading
-    :param shuffle: Whether to shuffle the data. Typically True for training, False for val/test.
-                    Default is False, expecting the caller (e.g., training script) to specify.
-    :return: DataLoader and class-to-index mapping
     """
     dataset_path = os.path.join(data_dir, dataset_type)
 
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
 
-    # Define a transform. For .npy files that are already tensors or tensor-like,
-    # ensure they are float tensors before normalization.
-    # Normalization values should be specific to your dataset's statistics.
     transform = transforms.Compose([
         transforms.Normalize(mean=[1.8503281380292511, -1.487870932531317, -0.5408549062596621, 47.234985618049116],
-                             std=[2.4918272597486815, 2.754400126426803, 0.541133137335665, 24.340171339993212])  # Normalize all 4 channels
+                             std=[2.4918272597486815, 2.754400126426803, 0.541133137335665, 24.340171339993212])
     ])
 
     dataset = NpyDataset(root_dir=dataset_path, transform=transform)
-
-    # Use the passed 'shuffle' parameter directly.
-    # The previous internal logic `shuffle_internal = dataset_type == "train"` is now handled by the caller.
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
 
     return loader, dataset.class_to_idx
 
 
 if __name__ == "__main__":
-    data_root = "/path/to/your_4channel_dataset"  # <<< UPDATE THIS PATH!
+    # --- IMPORTANT ---
+    # Update this path to the root directory containing your 'train', 'val', and 'test' folders.
+    data_root = "/path/to/your_4channel_dataset"
+    # --- IMPORTANT ---
+
     batch_size = 16
     num_workers = 0
 
     if data_root == "/path/to/your_4channel_dataset":
-        print("Please update the 'data_root' variable in the script to your dataset's actual path.")
+        print("🛑 Please update the 'data_root' variable in the script to your dataset's actual path.")
     else:
         try:
             print(f"\n--- Loading Training Data (Batch Size: {batch_size}) ---")
-            # MODIFIED: Explicitly passing shuffle=True for the training example
             train_loader, class_map = get_data_loader(
                 data_dir=data_root,
                 dataset_type="train",
@@ -117,19 +115,19 @@ if __name__ == "__main__":
                 num_workers=num_workers,
                 shuffle=True
             )
-            print(f"Loaded {len(train_loader.dataset)} training samples from {os.path.join(data_root, 'train')}.")
+            print(f"✅ Loaded {len(train_loader.dataset)} training samples from {os.path.join(data_root, 'train')}.")
             print(f"Class-to-index mapping: {class_map}")
 
             print("\n--- Checking a few training batches ---")
             for i, (data, labels) in enumerate(train_loader):
-                print(f"Batch {i + 1}: Data shape: {data.shape}, Labels: {labels[:5]}...") # Print first 5 labels
+                # Now data.shape will be [batch_size, 4, H, W]
+                print(f"Batch {i + 1}: Data shape: {data.shape}, Labels: {labels[:5]}...")
                 if i >= 2:
                     break
-            if not train_loader: # Simplified check
-                 print("Train loader is empty.")
+            if not train_loader:
+                print("Train loader is empty.")
 
             print(f"\n--- Loading Validation Data (Batch Size: {batch_size}) ---")
-            # MODIFIED: Explicitly passing shuffle=False for the validation example
             val_loader, _ = get_data_loader(
                 data_dir=data_root,
                 dataset_type="val",
@@ -137,15 +135,14 @@ if __name__ == "__main__":
                 num_workers=num_workers,
                 shuffle=False
             )
-            print(f"Loaded {len(val_loader.dataset)} validation samples from {os.path.join(data_root, 'val')}.")
-            if val_loader and len(val_loader) > 0: # Check if loader is not None and has items
+            print(f"✅ Loaded {len(val_loader.dataset)} validation samples from {os.path.join(data_root, 'val')}.")
+            if val_loader and len(val_loader) > 0:
                 val_data_sample, _ = next(iter(val_loader))
                 print(f"  Sample validation data batch shape: {val_data_sample.shape}")
             else:
                 print("Validation loader is empty or could not be iterated.")
 
             print(f"\n--- Loading Test Data (Batch Size: {batch_size}) ---")
-            # MODIFIED: Explicitly passing shuffle=False for the test example
             test_loader, _ = get_data_loader(
                 data_dir=data_root,
                 dataset_type="test",
@@ -153,8 +150,8 @@ if __name__ == "__main__":
                 num_workers=num_workers,
                 shuffle=False
             )
-            print(f"Loaded {len(test_loader.dataset)} test samples from {os.path.join(data_root, 'test')}.")
-            if test_loader and len(test_loader) > 0: # Check if loader is not None and has items
+            print(f"✅ Loaded {len(test_loader.dataset)} test samples from {os.path.join(data_root, 'test')}.")
+            if test_loader and len(test_loader) > 0:
                 test_data_sample, _ = next(iter(test_loader))
                 print(f"  Sample test data batch shape: {test_data_sample.shape}")
             else:
