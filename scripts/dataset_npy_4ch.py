@@ -73,7 +73,7 @@ class NpyDataset(Dataset):
         return image_tensor, label
 
 
-def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=4, shuffle: bool = False):
+def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=8, shuffle: bool = False):
     """
     Load dataset from the given path using NpyDataset.
     Returns a DataLoader and a class-to-index mapping.

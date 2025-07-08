@@ -74,7 +74,7 @@ def train_model(data_path, output_path, num_epochs=100, learning_rate=0.0001,
     sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
 
     # model = GoogLeNet(num_classes=num_classes, in_channels=4).to(device)
-    model = ConvNeXtCBAMClassifier(in_channels=3, class_num=num_classes).to(device)
+    model = ConvNeXtCBAMClassifier(in_channels=4, class_num=num_classes).to(device)
 
     model.apply(init_weights)
     criterion = nn.CrossEntropyLoss()
@@ -267,8 +267,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.001, help="Initial learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=4,
-                        help="Number of worker processes for data loading (default: 4)")
+    parser.add_argument("--num_workers", type=int, default=8,
+                        help="Number of worker processes for data loading (default: 8)")
     parser.add_argument("--milestone", type=int, default=50,
                         help="Save model checkpoint every N epochs (milestone)")
     parser.add_argument("--lr_decay_epochs", type=int, default=10,
