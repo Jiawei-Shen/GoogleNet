@@ -77,7 +77,12 @@ def train_model(data_path, output_path, num_epochs=100, learning_rate=0.0001,
     model = ConvNeXtCBAMClassifier(in_channels=4, class_num=num_classes).to(device)
 
     model.apply(init_weights)
-    criterion = nn.CrossEntropyLoss()
+    false_count = 78736
+    true_count = 268
+
+    weight = torch.tensor([1.0, false_count / true_count])  # 即 [1.0, 294]
+    weight = weight.to(device)
+    criterion = nn.CrossEntropyLoss(weight=weight)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = StepLR(optimizer, step_size=lr_scheduler_step_size, gamma=lr_scheduler_gamma)
 
