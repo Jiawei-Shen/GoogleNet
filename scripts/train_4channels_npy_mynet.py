@@ -77,7 +77,7 @@ def train_model(data_path, output_path, num_epochs=100, learning_rate=0.0001,
     model = ConvNeXtCBAMClassifier(in_channels=4, class_num=num_classes).to(device)
 
     model.apply(init_weights)
-    false_count = 78736
+    false_count = 48736
     true_count = 268
 
     weight = torch.tensor([1.0, false_count / true_count])  # 即 [1.0, 294]
