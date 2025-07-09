@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from timm.models.layers import trunc_normal_, DropPath
 
 
 def same_padding_conv(in_channels, out_channels, kernel_size, stride=1, groups=1):
@@ -77,7 +78,7 @@ class MultiGate(nn.Module):
 
 
 class ConvNeXtBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, drop_path):
         super().__init__()
         self.dwconv = same_padding_conv(in_channels, in_channels, kernel_size=(7, 5), stride=1, groups=in_channels)
         self.norm = nn.LayerNorm(in_channels)
@@ -87,6 +88,7 @@ class ConvNeXtBlock(nn.Module):
         self.pwconv2 = nn.Linear(4 * in_channels, out_channels)
         self.cbam = CBAM(out_channels)
         # self.gate = MultiGate(out_channels)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         if in_channels == out_channels:
             self.proj = nn.Identity()
@@ -141,6 +143,11 @@ class ConvNeXtCBAMClassifier(nn.Module):
 
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.head = nn.Linear(512, class_num)
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            trunc_normal_(m.weight, std=.02)
+            nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         x = self.stem(x)
