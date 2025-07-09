@@ -117,8 +117,8 @@ class DownsampleLayer(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.downsample = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=2, stride=2),
-            nn.LayerNorm(out_channels),  # Normalize after Conv
+            nn.LayerNorm(in_channels),
+            nn.Conv2d(in_channels, out_channels, kernel_size=2, stride=2),  # Normalize after Conv
             nn.GELU()          # Non-linearity
         )
 
@@ -130,6 +130,7 @@ class ConvNeXtCBAMClassifier(nn.Module):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, 64, kernel_size=4, stride=4),
+            nn.LayerNorm(64),
             nn.GELU()
         )
 
