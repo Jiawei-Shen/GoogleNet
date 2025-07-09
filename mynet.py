@@ -157,7 +157,7 @@ class ConvNeXtCBAMClassifier(nn.Module):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, 64, kernel_size=4, stride=4),
-            LayerNorm(eps=1e-6, data_format="channels_first"),
+            LayerNorm(64, eps=1e-6, data_format="channels_first"),
             nn.GELU()
         )
 
