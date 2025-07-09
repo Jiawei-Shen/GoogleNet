@@ -79,7 +79,7 @@ class MultiGate(nn.Module):
 class ConvNeXtBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.dwconv = same_padding_conv(in_channels, in_channels, kernel_size=(7, 3), stride=1, groups=in_channels)
+        self.dwconv = same_padding_conv(in_channels, in_channels, kernel_size=(7, 5), stride=1, groups=in_channels)
         self.norm = nn.LayerNorm(in_channels)
         self.pwconv1 = nn.Linear(in_channels, 4 * in_channels)
         self.act = nn.GELU()
@@ -114,11 +114,14 @@ class ConvNeXtBlock(nn.Module):
 class DownsampleLayer(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=2, stride=2),
+            nn.LayerNorm(out_channels),  # Normalize after Conv
+            nn.GELU()          # Non-linearity
+        )
 
     def forward(self, x):
-        return self.conv(x)
-
+        return self.downsample(x)
 
 class ConvNeXtCBAMClassifier(nn.Module):
     def __init__(self, in_channels=4, class_num=2):
@@ -128,11 +131,11 @@ class ConvNeXtCBAMClassifier(nn.Module):
             nn.GELU()
         )
 
-        self.stage1 = nn.Sequential(*[ConvNeXtBlock(64, 64) for _ in range(1)])
+        self.stage1 = nn.Sequential(*[ConvNeXtBlock(64, 64) for _ in range(4)])
         self.down1 = DownsampleLayer(64, 128)
-        self.stage2 = nn.Sequential(*[ConvNeXtBlock(128, 128) for _ in range(2)])
+        self.stage2 = nn.Sequential(*[ConvNeXtBlock(128, 128) for _ in range(4)])
         self.down2 = DownsampleLayer(128, 256)
-        self.stage3 = nn.Sequential(*[ConvNeXtBlock(256, 256) for _ in range(3)])
+        self.stage3 = nn.Sequential(*[ConvNeXtBlock(256, 256) for _ in range(4)])
         self.down3 = DownsampleLayer(256, 512)
         self.stage4 = nn.Sequential(*[ConvNeXtBlock(512, 512) for _ in range(4)])
 
