@@ -12,9 +12,11 @@ class NpyDataset(Dataset):
     Files with shape (H, W, 4) will be automatically transposed to (4, H, W).
     """
 
-    def __init__(self, root_dir, transform=None):
+    def __init__(self, root_dir, transform=None, return_paths=False):
         self.root_dir = os.path.expanduser(root_dir)
         self.transform = transform
+        # --- MODIFIED: Added return_paths handling ---
+        self.return_paths = return_paths
         self.samples = []
         self.classes = []
         self.class_to_idx = {}
@@ -55,12 +57,9 @@ class NpyDataset(Dataset):
         if not isinstance(image_np, np.ndarray):
             raise TypeError(f"File {file_path} did not load as a NumPy array (loaded type: {type(image_np)}).")
 
-        # MODIFIED: Check for (H, W, C) format and transpose it to (C, H, W)
         if image_np.ndim == 3 and image_np.shape[-1] == 4:
-            # Transpose from (H, W, 4) to (4, H, W)
             image_np = image_np.transpose((2, 0, 1))
 
-        # Final validation to ensure the shape is now (4, H, W)
         if image_np.ndim != 3 or image_np.shape[0] != 4:
             raise ValueError(
                 f"Loaded .npy file {file_path} has an unsupported shape {image_np.shape}. "
@@ -70,10 +69,17 @@ class NpyDataset(Dataset):
         image_tensor = torch.from_numpy(image_np.copy()).float()
         if self.transform:
             image_tensor = self.transform(image_tensor)
-        return image_tensor, label
+
+        # --- MODIFIED: Return path if requested ---
+        if self.return_paths:
+            return image_tensor, label, file_path
+        else:
+            return image_tensor, label
 
 
-def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=8, shuffle: bool = False):
+# --- NEW: Updated get_data_loader function from user ---
+def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=8, shuffle: bool = False,
+                    return_paths: bool = False):
     """
     Load dataset from the given path using NpyDataset.
     Returns a DataLoader and a class-to-index mapping.
@@ -88,11 +94,11 @@ def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=8, shuffl
                              std=[2.4918272597486815, 2.754400126426803, 0.541133137335665, 24.340171339993212])
     ])
 
-    dataset = NpyDataset(root_dir=dataset_path, transform=transform)
+    # --- MODIFIED: Pass return_paths flag to the dataset ---
+    dataset = NpyDataset(root_dir=dataset_path, transform=transform, return_paths=return_paths)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
 
     return loader, dataset.class_to_idx
-
 
 if __name__ == "__main__":
     # --- IMPORTANT ---
