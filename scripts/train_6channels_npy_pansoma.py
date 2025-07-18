@@ -3,21 +3,45 @@ import argparse
 import torch
 import torch.optim as optim
 import torch.nn as nn
+import torch.nn.functional as F
 import sys
 import os
 from tqdm import tqdm
 from collections import defaultdict
 import json
 
-# Import StepLR for learning rate scheduling
 from torch.optim.lr_scheduler import StepLR
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-# from googlenet import GoogLeNet
 from mynet import ConvNeXtCBAMClassifier
 from dataset_pansoma_npy_6ch import get_data_loader  # Using 6-channel dataloader
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class BinaryFocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super(BinaryFocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        targets = targets.float()
+
+        pt = probs * targets + (1 - probs) * (1 - targets)
+        alpha_factor = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        focal_weight = alpha_factor * (1 - pt).pow(self.gamma)
+
+        loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        loss = focal_weight * loss
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
 
 
 def init_weights(m):
@@ -28,9 +52,6 @@ def init_weights(m):
 
 
 def print_and_log(message, log_path):
-    """
-    Prints a message to console and appends it to the specified log file.
-    """
     print(message)
     with open(log_path, 'a', encoding='utf-8') as f:
         f.write(message + '\n')
@@ -38,7 +59,7 @@ def print_and_log(message, log_path):
 
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
                 batch_size=32, num_workers=4, model_save_milestone=50,
-                lr_scheduler_step_size=50, lr_scheduler_gamma=0.1):
+                lr_scheduler_step_size=50, lr_scheduler_gamma=0.1, loss_type='weighted_bce'):
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if os.path.exists(log_file):
@@ -59,8 +80,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         num_workers=num_workers, shuffle=True
     )
 
-    # --- MODIFIED: Request paths from the validation loader ---
-    # This requires your custom Dataset to yield (image, label, path) when return_paths=True
     try:
         val_loader, _ = get_data_loader(
             data_dir=data_path, dataset_type="val", batch_size=batch_size,
@@ -70,27 +89,34 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         print_and_log(f"\nFATAL: Could not create validation data loader with 'return_paths=True'.", log_file)
         print_and_log("Please ensure your 'dataset_pansoma_npy_6ch.py' can handle this flag and yield file paths.", log_file)
         print_and_log(f"Error details: {e}", log_file)
-        return  # Exit if we can't get paths for the required evaluation
+        return
 
     if not genotype_map:
         print_and_log("Error: genotype_map is empty. Check dataloader and dataset structure.", log_file)
         return
     num_classes = len(genotype_map)
-    if num_classes == 0:
-        print_and_log("Error: Number of classes is 0. Check dataloader.", log_file)
+    if num_classes != 2:
+        print_and_log("Error: This script supports only binary classification.", log_file)
         return
     print_and_log(f"Number of classes: {num_classes}", log_file)
     sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
 
-    model = ConvNeXtCBAMClassifier(in_channels=6, class_num=num_classes).to(device)
-
+    model = ConvNeXtCBAMClassifier(in_channels=6, class_num=1).to(device)
     model.apply(init_weights)
+
     false_count = 48736
     true_count = 268
+    pos_weight = false_count / true_count
 
-    weight = torch.tensor([1.0, false_count / true_count])
-    weight = weight.to(device)
-    criterion = nn.CrossEntropyLoss(weight=weight)
+    if loss_type == "focal":
+        criterion = BinaryFocalLoss(alpha=0.25, gamma=2.0)
+        print_and_log(f"Using Focal Loss (alpha=0.25, gamma=2.0)", log_file)
+    elif loss_type == "weighted_bce":
+        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).to(device))
+        print_and_log(f"Using Weighted BCE Loss (pos_weight={pos_weight:.2f})", log_file)
+    else:
+        raise ValueError(f"Unsupported loss_type: {loss_type}")
+
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = StepLR(optimizer, step_size=lr_scheduler_step_size, gamma=lr_scheduler_gamma)
 
@@ -105,19 +131,19 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
         batch_count = 0
         for images, labels in progress_bar:
-            images, labels = images.to(device), labels.to(device)
+            images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
             outputs = model(images)
 
             if isinstance(outputs, tuple) and len(outputs) == 3:
                 main_output, aux1, aux2 = outputs
-                loss1 = criterion(main_output, labels)
-                loss2 = criterion(aux1, labels)
-                loss3 = criterion(aux2, labels)
+                loss1 = criterion(main_output.squeeze(1), labels)
+                loss2 = criterion(aux1.squeeze(1), labels)
+                loss3 = criterion(aux2.squeeze(1), labels)
                 loss = loss1 + 0.3 * loss2 + 0.3 * loss3
                 outputs_for_acc = main_output
             elif isinstance(outputs, torch.Tensor):
-                loss = criterion(outputs, labels)
+                loss = criterion(outputs.squeeze(1), labels)
                 outputs_for_acc = outputs
             else:
                 progress_bar.close()
@@ -128,8 +154,8 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
             running_loss += loss.item()
             batch_count += 1
-            _, predicted = torch.max(outputs_for_acc, 1)
-            correct_train += (predicted == labels).sum().item()
+            preds = (torch.sigmoid(outputs_for_acc) > 0.5).long().squeeze(1)
+            correct_train += (preds == labels.long()).sum().item()
             total_train += labels.size(0)
 
             if total_train > 0 and batch_count > 0:
@@ -140,7 +166,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         epoch_train_loss = (running_loss / batch_count) if batch_count > 0 else 0.0
         epoch_train_acc = (correct_train / total_train) * 100 if total_train > 0 else 0.0
 
-        # --- MODIFIED: Unpack 4 values, including the inference results ---
         val_loss, val_acc, class_performance_stats_val, val_inference_results = evaluate_model(
             model, val_loader, criterion, genotype_map, log_file
         )
@@ -169,7 +194,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             }, milestone_path)
             print_and_log(f"\nMilestone model saved at: {milestone_path}", log_file)
 
-            # --- MODIFIED: Save the validation inference results if requested ---
             if save_val_results:
                 result_path = os.path.join(output_path, f"validation_results_epoch_{epoch + 1}.json")
                 try:
@@ -185,10 +209,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
 
 def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
-    """
-    Evaluates the model and now also returns detailed classification results.
-    Assumes data_loader yields (images, labels, paths).
-    """
     model.eval()
     running_loss_eval = 0.0
     correct_eval = 0
@@ -197,7 +217,6 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
     class_total_counts = defaultdict(int)
     batch_count_eval = 0
 
-    # --- MODIFIED: Added dictionary to store inference results ---
     inference_results = defaultdict(list)
     idx_to_class = {v: k for k, v in genotype_map.items()}
 
@@ -205,32 +224,29 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
         return 0.0, 0.0, {}, {}
 
     with torch.no_grad():
-        # --- MODIFIED: Expects data_loader to yield paths as the third item ---
         for images, labels, paths in data_loader:
-            images, labels = images.to(device), labels.to(device)
+            images, labels = images.to(device), labels.to(device).float()
             outputs = model(images)
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
 
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs.squeeze(1), labels)
             running_loss_eval += loss.item()
             batch_count_eval += 1
-            _, predicted = torch.max(outputs, 1)
-            correct_eval += (predicted == labels).sum().item()
+            preds = (torch.sigmoid(outputs) > 0.5).long().squeeze(1)
+            correct_eval += (preds == labels.long()).sum().item()
             total_eval += labels.size(0)
 
-            for i, pred_idx_tensor in enumerate(predicted):
+            for i, pred_idx_tensor in enumerate(preds):
                 pred_idx = pred_idx_tensor.item()
-                true_idx = labels[i].item()
+                true_idx = int(labels[i].item())
                 path = paths[i]
 
-                # For accuracy stats
                 class_total_counts[true_idx] += 1
                 if pred_idx == true_idx:
                     class_correct_counts[true_idx] += 1
 
-                # For inference results file
-                predicted_class_name = idx_to_class[pred_idx]
+                predicted_class_name = idx_to_class.get(pred_idx, "unknown")
                 inference_results[predicted_class_name].append(os.path.basename(path))
 
     avg_loss_eval = (running_loss_eval / batch_count_eval) if batch_count_eval > 0 else 0.0
@@ -247,7 +263,6 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
     else:
         print_and_log("Warning: genotype_map is missing in evaluate_model.", log_file)
 
-    # --- MODIFIED: Return the inference results dictionary ---
     return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results
 
 
@@ -259,26 +274,23 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.001, help="Initial learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=8,
-                        help="Number of worker processes for data loading (default: 8)")
-    parser.add_argument("--milestone", type=int, default=50,
-                        help="Save model and run test inference every N epochs (milestone)")
-    parser.add_argument("--lr_decay_epochs", type=int, default=10,
-                        help="Number of epochs after which to decay learning rate")
-    parser.add_argument("--lr_decay_factor", type=float, default=0.1,
-                        help="Factor by which to decay learning rate")
-    # --- MODIFIED: Added flag to control saving of validation results ---
-    parser.add_argument("--save_val_results", action='store_true',
-                        help="If set, save detailed classification results from the validation set at each milestone.")
+    parser.add_argument("--num_workers", type=int, default=8, help="Number of worker processes for data loading")
+    parser.add_argument("--milestone", type=int, default=50, help="Checkpoint saving frequency")
+    parser.add_argument("--lr_decay_epochs", type=int, default=10, help="LR decay interval")
+    parser.add_argument("--lr_decay_factor", type=float, default=0.1, help="LR decay factor")
+    parser.add_argument("--save_val_results", action='store_true', help="Save validation results per milestone")
+    parser.add_argument("--loss_type", type=str, default="weighted_bce", choices=["weighted_bce", "focal"],
+                        help="Loss function to use: 'weighted_bce' or 'focal'")
 
     args = parser.parse_args()
 
     train_model(
         data_path=args.data_path, output_path=args.output_path,
-        save_val_results=args.save_val_results,  # Pass the new argument
+        save_val_results=args.save_val_results,
         num_epochs=args.epochs, learning_rate=args.lr,
         batch_size=args.batch_size, num_workers=args.num_workers,
         model_save_milestone=args.milestone,
         lr_scheduler_step_size=args.lr_decay_epochs,
-        lr_scheduler_gamma=args.lr_decay_factor
+        lr_scheduler_gamma=args.lr_decay_factor,
+        loss_type=args.loss_type
     )
