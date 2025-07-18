@@ -156,21 +156,21 @@ class ConvNeXtCBAMClassifier(nn.Module):
     def __init__(self, in_channels=4, class_num=2):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=4, stride=4),
-            LayerNorm(64, eps=1e-6, data_format="channels_first"),
+            nn.Conv2d(in_channels, 128, kernel_size=4, stride=4),
+            LayerNorm(128, eps=1e-6, data_format="channels_first"),
             nn.GELU()
         )
 
-        self.stage1 = nn.Sequential(*[ConvNeXtBlock(64, 64, 3) for _ in range(3)])
-        self.down1 = DownsampleLayer(64, 128)
-        self.stage2 = nn.Sequential(*[ConvNeXtBlock(128, 128, 3) for _ in range(3)])
-        self.down2 = DownsampleLayer(128, 256)
-        self.stage3 = nn.Sequential(*[ConvNeXtBlock(256, 256, 9) for _ in range(9)])
-        self.down3 = DownsampleLayer(256, 512)
-        self.stage4 = nn.Sequential(*[ConvNeXtBlock(512, 512, 3) for _ in range(3)])
+        self.stage1 = nn.Sequential(*[ConvNeXtBlock(128, 128, 3) for _ in range(3)])
+        self.down1 = DownsampleLayer(128, 256)
+        self.stage2 = nn.Sequential(*[ConvNeXtBlock(256, 256, 3) for _ in range(3)])
+        self.down2 = DownsampleLayer(256, 512)
+        self.stage3 = nn.Sequential(*[ConvNeXtBlock(512, 512, 27) for _ in range(27)])
+        self.down3 = DownsampleLayer(512, 1024)
+        self.stage4 = nn.Sequential(*[ConvNeXtBlock(1024, 1024, 3) for _ in range(3)])
 
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.head = nn.Linear(512, class_num)
+        self.head = nn.Linear(1024, class_num)
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
