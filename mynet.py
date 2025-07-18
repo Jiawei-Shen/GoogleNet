@@ -152,40 +152,76 @@ class DownsampleLayer(nn.Module):
     def forward(self, x):
         return self.downsample(x)
 
+
 class ConvNeXtCBAMClassifier(nn.Module):
-    def __init__(self, in_channels=4, class_num=2):
+    """
+    A ConvNeXt-style classifier with a configurable architecture.
+
+    Args:
+        in_channels (int): Number of input channels. Default: 4.
+        class_num (int): Number of output classes. Default: 2.
+        depths (list[int]): Number of blocks in each stage.
+                           Default: [3, 3, 27, 3].
+        dims (list[int]): Number of channels in each stage.
+                         Default: [128, 256, 512, 1024].
+    """
+
+    def __init__(self, in_channels=4, class_num=2,
+                 depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024]):
         super().__init__()
+
+        if not (len(depths) == len(dims) and len(depths) == 4):
+            raise ValueError("Both depths and dims must be lists of length 4.")
+
+        # --- Stem ---
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 128, kernel_size=4, stride=4),
-            LayerNorm(128, eps=1e-6, data_format="channels_first"),
+            nn.Conv2d(in_channels, dims[0], kernel_size=4, stride=4),
+            LayerNorm(dims[0], eps=1e-6, data_format="channels_first"),
             nn.GELU()
         )
 
-        self.stage1 = nn.Sequential(*[ConvNeXtBlock(128, 128, 3) for _ in range(3)])
-        self.down1 = DownsampleLayer(128, 256)
-        self.stage2 = nn.Sequential(*[ConvNeXtBlock(256, 256, 3) for _ in range(3)])
-        self.down2 = DownsampleLayer(256, 512)
-        self.stage3 = nn.Sequential(*[ConvNeXtBlock(512, 512, 27) for _ in range(27)])
-        self.down3 = DownsampleLayer(512, 1024)
-        self.stage4 = nn.Sequential(*[ConvNeXtBlock(1024, 1024, 3) for _ in range(3)])
+        # --- Stages & Downsampling ---
+        self.stages = nn.ModuleList()
+        self.downsample_layers = nn.ModuleList()
 
+        # Build the four stages
+        for i in range(4):
+            stage = nn.Sequential(
+                *[ConvNeXtBlock(dim=dims[i]) for _ in range(depths[i])]
+            )
+            self.stages.append(stage)
+
+        # Build the three downsampling layers
+        for i in range(3):
+            downsample = DownsampleLayer(dims[i], dims[i + 1])
+            self.downsample_layers.append(downsample)
+
+        # --- Classification Head ---
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.head = nn.Linear(1024, class_num)
+        self.head = nn.Linear(dims[-1], class_num)
+
+        # Initialize weights
+        self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
             trunc_normal_(m.weight, std=.02)
-            nn.init.constant_(m.bias, 0)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
+        # Pass through stem and the four stages with downsampling in between
         x = self.stem(x)
-        x = self.stage1(x)
-        x = self.down1(x)
-        x = self.stage2(x)
-        x = self.down2(x)
-        x = self.stage3(x)
-        x = self.down3(x)
-        x = self.stage4(x)
+
+        x = self.stages[0](x)
+        x = self.downsample_layers[0](x)
+        x = self.stages[1](x)
+        x = self.downsample_layers[1](x)
+        x = self.stages[2](x)
+        x = self.downsample_layers[2](x)
+        x = self.stages[3](x)
+
+        # Global pooling and classification
         x = self.pool(x)
         x = torch.flatten(x, 1)
         return self.head(x)
