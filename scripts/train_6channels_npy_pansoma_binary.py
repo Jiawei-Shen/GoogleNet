@@ -9,15 +9,16 @@ import os
 from tqdm import tqdm
 from collections import defaultdict
 import json
-
 from torch.optim.lr_scheduler import StepLR
+from torch.cuda.amp import GradScaler, autocast
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from mynet import ConvNeXtCBAMClassifier
 from dataset_pansoma_npy_6ch import get_data_loader  # Using 6-channel dataloader
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.backends.cudnn.benchmark = True  # Enable CuDNN Benchmarking
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class BinaryFocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
@@ -43,27 +44,26 @@ class BinaryFocalLoss(nn.Module):
             return loss.sum()
         return loss
 
-
 def init_weights(m):
     if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
         nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
 
-
 def print_and_log(message, log_path):
     print(message)
     with open(log_path, 'a', encoding='utf-8') as f:
         f.write(message + '\n')
 
-
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
                 batch_size=32, num_workers=4, model_save_milestone=50,
                 lr_scheduler_step_size=50, lr_scheduler_gamma=0.1, loss_type='weighted_bce',
-                restore_path=None): # <-- Add restore_path parameter
+                restore_path=None):
+    scaler = GradScaler()
+
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
-    if not restore_path and os.path.exists(log_file): # Don't remove log if restoring
+    if not restore_path and os.path.exists(log_file):
         os.remove(log_file)
 
     print_and_log(f"Using device: {device}", log_file)
@@ -102,7 +102,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     print_and_log(f"Number of classes: {num_classes}", log_file)
     sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
 
-    # model = ConvNeXtCBAMClassifier(in_channels=6, class_num=2).to(device)
     model = ConvNeXtCBAMClassifier(in_channels=6, class_num=1, depths=[3, 3, 12, 3], dims=[128, 256, 512, 1024]).to(device)
     model.apply(init_weights)
 
@@ -123,7 +122,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     scheduler = StepLR(optimizer, step_size=lr_scheduler_step_size, gamma=lr_scheduler_gamma)
 
     start_epoch = 0
-    # --- RESTORE LOGIC START ---
     if restore_path:
         if os.path.isfile(restore_path):
             print_and_log(f"\nRestoring checkpoint from: {restore_path}", log_file)
@@ -136,14 +134,8 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 print_and_log(f"Successfully restored model. Resuming training from epoch {start_epoch + 1}.", log_file)
             except KeyError as e:
                 print_and_log(f"Error: Checkpoint is missing a required key: {e}. Starting from scratch.", log_file)
-                start_epoch = 0
             except Exception as e:
                 print_and_log(f"An error occurred while loading checkpoint: {e}. Starting from scratch.", log_file)
-                start_epoch = 0
-        else:
-            print_and_log(f"Warning: Restore path specified but file not found: {restore_path}. Starting from scratch.", log_file)
-    # --- RESTORE LOGIC END ---
-
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -158,24 +150,27 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         for images, labels in progress_bar:
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
-            outputs = model(images)
 
-            if isinstance(outputs, tuple) and len(outputs) == 3:
-                main_output, aux1, aux2 = outputs
-                loss1 = criterion(main_output.squeeze(1), labels)
-                loss2 = criterion(aux1.squeeze(1), labels)
-                loss3 = criterion(aux2.squeeze(1), labels)
-                loss = loss1 + 0.3 * loss2 + 0.3 * loss3
-                outputs_for_acc = main_output
-            elif isinstance(outputs, torch.Tensor):
-                loss = criterion(outputs.squeeze(1), labels)
-                outputs_for_acc = outputs
-            else:
-                progress_bar.close()
-                raise TypeError(f"Model output type not recognized: {type(outputs)}")
+            with autocast():
+                outputs = model(images)
 
-            loss.backward()
-            optimizer.step()
+                if isinstance(outputs, tuple) and len(outputs) == 3:
+                    main_output, aux1, aux2 = outputs
+                    loss1 = criterion(main_output.squeeze(1), labels)
+                    loss2 = criterion(aux1.squeeze(1), labels)
+                    loss3 = criterion(aux2.squeeze(1), labels)
+                    loss = loss1 + 0.3 * loss2 + 0.3 * loss3
+                    outputs_for_acc = main_output
+                elif isinstance(outputs, torch.Tensor):
+                    loss = criterion(outputs.squeeze(1), labels)
+                    outputs_for_acc = outputs
+                else:
+                    progress_bar.close()
+                    raise TypeError(f"Model output type not recognized: {type(outputs)}")
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += loss.item()
             batch_count += 1
