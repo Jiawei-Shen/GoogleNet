@@ -191,7 +191,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         epoch_train_loss = (running_loss / batch_count) if batch_count > 0 else 0.0
         epoch_train_acc = (correct_train / total_train) * 100 if total_train > 0 else 0.0
 
-        val_loss, val_acc, class_performance_stats_val, val_inference_results = evaluate_model(
+        val_loss, val_acc, class_performance_stats_val, val_inference_results, precision, recall, f1 = evaluate_model(
             model, val_loader, criterion, genotype_map, log_file
         )
 
@@ -207,7 +207,8 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
         summary_msg = (
             f"Epoch {epoch + 1}/{num_epochs} Summary - Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.2f}%, "
-            f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}% (LR: {current_lr:.1e})")
+            f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, "
+            f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f} (LR: {current_lr:.1e})")
         print_and_log(summary_msg, log_file)
 
         scheduler.step()
@@ -247,8 +248,10 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
     inference_results = defaultdict(list)
     idx_to_class = {v: k for k, v in genotype_map.items()}
 
+    tp = fp = fn = 0
+
     if not data_loader or len(data_loader) == 0:
-        return 0.0, 0.0, {}, {}
+        return 0.0, 0.0, {}, {}, 0.0, 0.0, 0.0
 
     with torch.no_grad():
         for images, labels, paths in data_loader:
@@ -264,9 +267,16 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
             running_loss_eval += loss.item()
             batch_count_eval += 1
 
-            preds = (torch.sigmoid(outputs) > 0.5).long()  # binary predictions
-            correct_eval += (preds == labels.long()).sum().item()
+            probs = torch.sigmoid(outputs)
+            preds = (probs > 0.5).long()
+            labels_int = labels.long()
+
+            correct_eval += (preds == labels_int).sum().item()
             total_eval += labels.size(0)
+
+            tp += ((preds == 1) & (labels_int == 1)).sum().item()
+            fp += ((preds == 1) & (labels_int == 0)).sum().item()
+            fn += ((preds == 0) & (labels_int == 1)).sum().item()
 
             for i in range(len(labels)):
                 pred_idx = preds[i].item()
@@ -277,8 +287,12 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
                 if pred_idx == true_idx:
                     class_correct_counts[true_idx] += 1
 
-                class_name = idx_to_class.get(pred_idx, str(pred_idx))  # fallback to '0' or '1'
+                class_name = idx_to_class.get(pred_idx, str(pred_idx))
                 inference_results[class_name].append(os.path.basename(path))
+
+    precision = tp / (tp + fp) if tp + fp > 0 else 0.0
+    recall = tp / (tp + fn) if tp + fn > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
 
     avg_loss_eval = running_loss_eval / batch_count_eval if batch_count_eval > 0 else 0.0
     overall_accuracy_eval = (correct_eval / total_eval) * 100 if total_eval > 0 else 0.0
@@ -295,7 +309,7 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
             'idx': class_idx
         }
 
-    return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results
+    return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results, precision, recall, f1
 
 
 if __name__ == "__main__":
