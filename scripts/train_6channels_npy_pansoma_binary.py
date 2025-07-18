@@ -21,7 +21,7 @@ torch.backends.cudnn.benchmark = True  # Enable CuDNN Benchmarking
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class BinaryFocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+    def __init__(self, alpha=0.01, gamma=2.0, reduction='mean'):
         super(BinaryFocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
