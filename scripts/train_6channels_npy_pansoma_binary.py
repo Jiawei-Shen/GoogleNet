@@ -107,7 +107,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
     false_count = 48736
     true_count = 268
-    pos_weight = min(88.0, false_count / true_count)
+    pos_weight = min(64.0, false_count / true_count)
 
     if loss_type == "focal":
         criterion = BinaryFocalLoss(alpha=0.25, gamma=2.0)
