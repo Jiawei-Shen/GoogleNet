@@ -89,8 +89,8 @@ def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=8, shuffl
     # 🚨 IMPORTANT: You must calculate and replace these placeholder values
     # with the actual mean and std of your 6-channel dataset.
     transform = transforms.Compose([
-        transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
-                             std=[0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
+        transforms.Normalize(mean=[1.8312537670135498, 12.5936918258667, -0.547197163105011, 24.569326400756836, 0.46740683913230896, 10.625722885131836],
+                             std=[2.498225688934326, 14.80020523071289, 0.6179432272911072, 29.931854248046875, 0.793965756893158, 27.117109298706055])
     ])
 
     dataset = NpyDataset(root_dir=dataset_path, transform=transform, return_paths=return_paths)
