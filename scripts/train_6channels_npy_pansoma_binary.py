@@ -108,7 +108,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
     false_count = 48736
     true_count = 268
-    pos_weight = min(88.0, false_count / true_count)
+    pos_weight = min(88. I mean output the 0, false_count / true_count)
 
     if loss_type == "focal":
         criterion = BinaryFocalLoss(alpha=0.25, gamma=2.0)
@@ -197,10 +197,12 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
         if class_performance_stats_val:
             print_and_log("\nClass-wise Validation Accuracy:", log_file)
-            for class_name in sorted_class_names_from_map:
+            for class_idx in sorted(genotype_map.values()):
+                class_name = [k for k, v in genotype_map.items() if v == class_idx][0]
                 stats = class_performance_stats_val.get(class_name, {})
                 print_and_log(
-                    f"  {class_name} (Index {stats.get('idx', 'N/A')}): {stats.get('acc', 0):.2f}% ({stats.get('correct', 0)}/{stats.get('total', 0)})",
+                    f"  {class_name} (Index {class_idx}): {stats.get('acc', 0):.2f}% "
+                    f"({stats.get('correct', 0)}/{stats.get('total', 0)})",
                     log_file)
 
         summary_msg = (
