@@ -1,129 +1,80 @@
 import os
+import torch
 import numpy as np
-import torch # Using torch for efficient tensor operations
-from tqdm import tqdm # For a progress bar
+from tqdm import tqdm
+import argparse # --- ADDED: Import argparse
 
-def calculate_channel_stats(data_root_dir):
+def calculate_mean_std(root_dir: str, num_channels: int):
     """
-    Calculates the mean and standard deviation for each channel across all
-    .npy files in the 'train' subdirectory of the given data_root_dir.
+    Calculates the mean and standard deviation of a dataset of .npy files.
 
     Args:
-        data_root_dir (str): The root directory of the dataset.
-                             This directory should contain a 'train' subdirectory,
-                             which in turn contains class-specific subdirectories
-                             with .npy files.
-
-    Returns:
-        tuple: A tuple containing two lists: (means, stds).
-               'means' is a list of 4 float values (mean for each channel).
-               'stds' is a list of 4 float values (std dev for each channel).
-               Returns (None, None) if no .npy files are found.
+        root_dir (str): The root directory of the training dataset.
+        num_channels (int): The number of channels in the image files.
     """
-    train_dir = os.path.join(data_root_dir, "train")
+    # Find all .npy file paths
+    filepaths = []
+    for dirpath, _, filenames in os.walk(root_dir):
+        for f in filenames:
+            if f.lower().endswith('.npy'):
+                filepaths.append(os.path.join(dirpath, f))
 
-    if not os.path.isdir(train_dir):
-        print(f"Error: 'train' directory not found in {data_root_dir}")
-        return None, None
+    if not filepaths:
+        raise ValueError(f"No .npy files found in directory: {root_dir}")
 
-    npy_files_paths = []
-    for root, _, files in os.walk(train_dir):
-        for file in files:
-            if file.lower().endswith(".npy"):
-                npy_files_paths.append(os.path.join(root, file))
+    print(f"Found {len(filepaths)} .npy files. Starting calculation for {num_channels} channels...")
 
-    if not npy_files_paths:
-        print(f"Error: No .npy files found in {train_dir}")
-        return None, None
+    # Use PyTorch for efficient computation
+    sum_channels = torch.zeros(num_channels) # --- MODIFIED: Use num_channels
+    sum_sq_channels = torch.zeros(num_channels) # --- MODIFIED: Use num_channels
+    pixel_count = 0
 
-    print(f"Found {len(npy_files_paths)} .npy files in {train_dir} to process.")
+    # Iterate through all files with a progress bar
+    for path in tqdm(filepaths, desc="Calculating Stats"):
+        image_np = np.load(path)
 
-    # Initialize accumulators for sums and sums of squares for 4 channels
-    # Using torch tensors for potentially faster accumulation if on GPU,
-    # but will work on CPU too.
-    channel_sum = torch.zeros(4, dtype=torch.float64) # Sum of pixel values
-    channel_sum_sq = torch.zeros(4, dtype=torch.float64) # Sum of squared pixel values
-    pixel_count_per_channel = torch.zeros(4, dtype=torch.int64) # Total number of pixels per channel
-
-    # Expected shape (can be dynamic if needed, but fixed for this example)
-    # If your H and W vary, this needs adjustment or per-file calculation.
-    # For now, let's assume they are somewhat consistent or we load one to check.
-    # We can also dynamically sum pixels.
-
-    for file_path in tqdm(npy_files_paths, desc="Processing .npy files"):
-        try:
-            # Load the .npy file
-            data_np = np.load(file_path)
-
-            # Ensure it's a numpy array
-            if not isinstance(data_np, np.ndarray):
-                print(f"Warning: Skipping {file_path}, not a NumPy array.")
-                continue
-
-            # Validate shape (Channels, Height, Width)
-            if data_np.ndim != 3 or data_np.shape[0] != 4:
-                print(f"Warning: Skipping {file_path}, unexpected shape {data_np.shape}. Expected (4, H, W).")
-                continue
-
-            # Convert to a float PyTorch tensor
-            data_tensor = torch.from_numpy(data_np.astype(np.float64)) # Use float64 for precision
-
-            # Accumulate sums and sums of squares per channel
-            # Sum over Height and Width dimensions (dim 1 and 2 for a C, H, W tensor)
-            channel_sum += torch.sum(data_tensor, dim=[1, 2])
-            channel_sum_sq += torch.sum(data_tensor**2, dim=[1, 2])
-
-            # Accumulate pixel counts for each channel
-            # data_tensor.shape[1] is Height, data_tensor.shape[2] is Width
-            num_pixels_in_this_file_per_channel = data_tensor.shape[1] * data_tensor.shape[2]
-            pixel_count_per_channel += num_pixels_in_this_file_per_channel
-
-        except Exception as e:
-            print(f"Warning: Could not process file {file_path}. Error: {e}")
+        # Ensure it's in the correct format (C, W, H)
+        if image_np.ndim != 3 or image_np.shape[0] != num_channels: # --- MODIFIED: Use num_channels
+            print(f"\nSkipping file with incorrect shape: {path} has shape {image_np.shape}")
             continue
 
-    if torch.any(pixel_count_per_channel == 0):
-        print("Error: Zero pixels counted for one or more channels. Cannot calculate stats.")
-        # Identify which channels had zero pixels
-        for i in range(4):
-            if pixel_count_per_channel[i] == 0:
-                print(f"  Channel {i+1} had 0 pixels.")
-        return None, None
+        image_tensor = torch.from_numpy(image_np.astype(np.float32))
 
-    # Calculate mean for each channel
-    means = channel_sum / pixel_count_per_channel.double() # Ensure double for division
+        # Sum over the width and height dimensions (1 and 2)
+        sum_channels += torch.sum(image_tensor, dim=[1, 2])
+        sum_sq_channels += torch.sum(image_tensor ** 2, dim=[1, 2])
+        pixel_count += image_tensor.shape[1] * image_tensor.shape[2]
 
-    # Calculate variance for each channel: Var(X) = E[X^2] - (E[X])^2
-    variances = (channel_sum_sq / pixel_count_per_channel.double()) - (means**2)
+    if pixel_count == 0:
+        raise ValueError("Could not process any images. Check file shapes and paths.")
 
-    # Handle potential negative variances due to floating point inaccuracies if variance is very close to 0
-    variances[variances < 0] = 0
+    # Calculate mean and standard deviation
+    mean = sum_channels / pixel_count
+    var = (sum_sq_channels / pixel_count) - (mean ** 2)
+    std = torch.sqrt(var)
 
-    # Calculate standard deviation for each channel
-    stds = torch.sqrt(variances)
+    return mean.tolist(), std.tolist()
 
-    return means.tolist(), stds.tolist()
 
 if __name__ == "__main__":
-    # IMPORTANT: Replace this with the actual path to your dataset's root directory
-    # This is the directory that contains the 'train' and 'val' subdirectories.
-    # Example: "/home/jiawei/Documents/Dockers/GoogleNet/data/COLO829T_SNV_chr1_tensors_4channel"
-    # dataset_root = input("Enter the root path to your 4-channel dataset directory: ")
-    dataset_root = "/home/jiawei/Documents/Dockers/GoogleNet/data/COLO829T_SNV_chr1_tensors_4channel"
+    # --- ADDED: Set up argument parser ---
+    parser = argparse.ArgumentParser(description="Calculate mean and std for a dataset of .npy files.")
+    parser.add_argument("data_dir", type=str, help="Path to the root directory of the training dataset.")
+    parser.add_argument("--channels", type=int, default=6, help="Number of channels in the image files (default: 6).")
+    args = parser.parse_args()
+    # -------------------------------------
 
-    if not os.path.isdir(dataset_root):
-        print(f"Error: The provided path '{dataset_root}' is not a valid directory.")
-    else:
-        print(f"\nCalculating normalization statistics for dataset at: {dataset_root}")
-        calculated_means, calculated_stds = calculate_channel_stats(dataset_root)
+    try:
+        # --- MODIFIED: Call function with parsed arguments ---
+        mean, std = calculate_mean_std(args.data_dir, args.channels)
 
-        if calculated_means and calculated_stds:
-            print("\n--- Calculated Statistics ---")
-            print(f"Means per channel: {calculated_means}")
-            print(f"Std Devs per channel: {calculated_stds}")
-            print("\nReminder: Use these values in your transforms.Normalize() step for your DataLoader.")
-            print("Example:")
-            print(f"transforms.Normalize(mean={calculated_means}, std={calculated_stds})")
-        else:
-            print("\nCould not calculate statistics. Please check errors above.")
+        print("\n" + "="*40)
+        print("✅ Calculation Complete!")
+        print("="*40)
+        print("\nCopy these values into your dataloader script:\n")
+        print(f"mean = {mean}")
+        print(f"std  = {std}")
+        print("\n" + "="*40)
 
+    except (ValueError, FileNotFoundError) as e:
+        print(f"\nError: {e}")
