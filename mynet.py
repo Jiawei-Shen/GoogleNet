@@ -105,6 +105,8 @@ class MultiGate(nn.Module):
 
 
 class ConvNeXtBlock(nn.Module):
+    """The user-provided ConvNeXt block with CBAM."""
+
     def __init__(self, in_channels, out_channels, drop_path):
         super().__init__()
         self.dwconv = same_padding_conv(in_channels, in_channels, kernel_size=(7, 5), stride=1, groups=in_channels)
@@ -114,7 +116,6 @@ class ConvNeXtBlock(nn.Module):
         self.grn = GRN(4 * in_channels)
         self.pwconv2 = nn.Linear(4 * in_channels, out_channels)
         self.cbam = CBAM(out_channels)
-        # self.gate = MultiGate(out_channels)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         if in_channels == out_channels:
@@ -124,20 +125,22 @@ class ConvNeXtBlock(nn.Module):
                                       nn.GELU())
 
     def forward(self, x):
-        shortcut = x  # save for shortcut
+        shortcut = x
         x = self.dwconv(x)
-        x = x.permute(0, 2, 3, 1)
+        x = x.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
         x = self.norm(x)
         x = self.pwconv1(x)
         x = self.act(x)
         x = self.grn(x)
         x = self.pwconv2(x)
-        x = x.permute(0, 3, 1, 2)  # shape now [B, out_channels, H, W]
+        x = x.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
 
         x = self.cbam(x)
 
-        shortcut = self.proj(shortcut)  # match to out_channels
-        return self.act(shortcut + x)
+        # Apply stochastic depth and the residual connection
+        x = self.drop_path(x)
+        x = self.proj(shortcut) + x
+        return self.act(x)
 
 
 class DownsampleLayer(nn.Module):
@@ -155,23 +158,20 @@ class DownsampleLayer(nn.Module):
 
 class ConvNeXtCBAMClassifier(nn.Module):
     """
-    A ConvNeXt-style classifier with a configurable architecture.
+    A revised classifier that correctly instantiates the user-provided ConvNeXtBlock.
 
     Args:
         in_channels (int): Number of input channels. Default: 4.
         class_num (int): Number of output classes. Default: 2.
         depths (list[int]): Number of blocks in each stage.
-                           Default: [3, 3, 27, 3].
         dims (list[int]): Number of channels in each stage.
-                         Default: [128, 256, 512, 1024].
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1.
     """
 
     def __init__(self, in_channels=4, class_num=2,
-                 depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024]):
+                 depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024],
+                 drop_path_rate=0.1):
         super().__init__()
-
-        if not (len(depths) == len(dims) and len(depths) == 4):
-            raise ValueError("Both depths and dims must be lists of length 4.")
 
         # --- Stem ---
         self.stem = nn.Sequential(
@@ -184,14 +184,27 @@ class ConvNeXtCBAMClassifier(nn.Module):
         self.stages = nn.ModuleList()
         self.downsample_layers = nn.ModuleList()
 
-        # Build the four stages
-        for i in range(4):
-            stage = nn.Sequential(
-                *[ConvNeXtBlock(dim=dims[i]) for _ in range(depths[i])]
-            )
-            self.stages.append(stage)
+        # Calculate drop path rates for each block
+        total_blocks = sum(depths)
+        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, total_blocks)]
+        block_idx = 0
 
-        # Build the three downsampling layers
+        # Build the four stages using the provided ConvNeXtBlock
+        for i in range(4):  # For each stage
+            stage_blocks = []
+            for j in range(depths[i]):  # For each block in the stage
+                # Note: in_channels and out_channels are the same within a stage
+                block = ConvNeXtBlock(
+                    in_channels=dims[i],
+                    out_channels=dims[i],
+                    drop_path=dp_rates[block_idx]
+                )
+                stage_blocks.append(block)
+                block_idx += 1
+
+            self.stages.append(nn.Sequential(*stage_blocks))
+
+        # Build the three downsampling layers between stages
         for i in range(3):
             downsample = DownsampleLayer(dims[i], dims[i + 1])
             self.downsample_layers.append(downsample)
@@ -200,7 +213,6 @@ class ConvNeXtCBAMClassifier(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.head = nn.Linear(dims[-1], class_num)
 
-        # Initialize weights
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -210,7 +222,6 @@ class ConvNeXtCBAMClassifier(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        # Pass through stem and the four stages with downsampling in between
         x = self.stem(x)
 
         x = self.stages[0](x)
@@ -221,7 +232,6 @@ class ConvNeXtCBAMClassifier(nn.Module):
         x = self.downsample_layers[2](x)
         x = self.stages[3](x)
 
-        # Global pooling and classification
         x = self.pool(x)
         x = torch.flatten(x, 1)
         return self.head(x)
