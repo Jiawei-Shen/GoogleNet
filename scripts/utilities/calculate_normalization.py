@@ -1,7 +1,7 @@
 import os
 import torch
 import numpy as np
-from tqdm import tqdm  # <-- 1. IMPORT THE LIBRARY
+from tqdm import tqdm
 import argparse
 
 def calculate_mean_std(root_dir: str, num_channels: int):
@@ -23,8 +23,12 @@ def calculate_mean_std(root_dir: str, num_channels: int):
     sum_sq_channels = torch.zeros(num_channels)
     pixel_count = 0
 
-    # <-- 2. WRAP THE LIST WITH tqdm() TO DISPLAY THE PROGRESS BAR -->
-    for path in tqdm(filepaths, desc="Calculating Stats"):
+    # --- REVISED: Define a custom format for the progress bar ---
+    # {n_fmt} is processed count, {total_fmt} is total count.
+    custom_bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
+
+    # --- Pass the custom format to tqdm ---
+    for path in tqdm(filepaths, desc="Calculating Stats", bar_format=custom_bar_format):
         image_np = np.load(path)
 
         if image_np.ndim != 3 or image_np.shape[0] != num_channels:
