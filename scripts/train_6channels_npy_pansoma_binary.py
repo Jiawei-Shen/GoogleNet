@@ -120,7 +120,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
 
     # model = ConvNeXtCBAMClassifier(in_channels=6, class_num=2).to(device)
-    model = ConvNeXtCBAMClassifier(in_channels=6, class_num=1, depths=[3, 3, 12, 3], dims=[128, 256, 512, 1024]).to(device)
+    model = ConvNeXtCBAMClassifier(in_channels=6, class_num=1, depths=[4, 4, 32, 4], dims=[128, 256, 512, 1024]).to(device)
     model.apply(init_weights)
 
     false_count = 48736
