@@ -120,12 +120,12 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
 
     # model = ConvNeXtCBAMClassifier(in_channels=6, class_num=2).to(device)
-    model = ConvNeXtCBAMClassifier(in_channels=6, class_num=1, depths=[4, 4, 32, 4], dims=[128, 256, 512, 1024]).to(device)
+    model = ConvNeXtCBAMClassifier(in_channels=6, class_num=1, depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024]).to(device)
     model.apply(init_weights)
 
     false_count = 48736
     true_count = 268
-    pos_weight = min(88.0, false_count / true_count)
+    pos_weight = min(100.0, false_count / true_count)
 
     if loss_type == "focal":
         alp, gam = 0.99, 2.0
@@ -180,13 +180,13 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
             if isinstance(outputs, tuple) and len(outputs) == 3:
                 main_output, aux1, aux2 = outputs
-                loss1 = criterion(main_output.squeeze(1), labels) + 0.01 * SoftF1Loss()(main_output.squeeze(1), labels)
-                loss2 = criterion(aux1.squeeze(1), labels) + 0.01 * SoftF1Loss()(aux1.squeeze(1), labels)
-                loss3 = criterion(aux2.squeeze(1), labels) + 0.01 * SoftF1Loss()(aux2.squeeze(1), labels)
+                loss1 = criterion(main_output.squeeze(1), labels)
+                loss2 = criterion(aux1.squeeze(1), labels)
+                loss3 = criterion(aux2.squeeze(1), labels)
                 loss = loss1 + 0.3 * loss2 + 0.3 * loss3
                 outputs_for_acc = main_output
             elif isinstance(outputs, torch.Tensor):
-                loss = criterion(outputs.squeeze(1), labels) + 0.01 * SoftF1Loss()(outputs.squeeze(1), labels)
+                loss = criterion(outputs.squeeze(1), labels)
                 outputs_for_acc = outputs
             else:
                 progress_bar.close()
