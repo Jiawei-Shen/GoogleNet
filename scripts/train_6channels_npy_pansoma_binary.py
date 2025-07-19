@@ -180,12 +180,12 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             if isinstance(outputs, tuple) and len(outputs) == 3:
                 main_output, aux1, aux2 = outputs
                 loss1 = criterion(main_output.squeeze(1), labels) + 0.01 * SoftF1Loss()(main_output.squeeze(1), labels)
-                loss2 = criterion(aux1.squeeze(1), labels) + 0.01 * SoftF1Loss()(main_output.squeeze(1), labels)
-                loss3 = criterion(aux2.squeeze(1), labels) + 0.01 * SoftF1Loss()(main_output.squeeze(1), labels)
+                loss2 = criterion(aux1.squeeze(1), labels) + 0.01 * SoftF1Loss()(aux1.squeeze(1), labels)
+                loss3 = criterion(aux2.squeeze(1), labels) + 0.01 * SoftF1Loss()(aux2.squeeze(1), labels)
                 loss = loss1 + 0.3 * loss2 + 0.3 * loss3
                 outputs_for_acc = main_output
             elif isinstance(outputs, torch.Tensor):
-                loss = criterion(outputs.squeeze(1), labels) + 0.01 * SoftF1Loss()(main_output.squeeze(1), labels)
+                loss = criterion(outputs.squeeze(1), labels) + 0.01 * SoftF1Loss()(outputs.squeeze(1), labels)
                 outputs_for_acc = outputs
             else:
                 progress_bar.close()
