@@ -109,7 +109,7 @@ class ConvNeXtBlock(nn.Module):
 
     def __init__(self, in_channels, out_channels, drop_path):
         super().__init__()
-        self.dwconv = same_padding_conv(in_channels, in_channels, kernel_size=(10, 5), stride=1, groups=in_channels)
+        self.dwconv = same_padding_conv(in_channels, in_channels, kernel_size=(11, 5), stride=1, groups=in_channels)
         self.norm = LayerNorm(in_channels, eps=1e-6)
         self.pwconv1 = nn.Linear(in_channels, 4 * in_channels)
         self.act = nn.GELU()
