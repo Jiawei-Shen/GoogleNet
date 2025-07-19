@@ -185,7 +185,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 loss = loss1 + 0.3 * loss2 + 0.3 * loss3
                 outputs_for_acc = main_output
             elif isinstance(outputs, torch.Tensor):
-                loss = criterion(outputs.squeeze(1), labels)
+                loss = criterion(outputs.squeeze(1), labels) + 0.01 * SoftF1Loss()(main_output.squeeze(1), labels)
                 outputs_for_acc = outputs
             else:
                 progress_bar.close()
