@@ -131,7 +131,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         criterion = BinaryFocalLoss(alpha=0.01, gamma=2.0)
         print_and_log(f"Using Focal Loss (alpha=0.01, gamma=2.0)", log_file)
     elif loss_type == "weighted_bce":
-        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).to(device)) + 0.1 * SoftF1Loss()
+        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).to(device))
         print_and_log(f"Using Weighted BCE Loss (pos_weight={pos_weight:.2f})", log_file)
     else:
         raise ValueError(f"Unsupported loss_type: {loss_type}")
@@ -179,9 +179,9 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
             if isinstance(outputs, tuple) and len(outputs) == 3:
                 main_output, aux1, aux2 = outputs
-                loss1 = criterion(main_output.squeeze(1), labels)
-                loss2 = criterion(aux1.squeeze(1), labels)
-                loss3 = criterion(aux2.squeeze(1), labels)
+                loss1 = criterion(main_output.squeeze(1), labels) + 0.01 * SoftF1Loss()(main_output.squeeze(1), labels)
+                loss2 = criterion(aux1.squeeze(1), labels) + 0.01 * SoftF1Loss()(main_output.squeeze(1), labels)
+                loss3 = criterion(aux2.squeeze(1), labels) + 0.01 * SoftF1Loss()(main_output.squeeze(1), labels)
                 loss = loss1 + 0.3 * loss2 + 0.3 * loss3
                 outputs_for_acc = main_output
             elif isinstance(outputs, torch.Tensor):
