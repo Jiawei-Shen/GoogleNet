@@ -128,8 +128,9 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     pos_weight = min(88.0, false_count / true_count)
 
     if loss_type == "focal":
-        criterion = BinaryFocalLoss(alpha=0.99, gamma=2.0)
-        print_and_log(f"Using Focal Loss (alpha=0.99, gamma=2.0)", log_file)
+        alp, gam = 0.99, 2.0
+        criterion = BinaryFocalLoss(alpha=alp, gamma=gam)
+        print_and_log(f"Using Focal Loss (alpha={alp}, gamma={gam})", log_file)
     elif loss_type == "weighted_bce":
         criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).to(device))
         print_and_log(f"Using Weighted BCE Loss (pos_weight={pos_weight:.2f})", log_file)
