@@ -116,7 +116,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
 
     model = ConvNeXtCBAMClassifier(in_channels=6, class_num=num_classes,
-                                   depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024]).to(device)
+                                   depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536]).to(device)
 
     model.apply(init_weights)
     false_count = 48736
