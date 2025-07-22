@@ -7,6 +7,7 @@ import sys
 import os
 from tqdm import tqdm
 from collections import defaultdict
+import torch.nn.functional as F
 import json
 
 # Import StepLR for learning rate scheduling
@@ -19,6 +20,45 @@ from dataset_pansoma_npy_6ch import get_data_loader  # Using 6-channel dataloade
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+class BinaryFocalLoss(nn.Module):
+    def __init__(self, alpha=0.98, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        targets = targets.float()
+
+        pt = probs * targets + (1 - probs) * (1 - targets)
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        focal_weight = alpha_t * (1 - pt) ** self.gamma
+
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        loss = focal_weight * bce
+
+        return loss.mean() if self.reduction == 'mean' else loss.sum()
+
+
+class CombinedFocalWeightedCELoss(nn.Module):
+    def __init__(self, initial_lr, pos_weight=None, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.initial_lr = initial_lr
+        self.focal_loss = BinaryFocalLoss(alpha=alpha, gamma=gamma)
+        self.wce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    def forward(self, logits, targets, current_lr):
+        # Compute weight schedule
+        focal_weight = 1.0 - (current_lr / self.initial_lr)
+        wce_weight = 1.0 - focal_weight
+
+        # Compute individual losses
+        loss_focal = self.focal_loss(logits, targets)
+        loss_wce = self.wce_loss(logits, targets)
+
+        # Weighted combination
+        return focal_weight * loss_focal + wce_weight * loss_wce
 
 def init_weights(m):
     if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
@@ -37,7 +77,7 @@ def print_and_log(message, log_path):
 
 
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
-                batch_size=32, num_workers=4, model_save_milestone=50,
+                batch_size=32, num_workers=4, model_save_milestone=50, loss_type='weighted_ce',
                 lr_scheduler_step_size=50, lr_scheduler_gamma=0.1):
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
@@ -92,7 +132,15 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
     weight = torch.tensor([1.0, pos_weight])
     weight = weight.to(device)
-    criterion = nn.CrossEntropyLoss(weight=weight)
+    if loss_type == "combined":
+        criterion = CombinedFocalWeightedCELoss(initial_lr=learning_rate, pos_weight=pos_weight)
+        print_and_log(f"Using Combined Focal Loss and Weighted CE Loss.", log_file)
+    elif loss_type == "weighted_ce":
+        criterion = nn.CrossEntropyLoss(weight=weight)
+        print_and_log(f"Using Weighted CE Loss.", log_file)
+    else:
+        raise ValueError(f"Unsupported loss_type: {loss_type}")
+
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = StepLR(optimizer, step_size=lr_scheduler_step_size, gamma=lr_scheduler_gamma)
 
