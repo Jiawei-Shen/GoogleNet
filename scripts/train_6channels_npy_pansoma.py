@@ -331,5 +331,6 @@ if __name__ == "__main__":
         batch_size=args.batch_size, num_workers=args.num_workers,
         model_save_milestone=args.milestone,
         lr_scheduler_step_size=args.lr_decay_epochs,
-        lr_scheduler_gamma=args.lr_decay_factor
+        lr_scheduler_gamma=args.lr_decay_factor,
+        loss_type=args.loss_type,
     )
