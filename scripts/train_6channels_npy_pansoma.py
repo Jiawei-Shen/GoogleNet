@@ -320,7 +320,8 @@ if __name__ == "__main__":
     # --- MODIFIED: Added flag to control saving of validation results ---
     parser.add_argument("--save_val_results", action='store_true',
                         help="If set, save detailed classification results from the validation set at each milestone.")
-
+    parser.add_argument("--loss_type", type=str, default="weighted_ce", choices=["combined", "weighted_ce"],
+                        help="Loss function to use: 'weighted_ce' or 'focal'")
     args = parser.parse_args()
 
     train_model(
