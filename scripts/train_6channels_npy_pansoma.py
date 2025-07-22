@@ -130,14 +130,14 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     true_count = 268
     pos_weight_value = min(88.0, false_count / true_count)
     # Convert the float to a tensor and move it to the correct device
-    pos_weight_tensor = torch.tensor(pos_weight_value).to(device)
+    # pos_weight_tensor = torch.tensor(pos_weight_value).to(device)
+    class_weights = torch.tensor([1.0, pos_weight_value]).to(device)
 
     if loss_type == "combined":
-        criterion = CombinedFocalWeightedCELoss(initial_lr=learning_rate, pos_weight=pos_weight_tensor)
+        criterion = CombinedFocalWeightedCELoss(initial_lr=learning_rate, pos_weight=class_weights)
         print_and_log(f"Using Combined Focal Loss and Weighted CE Loss.", log_file)
     elif loss_type == "weighted_ce":
-        weight = torch.tensor([1.0, pos_weight_value]).to(device)
-        criterion = nn.CrossEntropyLoss(weight=weight)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
         print_and_log(f"Using Weighted CE Loss.", log_file)
     else:
         raise ValueError(f"Unsupported loss_type: {loss_type}")
