@@ -299,7 +299,7 @@ if __name__ == "__main__":
     parser.add_argument("--milestone", type=int, default=50, help="Save model every N epochs")
 
     # --- MODIFIED: Added arguments for new optimizer and scheduler ---
-    parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of epochs for linear LR warmup")
+    parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of epochs for linear LR warmup")
     parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay for AdamW optimizer")
 
     # --- REMOVED: Obsolete arguments for StepLR ---
