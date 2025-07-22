@@ -10,15 +10,15 @@ from collections import defaultdict
 import torch.nn.functional as F
 import json
 
-# Import StepLR for learning rate scheduling
-from torch.optim.lr_scheduler import StepLR
+# --- MODIFIED: Import new schedulers ---
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-# from googlenet import GoogLeNet
 from mynet import ConvNeXtCBAMClassifier
-from dataset_pansoma_npy_6ch import get_data_loader  # Using 6-channel dataloader
+from dataset_pansoma_npy_6ch import get_data_loader
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 class BinaryFocalLoss(nn.Module):
     def __init__(self, alpha=0.98, gamma=2.0, reduction='mean'):
@@ -49,16 +49,12 @@ class CombinedFocalWeightedCELoss(nn.Module):
         self.wce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     def forward(self, logits, targets, current_lr):
-        # Compute weight schedule
         focal_weight = 1.0 - (current_lr / self.initial_lr)
         wce_weight = 1.0 - focal_weight
-
-        # Compute individual losses
         loss_focal = self.focal_loss(logits, targets)
         loss_wce = self.wce_loss(logits, targets)
-
-        # Weighted combination
         return focal_weight * loss_focal + wce_weight * loss_wce
+
 
 def init_weights(m):
     if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
@@ -68,17 +64,15 @@ def init_weights(m):
 
 
 def print_and_log(message, log_path):
-    """
-    Prints a message to console and appends it to the specified log file.
-    """
     print(message)
     with open(log_path, 'a', encoding='utf-8') as f:
         f.write(message + '\n')
 
 
+# --- MODIFIED: Updated function signature with new arguments ---
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
                 batch_size=32, num_workers=4, model_save_milestone=50, loss_type='weighted_ce',
-                lr_scheduler_step_size=50, lr_scheduler_gamma=0.1):
+                warmup_epochs=10, weight_decay=0.05):
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if os.path.exists(log_file):
@@ -86,8 +80,9 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
     print_and_log(f"Using device: {device}", log_file)
     print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
+    # --- MODIFIED: Updated log message for new scheduler ---
     print_and_log(
-        f"Learning Rate will decay by a factor of {lr_scheduler_gamma} every {lr_scheduler_step_size} epochs.",
+        f"Using Cosine Annealing scheduler with a {warmup_epochs}-epoch linear warmup.",
         log_file)
     print_and_log(f"Checkpoints will be saved every {model_save_milestone} epochs into: {output_path}", log_file)
     print_and_log(f"Using {num_workers} workers for data loading.", log_file)
@@ -99,8 +94,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         num_workers=num_workers, shuffle=True
     )
 
-    # --- MODIFIED: Request paths from the validation loader ---
-    # This requires your custom Dataset to yield (image, label, path) when return_paths=True
     try:
         val_loader, _ = get_data_loader(
             data_dir=data_path, dataset_type="val", batch_size=batch_size,
@@ -108,12 +101,12 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         )
     except Exception as e:
         print_and_log(f"\nFATAL: Could not create validation data loader with 'return_paths=True'.", log_file)
-        print_and_log("Please ensure your 'dataset_pansoma_npy_6ch.py' can handle this flag and yield file paths.", log_file)
+        print_and_log("Please ensure your 'dataset_pansoma_npy_6ch.py' can handle this flag.", log_file)
         print_and_log(f"Error details: {e}", log_file)
-        return  # Exit if we can't get paths for the required evaluation
+        return
 
     if not genotype_map:
-        print_and_log("Error: genotype_map is empty. Check dataloader and dataset structure.", log_file)
+        print_and_log("Error: genotype_map is empty. Check dataloader.", log_file)
         return
     num_classes = len(genotype_map)
     if num_classes == 0:
@@ -129,9 +122,8 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     false_count = 48736
     true_count = 268
     pos_weight = min(88.0, false_count / true_count)
+    weight = torch.tensor([pos_weight]).to(device)
 
-    weight = torch.tensor([1.0, pos_weight])
-    weight = weight.to(device)
     if loss_type == "combined":
         criterion = CombinedFocalWeightedCELoss(initial_lr=learning_rate, pos_weight=pos_weight)
         print_and_log(f"Using Combined Focal Loss and Weighted CE Loss.", log_file)
@@ -141,8 +133,14 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     else:
         raise ValueError(f"Unsupported loss_type: {loss_type}")
 
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = StepLR(optimizer, step_size=lr_scheduler_step_size, gamma=lr_scheduler_gamma)
+    # --- MODIFIED: Use AdamW optimizer ---
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    print_and_log(f"Using AdamW optimizer with weight decay: {weight_decay}", log_file)
+
+    # --- MODIFIED: Set up schedulers for warmup and cosine annealing ---
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
+    main_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=0)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
 
     for epoch in range(num_epochs):
         model.train()
@@ -190,7 +188,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         epoch_train_loss = (running_loss / batch_count) if batch_count > 0 else 0.0
         epoch_train_acc = (correct_train / total_train) * 100 if total_train > 0 else 0.0
 
-        # --- MODIFIED: Unpack 4 values, including the inference results ---
         val_loss, val_acc, class_performance_stats_val, val_inference_results = evaluate_model(
             model, val_loader, criterion, genotype_map, log_file
         )
@@ -219,7 +216,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             }, milestone_path)
             print_and_log(f"\nMilestone model saved at: {milestone_path}", log_file)
 
-            # --- MODIFIED: Save the validation inference results if requested ---
             if save_val_results:
                 result_path = os.path.join(output_path, f"validation_results_epoch_{epoch + 1}.json")
                 try:
@@ -235,10 +231,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
 
 def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
-    """
-    Evaluates the model and now also returns detailed classification results.
-    Assumes data_loader yields (images, labels, paths).
-    """
     model.eval()
     running_loss_eval = 0.0
     correct_eval = 0
@@ -247,7 +239,6 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
     class_total_counts = defaultdict(int)
     batch_count_eval = 0
 
-    # --- MODIFIED: Added dictionary to store inference results ---
     inference_results = defaultdict(list)
     idx_to_class = {v: k for k, v in genotype_map.items()}
 
@@ -255,7 +246,6 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
         return 0.0, 0.0, {}, {}
 
     with torch.no_grad():
-        # --- MODIFIED: Expects data_loader to yield paths as the third item ---
         for images, labels, paths in data_loader:
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
@@ -274,12 +264,10 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
                 true_idx = labels[i].item()
                 path = paths[i]
 
-                # For accuracy stats
                 class_total_counts[true_idx] += 1
                 if pred_idx == true_idx:
                     class_correct_counts[true_idx] += 1
 
-                # For inference results file
                 predicted_class_name = idx_to_class[pred_idx]
                 inference_results[predicted_class_name].append(os.path.basename(path))
 
@@ -297,40 +285,40 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
     else:
         print_and_log("Warning: genotype_map is missing in evaluate_model.", log_file)
 
-    # --- MODIFIED: Return the inference results dictionary ---
     return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Classifier on 6-channel custom .npy dataset")
-    parser.add_argument("data_path", type=str, help="Path to the dataset (containing train/val subdirectories)")
-    parser.add_argument("-o", "--output_path", default="./saved_models_6channel", type=str,
-                        help="Path to save the model and training log")
+    parser.add_argument("data_path", type=str, help="Path to the dataset")
+    parser.add_argument("-o", "--output_path", default="./saved_models_6channel", type=str, help="Path to save model")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.001, help="Initial learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=8,
-                        help="Number of worker processes for data loading (default: 8)")
-    parser.add_argument("--milestone", type=int, default=50,
-                        help="Save model and run test inference every N epochs (milestone)")
-    parser.add_argument("--lr_decay_epochs", type=int, default=10,
-                        help="Number of epochs after which to decay learning rate")
-    parser.add_argument("--lr_decay_factor", type=float, default=0.1,
-                        help="Factor by which to decay learning rate")
-    # --- MODIFIED: Added flag to control saving of validation results ---
-    parser.add_argument("--save_val_results", action='store_true',
-                        help="If set, save detailed classification results from the validation set at each milestone.")
+    parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for data loading")
+    parser.add_argument("--milestone", type=int, default=50, help="Save model every N epochs")
+
+    # --- MODIFIED: Added arguments for new optimizer and scheduler ---
+    parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of epochs for linear LR warmup")
+    parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay for AdamW optimizer")
+
+    # --- REMOVED: Obsolete arguments for StepLR ---
+    # parser.add_argument("--lr_decay_epochs", ...)
+    # parser.add_argument("--lr_decay_factor", ...)
+
+    parser.add_argument("--save_val_results", action='store_true', help="Save validation results at each milestone.")
     parser.add_argument("--loss_type", type=str, default="weighted_ce", choices=["combined", "weighted_ce"],
-                        help="Loss function to use: 'weighted_ce' or 'focal'")
+                        help="Loss function to use")
     args = parser.parse_args()
 
     train_model(
         data_path=args.data_path, output_path=args.output_path,
-        save_val_results=args.save_val_results,  # Pass the new argument
+        save_val_results=args.save_val_results,
         num_epochs=args.epochs, learning_rate=args.lr,
         batch_size=args.batch_size, num_workers=args.num_workers,
         model_save_milestone=args.milestone,
-        lr_scheduler_step_size=args.lr_decay_epochs,
-        lr_scheduler_gamma=args.lr_decay_factor,
         loss_type=args.loss_type,
+        # --- MODIFIED: Pass new arguments to the train function ---
+        warmup_epochs=args.warmup_epochs,
+        weight_decay=args.weight_decay,
     )
