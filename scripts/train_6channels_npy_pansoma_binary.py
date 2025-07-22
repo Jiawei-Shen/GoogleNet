@@ -341,7 +341,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=0.001, help="Initial learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of worker processes for data loading")
-    parser.add_argument("--milestone", type=int, default=50, help="Checkpoint saving frequency")
+    parser.add_argument("--milestone", type=int, default=10, help="Checkpoint saving frequency")
 
     # --- MODIFIED: Added arguments for new optimizer and scheduler ---
     parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of epochs for linear LR warmup")

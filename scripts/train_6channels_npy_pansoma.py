@@ -20,32 +20,39 @@ from dataset_pansoma_npy_6ch import get_data_loader
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class BinaryFocalLoss(nn.Module):
-    def __init__(self, alpha=0.98, gamma=2.0, reduction='mean'):
-        super().__init__()
-        self.alpha = alpha
+class MultiClassFocalLoss(nn.Module):
+    """
+    Focal Loss for multi-class classification.
+    """
+    def __init__(self, gamma=2.0, weight=None, reduction='mean'):
+        super(MultiClassFocalLoss, self).__init__()
         self.gamma = gamma
+        self.weight = weight
         self.reduction = reduction
 
     def forward(self, logits, targets):
-        probs = torch.sigmoid(logits)
-        targets = targets.float()
+        log_probs = F.log_softmax(logits, dim=1)
+        log_pt = log_probs.gather(1, targets.view(-1, 1)).squeeze(1)
+        pt = torch.exp(log_pt)
 
-        pt = probs * targets + (1 - probs) * (1 - targets)
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-        focal_weight = alpha_t * (1 - pt) ** self.gamma
+        if self.weight is not None:
+            at = self.weight.gather(0, targets)
+            log_pt = log_pt * at
 
-        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        loss = focal_weight * bce
+        focal_loss = -1 * (1 - pt)**self.gamma * log_pt
 
-        return loss.mean() if self.reduction == 'mean' else loss.sum()
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
 
 
 class CombinedFocalWeightedCELoss(nn.Module):
-    def __init__(self, initial_lr, pos_weight=None, alpha=0.25, gamma=2.0):
+    def __init__(self, initial_lr, pos_weight=None, gamma=2.0):
         super().__init__()
         self.initial_lr = initial_lr
-        self.focal_loss = BinaryFocalLoss(alpha=alpha, gamma=gamma)
+        self.focal_loss = MultiClassFocalLoss(gamma=gamma, weight=pos_weight)
         self.wce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     def forward(self, logits, targets, current_lr):
@@ -72,7 +79,7 @@ def print_and_log(message, log_path):
 # --- MODIFIED: Updated function signature with new arguments ---
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
                 batch_size=32, num_workers=4, model_save_milestone=50, loss_type='weighted_ce',
-                warmup_epochs=10, weight_decay=0.05):
+                warmup_epochs=10, weight_decay=0.05, depths=None, dims=None):
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if os.path.exists(log_file):
@@ -116,7 +123,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
 
     model = ConvNeXtCBAMClassifier(in_channels=6, class_num=num_classes,
-                                   depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536]).to(device)
+                                   depths=depths, dims=dims).to(device)
 
     model.apply(init_weights)
     false_count = 48736
@@ -317,11 +324,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Classifier on 6-channel custom .npy dataset")
     parser.add_argument("data_path", type=str, help="Path to the dataset")
     parser.add_argument("-o", "--output_path", default="./saved_models_6channel", type=str, help="Path to save model")
+    parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3],
+                        help="A list of depths for the ConvNeXt stages (e.g., 3 3 27 3)")
+    parser.add_argument("--dims", type=int, nargs='+', default=[192, 384, 768, 1536],
+                        help="A list of dimensions for the ConvNeXt stages (e.g., 192 384 768 1536)")
+
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.001, help="Initial learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for data loading")
-    parser.add_argument("--milestone", type=int, default=50, help="Save model every N epochs")
+    parser.add_argument("--milestone", type=int, default=10, help="Save model every N epochs")
 
     # --- MODIFIED: Added arguments for new optimizer and scheduler ---
     parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of epochs for linear LR warmup")
@@ -346,4 +358,6 @@ if __name__ == "__main__":
         # --- MODIFIED: Pass new arguments to the train function ---
         warmup_epochs=args.warmup_epochs,
         weight_decay=args.weight_decay,
+        depths=args.depths,
+        dims=args.dims,
     )
