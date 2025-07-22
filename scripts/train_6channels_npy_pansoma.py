@@ -53,7 +53,7 @@ class CombinedFocalWeightedCELoss(nn.Module):
         super().__init__()
         self.initial_lr = initial_lr
         self.focal_loss = MultiClassFocalLoss(gamma=gamma, weight=pos_weight)
-        self.wce_loss = nn.CrossEntropyLoss(pos_weight=pos_weight)
+        self.wce_loss = nn.CrossEntropyLoss(weight=pos_weight)
 
     def forward(self, logits, targets, current_lr):
         focal_weight = 1.0 - (current_lr / self.initial_lr)
