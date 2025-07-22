@@ -79,7 +79,7 @@ def print_and_log(message, log_path):
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
                 batch_size=32, num_workers=4, model_save_milestone=50,
                 loss_type='weighted_bce', restore_path=None,
-                warmup_epochs=10, weight_decay=0.05):
+                warmup_epochs=10, weight_decay=0.05, depths=None, dims=None):
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if not restore_path and os.path.exists(log_file):
@@ -124,7 +124,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         return
     print_and_log(f"Number of classes: {num_classes}", log_file)
 
-    model = ConvNeXtCBAMClassifier(in_channels=6, class_num=1, depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024]).to(
+    model = ConvNeXtCBAMClassifier(in_channels=6, class_num=1, depths=depths, dims=dims).to(
         device)
     model.apply(init_weights)
 
@@ -337,6 +337,10 @@ if __name__ == "__main__":
     parser.add_argument("data_path", type=str, help="Path to the dataset (containing train/val subdirectories)")
     parser.add_argument("-o", "--output_path", default="./saved_models_6channel", type=str,
                         help="Path to save the model and training log")
+    parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3],
+                        help="A list of depths for the ConvNeXt stages (e.g., 3 3 27 3)")
+    parser.add_argument("--dims", type=int, nargs='+', default=[192, 384, 768, 1536],
+                        help="A list of dimensions for the ConvNeXt stages (e.g., 192 384 768 1536)")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.001, help="Initial learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
@@ -369,4 +373,6 @@ if __name__ == "__main__":
         # --- MODIFIED: Pass new arguments to the train function ---
         warmup_epochs=args.warmup_epochs,
         weight_decay=args.weight_decay,
+        depths=args.depths,
+        dims=args.dims,
     )
