@@ -179,7 +179,7 @@ class ConvNeXtCBAMClassifier(nn.Module):
             LayerNorm(dims[0], eps=1e-6, data_format="channels_first"),
             nn.GELU()
         )
-
+        print(f"depths={depths}, dims={dims}. \n")
         # --- Stages & Downsampling ---
         self.stages = nn.ModuleList()
         self.downsample_layers = nn.ModuleList()

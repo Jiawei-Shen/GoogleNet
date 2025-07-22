@@ -159,19 +159,36 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             optimizer.zero_grad()
             outputs = model(images)
 
-            if isinstance(outputs, tuple) and len(outputs) == 3:
-                main_output, aux1, aux2 = outputs
-                loss1 = criterion(main_output, labels)
-                loss2 = criterion(aux1, labels)
-                loss3 = criterion(aux2, labels)
-                loss = loss1 + 0.3 * loss2 + 0.3 * loss3
-                outputs_for_acc = main_output
-            elif isinstance(outputs, torch.Tensor):
-                loss = criterion(outputs, labels)
-                outputs_for_acc = outputs
-            else:
-                progress_bar.close()
-                raise TypeError(f"Model output type not recognized: {type(outputs)}")
+            # AFTER
+            # Check if using the special combined loss that needs current_lr
+            if loss_type == "combined":
+                if isinstance(outputs, tuple) and len(outputs) == 3:
+                    main_output, aux1, aux2 = outputs
+                    loss1 = criterion(main_output, labels, current_lr)
+                    loss2 = criterion(aux1, labels, current_lr)
+                    loss3 = criterion(aux2, labels, current_lr)
+                    loss = loss1 + 0.3 * loss2 + 0.3 * loss3
+                    outputs_for_acc = main_output
+                elif isinstance(outputs, torch.Tensor):
+                    loss = criterion(outputs, labels, current_lr)
+                    outputs_for_acc = outputs
+                else:
+                    progress_bar.close()
+                    raise TypeError(f"Model output type not recognized: {type(outputs)}")
+            else:  # For other standard losses
+                if isinstance(outputs, tuple) and len(outputs) == 3:
+                    main_output, aux1, aux2 = outputs
+                    loss1 = criterion(main_output, labels)
+                    loss2 = criterion(aux1, labels)
+                    loss3 = criterion(aux2, labels)
+                    loss = loss1 + 0.3 * loss2 + 0.3 * loss3
+                    outputs_for_acc = main_output
+                elif isinstance(outputs, torch.Tensor):
+                    loss = criterion(outputs, labels)
+                    outputs_for_acc = outputs
+                else:
+                    progress_bar.close()
+                    raise TypeError(f"Model output type not recognized: {type(outputs)}")
 
             loss.backward()
             optimizer.step()
@@ -191,7 +208,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         epoch_train_acc = (correct_train / total_train) * 100 if total_train > 0 else 0.0
 
         val_loss, val_acc, class_performance_stats_val, val_inference_results = evaluate_model(
-            model, val_loader, criterion, genotype_map, log_file
+            model, val_loader, criterion, genotype_map, log_file, loss_type, current_lr
         )
 
         if class_performance_stats_val:
@@ -232,7 +249,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     print_and_log(f"Training complete. Final model located in: {output_path}", log_file)
 
 
-def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
+def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_type, current_lr):
     model.eval()
     running_loss_eval = 0.0
     correct_eval = 0
@@ -254,7 +271,13 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file):
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
 
-            loss = criterion(outputs, labels)
+            # loss = criterion(outputs, labels)
+            # Update the loss calculation here
+            if loss_type == "combined":
+                loss = criterion(outputs, labels, current_lr)
+            else:
+                loss = criterion(outputs, labels)
+
             running_loss_eval += loss.item()
             batch_count_eval += 1
             _, predicted = torch.max(outputs, 1)
