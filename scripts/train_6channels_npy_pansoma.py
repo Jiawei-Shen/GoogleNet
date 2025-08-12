@@ -330,7 +330,7 @@ if __name__ == "__main__":
                         help="A list of dimensions for the ConvNeXt stages (e.g., 192 384 768 1536)")
 
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.001, help="Initial learning rate")
+    parser.add_argument("--lr", type=float, default=0.0001, help="Initial learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for data loading")
     parser.add_argument("--milestone", type=int, default=10, help="Save model every N epochs")
