@@ -341,7 +341,7 @@ if __name__ == "__main__":
                         help="A list of depths for the ConvNeXt stages (e.g., 3 3 27 3)")
     parser.add_argument("--dims", type=int, nargs='+', default=[192, 384, 768, 1536],
                         help="A list of dimensions for the ConvNeXt stages (e.g., 192 384 768 1536)")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.001, help="Initial learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of worker processes for data loading")
