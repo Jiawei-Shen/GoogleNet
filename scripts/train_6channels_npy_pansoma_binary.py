@@ -348,15 +348,15 @@ if __name__ == "__main__":
     parser.add_argument("--milestone", type=int, default=10, help="Checkpoint saving frequency")
 
     # --- MODIFIED: Added arguments for new optimizer and scheduler ---
-    parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of epochs for linear LR warmup")
-    parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay for AdamW optimizer")
+    parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of epochs for linear LR warmup")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
 
     # --- REMOVED: Obsolete arguments for StepLR ---
     # parser.add_argument("--lr_decay_epochs", ...)
     # parser.add_argument("--lr_decay_factor", ...)
 
     parser.add_argument("--save_val_results", action='store_true', help="Save validation results per milestone")
-    parser.add_argument("--loss_type", type=str, default="weighted_bce", choices=["weighted_bce", "focal"],
+    parser.add_argument("--loss_type", type=str, default="focal", choices=["weighted_bce", "focal"],
                         help="Loss function to use: 'weighted_bce' or 'focal'")
     parser.add_argument("--restore", type=str, default=None,
                         help="Path to a .pth checkpoint file to restore training from.")
