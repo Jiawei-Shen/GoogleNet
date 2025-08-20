@@ -615,7 +615,6 @@ if __name__ == "__main__":
         data_path_or_pair = (train_roots, val_roots)
 
     # --- DDP init (takes precedence over DataParallel) ---
-    global IS_MAIN_PROCESS, device
     if args.ddp:
         if not torch.cuda.is_available():
             raise RuntimeError("DDP requires CUDA available.")
