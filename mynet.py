@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.models.layers import trunc_normal_, DropPath
+from timm.layers import DropPath, trunc_normal_, Mlp
 
 
 def same_padding_conv(in_channels, out_channels, kernel_size, stride=1, groups=1):
