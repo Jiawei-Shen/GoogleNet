@@ -8,6 +8,7 @@ import os
 from tqdm import tqdm
 from collections import defaultdict
 import torch.nn.functional as F
+from torch.utils.data import Subset, DataLoader
 import json
 
 # --- MODIFIED: Import new schedulers ---
@@ -76,30 +77,46 @@ def print_and_log(message, log_path):
         f.write(message + '\n')
 
 
-# --- MODIFIED: Updated function signature with new arguments ---
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
-                batch_size=32, num_workers=4, model_save_milestone=50, loss_type='weighted_ce',
-                warmup_epochs=10, weight_decay=0.05, depths=None, dims=None):
+                batch_size=32, num_workers=4, loss_type='weighted_ce',
+                warmup_epochs=10, weight_decay=0.05, depths=None, dims=None,
+                training_data_ratio=1.0):
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if os.path.exists(log_file):
         os.remove(log_file)
 
+    MIN_SAVE_EPOCH = 5  # save first checkpoint after 5 epochs
+
+    if not (0 < training_data_ratio <= 1.0):
+        raise ValueError(f"--training_data_ratio must be in (0,1], got {training_data_ratio}")
+
     print_and_log(f"Using device: {device}", log_file)
     print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
-    # --- MODIFIED: Updated log message for new scheduler ---
+    print_and_log(f"Using Cosine Annealing scheduler with a {warmup_epochs}-epoch linear warmup.", log_file)
     print_and_log(
-        f"Using Cosine Annealing scheduler with a {warmup_epochs}-epoch linear warmup.",
+        f"Checkpointing: snapshot at epoch {MIN_SAVE_EPOCH}, then save only when validation improves (best so far).",
         log_file)
-    print_and_log(f"Checkpoints will be saved every {model_save_milestone} epochs into: {output_path}", log_file)
     print_and_log(f"Using {num_workers} workers for data loading.", log_file)
     if save_val_results:
-        print_and_log("Validation classification results will be saved at each milestone.", log_file)
+        print_and_log("Will save validation results when a new best is found.", log_file)
 
+    # Build loaders
     train_loader, genotype_map = get_data_loader(
         data_dir=data_path, dataset_type="train", batch_size=batch_size,
         num_workers=num_workers, shuffle=True
     )
+
+    # Randomly subsample training data if requested
+    if training_data_ratio < 1.0:
+        full_ds = train_loader.dataset
+        n = len(full_ds)
+        k = max(1, int(round(n * training_data_ratio)))
+        idx = torch.randperm(n)[:k].tolist()
+        subset = Subset(full_ds, idx)
+        train_loader = DataLoader(subset, batch_size=batch_size, shuffle=True,
+                                  num_workers=num_workers, pin_memory=True)
+        print_and_log(f"Training subset: using {k}/{n} samples (~{training_data_ratio:.2f} of data).", log_file)
 
     try:
         val_loader, _ = get_data_loader(
@@ -140,14 +157,16 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     else:
         raise ValueError(f"Unsupported loss_type: {loss_type}")
 
-    # --- MODIFIED: Use AdamW optimizer ---
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     print_and_log(f"Using AdamW optimizer with weight decay: {weight_decay}", log_file)
 
-    # --- MODIFIED: Set up schedulers for warmup and cosine annealing ---
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
     main_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=0)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
+
+    best_val_acc = float("-inf")
+    best_val_loss = float("inf")
+    best_epoch = 0
 
     for epoch in range(num_epochs):
         model.train()
@@ -227,29 +246,62 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}% (LR: {current_lr:.1e})")
         print_and_log(summary_msg, log_file)
 
-        scheduler.step()
-
-        if (epoch + 1) % model_save_milestone == 0 or (epoch + 1) == num_epochs:
-            milestone_path = os.path.join(output_path, f"model_epoch_{epoch + 1}.pth")
+        # Snapshot at epoch 5
+        if (epoch + 1) == MIN_SAVE_EPOCH:
+            snap_path = os.path.join(output_path, f"model_epoch_{MIN_SAVE_EPOCH}.pth")
             torch.save({
-                'epoch': epoch + 1, 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict(),
-                'genotype_map': genotype_map, 'in_channels': 6
-            }, milestone_path)
-            print_and_log(f"\nMilestone model saved at: {milestone_path}", log_file)
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'genotype_map': genotype_map,
+                'in_channels': 6
+            }, snap_path)
+            print_and_log(f"\nSnapshot saved at epoch {epoch + 1}: {snap_path}", log_file)
+
+        # Save on validation improvement (primary: higher acc; tie-breaker: lower loss), after epoch 5
+        improved = (val_acc > best_val_acc) or (val_acc == best_val_acc and val_loss < best_val_loss)
+        if (epoch + 1) >= MIN_SAVE_EPOCH and improved:
+            best_val_acc = val_acc
+            best_val_loss = val_loss
+            best_epoch = epoch + 1
+
+            best_path = os.path.join(output_path, "model_best.pth")
+            torch.save({
+                'epoch': best_epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'genotype_map': genotype_map,
+                'in_channels': 6,
+                'best_val_acc': best_val_acc,
+                'best_val_loss': best_val_loss,
+            }, best_path)
+            print_and_log(f"\nNew BEST at epoch {best_epoch}: Val Acc {best_val_acc:.2f}%, Val Loss {best_val_loss:.4f}. Saved: {best_path}", log_file)
 
             if save_val_results:
-                result_path = os.path.join(output_path, f"validation_results_epoch_{epoch + 1}.json")
+                result_path = os.path.join(output_path, "validation_results_best.json")
                 try:
                     with open(result_path, 'w') as f:
-                        json.dump(val_inference_results, f, indent=4)
-                    print_and_log(f"Saved validation results for epoch {epoch + 1} to {result_path}", log_file)
+                        json.dump({
+                            'epoch': best_epoch,
+                            'val_acc': best_val_acc,
+                            'val_loss': best_val_loss,
+                            'inference_results': val_inference_results
+                        }, f, indent=4)
+                    print_and_log(f"Saved best validation results to {result_path}", log_file)
                 except Exception as e:
-                    print_and_log(f"Error saving validation results: {e}", log_file)
+                    print_and_log(f"Error saving best validation results: {e}", log_file)
 
+        scheduler.step()
         print_and_log("-" * 30, log_file)
 
-    print_and_log(f"Training complete. Final model located in: {output_path}", log_file)
+    print_and_log(
+        f"Training complete. Best epoch: {best_epoch} with Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
+        f"Best model: {os.path.join(output_path, 'model_best.pth')}",
+        log_file
+    )
+
 
 
 def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_type, current_lr):
@@ -378,8 +430,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.0001, help="Initial learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for data loading")
-    parser.add_argument("--milestone", type=int, default=10, help="Save model every N epochs")
+    parser.add_argument("--num_workers", type=int, default=16, help="Number of workers for data loading")
+    # parser.add_argument("--milestone", type=int, default=10, help="Save model every N epochs")
 
     # Optimizer / scheduler (unchanged)
     parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of epochs for linear LR warmup")
@@ -393,12 +445,17 @@ if __name__ == "__main__":
                         help="Text file listing TRAIN dataset roots (one per line).")
     parser.add_argument("--val_data_paths_file", type=str, default=None,
                         help="Text file listing VAL dataset roots (one per line).")
+    parser.add_argument("--training_data_ratio", type=float, default=1.0,
+                        help="Proportion of training data to use (0–1]. Randomly subsamples the training set.")
 
     args = parser.parse_args()
 
     # ---- Enforce: exactly one of (data_path) OR (both files) ----
     has_base = args.data_path is not None
     has_both_files = (args.train_data_paths_file is not None) and (args.val_data_paths_file is not None)
+
+    if not (0 < args.training_data_ratio <= 1.0):
+        parser.error(f"--training_data_ratio must be in (0,1], got {args.training_data_ratio}")
 
     if has_base and has_both_files:
         parser.error("Provide either positional data_path (Mode A) OR both --train_data_paths_file and "
@@ -430,10 +487,11 @@ if __name__ == "__main__":
         save_val_results=args.save_val_results,
         num_epochs=args.epochs, learning_rate=args.lr,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        model_save_milestone=args.milestone,
         loss_type=args.loss_type,
         warmup_epochs=args.warmup_epochs,
         weight_decay=args.weight_decay,
         depths=args.depths,
         dims=args.dims,
+        training_data_ratio=args.training_data_ratio,
     )
+
