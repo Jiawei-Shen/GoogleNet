@@ -229,7 +229,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         epoch_train_loss = (running_loss / batch_count) if batch_count > 0 else 0.0
         epoch_train_acc = (correct_train / total_train) * 100 if total_train > 0 else 0.0
 
-        val_loss, val_acc, class_performance_stats_val, val_inference_results = evaluate_model(
+        val_loss, val_acc, class_performance_stats_val, val_inference_results, val_metrics = evaluate_model(
             model, val_loader, criterion, genotype_map, log_file, loss_type, current_lr
         )
 
@@ -242,8 +242,15 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                     log_file)
 
         summary_msg = (
-            f"Epoch {epoch + 1}/{num_epochs} Summary - Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.2f}%, "
-            f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}% (LR: {current_lr:.1e})")
+            f"Epoch {epoch + 1}/{num_epochs} Summary - "
+            f"Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.2f}%, "
+            f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}% | "
+            f"Prec: {val_metrics['precision_macro'] * 100:.2f}%, "
+            f"Rec: {val_metrics['recall_macro'] * 100:.2f}%, "
+            f"F1: {val_metrics['f1_macro'] * 100:.2f}% "
+            f"(LR: {current_lr:.1e})"
+        )
+
         print_and_log(summary_msg, log_file)
 
         # Snapshot at epoch 5
@@ -313,11 +320,21 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
     class_total_counts = defaultdict(int)
     batch_count_eval = 0
 
+    # NEW: for precision/recall/F1
+    tp = defaultdict(int)
+    fp = defaultdict(int)
+    fn = defaultdict(int)
+
     inference_results = defaultdict(list)
     idx_to_class = {v: k for k, v in genotype_map.items()}
 
     if not data_loader or len(data_loader) == 0:
-        return 0.0, 0.0, {}, {}
+        # Return zeros + empty metrics
+        metrics = {
+            'precision_macro': 0.0, 'recall_macro': 0.0, 'f1_macro': 0.0,
+            'precision_weighted': 0.0, 'recall_weighted': 0.0, 'f1_weighted': 0.0
+        }
+        return 0.0, 0.0, {}, {}, metrics
 
     with torch.no_grad():
         for images, labels, paths in data_loader:
@@ -326,6 +343,7 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
 
+            # Compute loss
             if loss_type == "combined":
                 loss = criterion(outputs, labels, current_lr)
             else:
@@ -333,18 +351,25 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
 
             running_loss_eval += loss.item()
             batch_count_eval += 1
+
             _, predicted = torch.max(outputs, 1)
             correct_eval += (predicted == labels).sum().item()
             total_eval += labels.size(0)
 
+            # Accumulate per-class stats
             for i, pred_idx_tensor in enumerate(predicted):
-                pred_idx = pred_idx_tensor.item()
-                true_idx = labels[i].item()
+                pred_idx = int(pred_idx_tensor.item())
+                true_idx = int(labels[i].item())
                 path = paths[i]
 
+                # accuracy & class-wise accuracy
                 class_total_counts[true_idx] += 1
                 if pred_idx == true_idx:
                     class_correct_counts[true_idx] += 1
+                    tp[true_idx] += 1
+                else:
+                    fp[pred_idx] += 1
+                    fn[true_idx] += 1
 
                 predicted_class_name = idx_to_class[pred_idx]
                 inference_results[predicted_class_name].append(os.path.basename(path))
@@ -352,18 +377,68 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
     avg_loss_eval = (running_loss_eval / batch_count_eval) if batch_count_eval > 0 else 0.0
     overall_accuracy_eval = (correct_eval / total_eval) * 100 if total_eval > 0 else 0.0
 
+    # Build class-wise stats dict (unchanged behavior)
     class_performance_stats = {}
     if genotype_map:
         for class_name, class_idx in genotype_map.items():
             correct_c = class_correct_counts[class_idx]
             total_c = class_total_counts[class_idx]
             acc_c = (correct_c / total_c) * 100 if total_c > 0 else 0.0
-            class_performance_stats[class_name] = {'acc': acc_c, 'correct': correct_c, 'total': total_c,
-                                                   'idx': class_idx}
+            class_performance_stats[class_name] = {
+                'acc': acc_c, 'correct': correct_c, 'total': total_c, 'idx': class_idx
+            }
     else:
         print_and_log("Warning: genotype_map is missing in evaluate_model.", log_file)
 
-    return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results
+    # ---- NEW: precision/recall/F1 (macro & weighted) ----
+    class_indices = list(genotype_map.values()) if genotype_map else list(set(list(tp.keys()) + list(fp.keys()) + list(fn.keys())))
+    precisions, recalls, f1s = [], [], []
+    supports = []
+
+    for c in class_indices:
+        tpc = tp[c]
+        fpc = fp[c]
+        fnc = fn[c]
+        denom_p = tpc + fpc
+        denom_r = tpc + fnc
+
+        pc = (tpc / denom_p) if denom_p > 0 else 0.0
+        rc = (tpc / denom_r) if denom_r > 0 else 0.0
+        fc = (2 * pc * rc / (pc + rc)) if (pc + rc) > 0 else 0.0
+
+        precisions.append(pc)
+        recalls.append(rc)
+        f1s.append(fc)
+        supports.append(tpc + fnc)  # ground-truth count for class
+
+    # macro
+    if len(class_indices) > 0:
+        precision_macro = sum(precisions) / len(precisions)
+        recall_macro = sum(recalls) / len(recalls)
+        f1_macro = sum(f1s) / len(f1s)
+    else:
+        precision_macro = recall_macro = f1_macro = 0.0
+
+    # weighted (by support)
+    total_support = sum(supports)
+    if total_support > 0:
+        precision_weighted = sum(p * s for p, s in zip(precisions, supports)) / total_support
+        recall_weighted = sum(r * s for r, s in zip(recalls, supports)) / total_support
+        f1_weighted = sum(f * s for f, s in zip(f1s, supports)) / total_support
+    else:
+        precision_weighted = recall_weighted = f1_weighted = 0.0
+
+    metrics = {
+        'precision_macro': precision_macro,
+        'recall_macro': recall_macro,
+        'f1_macro': f1_macro,
+        'precision_weighted': precision_weighted,
+        'recall_weighted': recall_weighted,
+        'f1_weighted': f1_weighted,
+    }
+
+    # Return with metrics as 5th element
+    return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results, metrics
 
 
 # --- MODIFIED: helpers for path resolution ---
@@ -430,7 +505,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.0001, help="Initial learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=16, help="Number of workers for data loading")
+    parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for data loading")
     # parser.add_argument("--milestone", type=int, default=10, help="Save model every N epochs")
 
     # Optimizer / scheduler (unchanged)
