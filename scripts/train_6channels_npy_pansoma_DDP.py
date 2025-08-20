@@ -168,7 +168,13 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     # DDP (multi-process) takes precedence if requested
     if ddp:
         print_and_log(f"Wrapping model in DistributedDataParallel on cuda:{local_rank}.", log_file)
-        model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            gradient_as_bucket_view=True,  # <- key line
+            broadcast_buffers=False,
+        )
 
         # Attach DistributedSampler to train/val datasets
         train_dataset = train_loader.dataset
