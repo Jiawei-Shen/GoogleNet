@@ -320,6 +320,52 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
     return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results
 
 
+# --- MODIFIED: helper to resolve multiple dataset roots ---
+def _read_paths_file(file_path):
+    paths = []
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith('#'):
+                    continue
+                paths.append(os.path.abspath(os.path.expanduser(s)))
+    except Exception:
+        pass
+    return paths
+
+
+def _resolve_data_roots(primary_path, extra_paths, paths_file):
+    # Start with the required positional path
+    candidates = []
+    if primary_path:
+        candidates.append(os.path.abspath(os.path.expanduser(primary_path)))
+
+    # Add from --data_paths
+    if extra_paths:
+        for p in extra_paths:
+            candidates.append(os.path.abspath(os.path.expanduser(p)))
+
+    # Add from --data_paths_file
+    if paths_file:
+        candidates.extend(_read_paths_file(paths_file))
+
+    # Deduplicate while preserving order
+    seen = set()
+    deduped = []
+    for p in candidates:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+
+    # If more than one, return list; else return single string
+    if len(deduped) == 0:
+        return primary_path  # fall back (shouldn't happen)
+    if len(deduped) == 1:
+        return deduped[0]
+    return deduped
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Classifier on 6-channel custom .npy dataset")
     parser.add_argument("data_path", type=str, help="Path to the dataset")
@@ -346,10 +392,20 @@ if __name__ == "__main__":
     parser.add_argument("--save_val_results", action='store_true', help="Save validation results at each milestone.")
     parser.add_argument("--loss_type", type=str, default="weighted_ce", choices=["combined", "weighted_ce"],
                         help="Loss function to use")
+
+    # --- MODIFIED: new options for multiple data roots ---
+    parser.add_argument("--data_paths", nargs='+', default=None,
+                        help="Additional dataset root paths (space-separated).")
+    parser.add_argument("--data_paths_file", type=str, default=None,
+                        help="Text file listing dataset root paths (one per line).")
+
     args = parser.parse_args()
 
+    # --- MODIFIED: resolve single vs multiple roots; pass through unchanged API name 'data_path' ---
+    data_path_or_paths = _resolve_data_roots(args.data_path, args.data_paths, args.data_paths_file)
+
     train_model(
-        data_path=args.data_path, output_path=args.output_path,
+        data_path=data_path_or_paths, output_path=args.output_path,
         save_val_results=args.save_val_results,
         num_epochs=args.epochs, learning_rate=args.lr,
         batch_size=args.batch_size, num_workers=args.num_workers,

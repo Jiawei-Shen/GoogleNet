@@ -96,8 +96,8 @@ if __name__ == "__main__":
     parser.add_argument("output_dir", type=str,
                         help="Path to the output directory where organized dataset will be saved.")
     parser.add_argument("--train_ratio", type=float, default=0.7, help="Proportion of data for training (default: 0.7)")
-    parser.add_argument("--val_ratio", type=float, default=0.15,
-                        help="Proportion of data for validation (default: 0.15)")
+    parser.add_argument("--val_ratio", type=float, default=0.3,
+                        help="Proportion of data for validation (default: 0.3)")
     parser.add_argument("--include_png", action="store_true",
                         help="Include .png files corresponding to .npy files (default: False)")
 

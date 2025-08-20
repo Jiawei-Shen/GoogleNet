@@ -77,26 +77,79 @@ class NpyDataset(Dataset):
 def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=8, shuffle: bool = False,
                     return_paths: bool = False):
     """
-    Load dataset from the given path using NpyDataset.
-    Returns a DataLoader and a class-to-index mapping.
+    Load dataset(s) using NpyDataset.
+
+    Behavior:
+      • If data_dir is (train_roots, val_roots):
+          - Pick roots by dataset_type ("train" -> train_roots, "val" -> val_roots)
+          - For EACH root, include BOTH 'train' and 'val' subfolders.
+      • Else (str or list/tuple of str): back-compat mode:
+          - Include only the requested `dataset_type` subfolder for each root.
+
+    Returns: (DataLoader, class_to_idx)
     """
-    dataset_path = os.path.join(data_dir, dataset_type)
+    import os
+    from torch.utils.data import DataLoader, ConcatDataset
+    from torchvision import transforms
 
-    if not os.path.exists(dataset_path):
-        raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
+    def _to_list(x):
+        if x is None:
+            return []
+        if isinstance(x, (list, tuple)):
+            return list(x)
+        return [x]
 
-    # --- REVISED: Updated normalization for 6 channels ---
-    # 🚨 IMPORTANT: You must calculate and replace these placeholder values
-    # with the actual mean and std of your 6-channel dataset.
+    # Decide which roots and which subfolders to include
+    if isinstance(data_dir, (list, tuple)) and len(data_dir) == 2 \
+       and (isinstance(data_dir[0], (str, list, tuple)) and isinstance(data_dir[1], (str, list, tuple))):
+        # New split-mode: (train_roots, val_roots)
+        roots = _to_list(data_dir[0] if dataset_type == "train" else data_dir[1])
+        subfolders = ["train", "val"]  # ← include BOTH for each root
+    else:
+        # Back-compat: single root or list of roots; only requested split
+        roots = _to_list(data_dir)
+        subfolders = [dataset_type]
+
+    # Expand to concrete dataset directories
+    dataset_dirs = []
+    for r in roots:
+        r = os.path.abspath(os.path.expanduser(r))
+        for sf in subfolders:
+            dataset_dirs.append(os.path.join(r, sf))
+
+    # Existence check (strict, like original)
+    missing = [p for p in dataset_dirs if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(f"Dataset path(s) do not exist: {missing}")
+
+    # 6-channel normalization (unchanged placeholders)
     transform = transforms.Compose([
-        transforms.Normalize(mean = [18.417816162109375, 12.649129867553711, -0.5452527403831482, 24.723854064941406, 4.690611362457275, 10.659969329833984],
-                             std  = [25.028322219848633, 14.809632301330566, 0.6181337833404541, 29.972835540771484, 7.9231791496276855, 27.151996612548828])
+        transforms.Normalize(
+            mean=[18.417816162109375, 12.649129867553711, -0.5452527403831482,
+                  24.723854064941406, 4.690611362457275, 10.659969329833984],
+            std=[25.028322219848633, 14.809632301330566, 0.6181337833404541,
+                 29.972835540771484, 7.9231791496276855, 27.151996612548828]
+        )
     ])
 
-    dataset = NpyDataset(root_dir=dataset_path, transform=transform, return_paths=return_paths)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
+    # Build datasets and verify consistent class_to_idx
+    datasets = []
+    unified_class_to_idx = None
+    for d in dataset_dirs:
+        ds = NpyDataset(root_dir=d, transform=transform, return_paths=return_paths)
+        if unified_class_to_idx is None:
+            unified_class_to_idx = ds.class_to_idx
+        else:
+            if ds.class_to_idx != unified_class_to_idx:
+                raise ValueError("class_to_idx mismatch across dataset roots/subfolders.")
+        datasets.append(ds)
 
-    return loader, dataset.class_to_idx
+    dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
+                        num_workers=num_workers, pin_memory=True)
+
+    return loader, unified_class_to_idx
+
 
 
 if __name__ == "__main__":
