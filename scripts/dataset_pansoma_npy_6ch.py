@@ -151,7 +151,6 @@ def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=8, shuffl
     return loader, unified_class_to_idx
 
 
-
 if __name__ == "__main__":
     # --- IMPORTANT ---
     # Update this path to the root directory containing your 'train', 'val', and 'test' folders.

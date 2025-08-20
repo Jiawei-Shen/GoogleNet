@@ -129,8 +129,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     false_count = 48736
     true_count = 268
     pos_weight_value = min(88.0, false_count / true_count)
-    # Convert the float to a tensor and move it to the correct device
-    # pos_weight_tensor = torch.tensor(pos_weight_value).to(device)
     class_weights = torch.tensor([1.0, pos_weight_value]).to(device)
 
     if loss_type == "combined":
@@ -166,8 +164,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             optimizer.zero_grad()
             outputs = model(images)
 
-            # AFTER
-            # Check if using the special combined loss that needs current_lr
             if loss_type == "combined":
                 if isinstance(outputs, tuple) and len(outputs) == 3:
                     main_output, aux1, aux2 = outputs
@@ -182,7 +178,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 else:
                     progress_bar.close()
                     raise TypeError(f"Model output type not recognized: {type(outputs)}")
-            else:  # For other standard losses
+            else:
                 if isinstance(outputs, tuple) and len(outputs) == 3:
                     main_output, aux1, aux2 = outputs
                     loss1 = criterion(main_output, labels)
@@ -278,8 +274,6 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
 
-            # loss = criterion(outputs, labels)
-            # Update the loss calculation here
             if loss_type == "combined":
                 loss = criterion(outputs, labels, current_lr)
             else:
@@ -320,7 +314,7 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
     return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results
 
 
-# --- MODIFIED: helper to resolve multiple dataset roots ---
+# --- MODIFIED: helpers for path resolution ---
 def _read_paths_file(file_path):
     paths = []
     try:
@@ -336,34 +330,49 @@ def _read_paths_file(file_path):
 
 
 def _resolve_data_roots(primary_path, extra_paths, paths_file):
-    # Start with the required positional path
     candidates = []
     if primary_path:
         candidates.append(os.path.abspath(os.path.expanduser(primary_path)))
-
-    # Add from --data_paths
     if extra_paths:
         for p in extra_paths:
             candidates.append(os.path.abspath(os.path.expanduser(p)))
-
-    # Add from --data_paths_file
     if paths_file:
         candidates.extend(_read_paths_file(paths_file))
-
-    # Deduplicate while preserving order
     seen = set()
     deduped = []
     for p in candidates:
         if p not in seen:
             seen.add(p)
             deduped.append(p)
-
-    # If more than one, return list; else return single string
     if len(deduped) == 0:
-        return primary_path  # fall back (shouldn't happen)
+        return primary_path
     if len(deduped) == 1:
         return deduped[0]
     return deduped
+
+
+def _resolve_paths_arg(paths_list, paths_file, fallback_single):
+    """
+    Merge multiple path sources for the new args.
+    Returns a list of absolute paths (can be empty if nothing was provided).
+    """
+    out = []
+    if paths_list:
+        for p in paths_list:
+            out.append(os.path.abspath(os.path.expanduser(p)))
+    if paths_file:
+        out.extend(_read_paths_file(paths_file))
+    # Dedup, preserve order
+    seen = set()
+    out_dedup = []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            out_dedup.append(p)
+    # If still empty, optionally use fallback (positional data_path)
+    if not out_dedup and fallback_single:
+        out_dedup = [os.path.abspath(os.path.expanduser(fallback_single))]
+    return out_dedup
 
 
 if __name__ == "__main__":
@@ -385,35 +394,79 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of epochs for linear LR warmup")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
 
-    # --- REMOVED: Obsolete arguments for StepLR ---
-    # parser.add_argument("--lr_decay_epochs", ...)
-    # parser.add_argument("--lr_decay_factor", ...)
-
     parser.add_argument("--save_val_results", action='store_true', help="Save validation results at each milestone.")
     parser.add_argument("--loss_type", type=str, default="weighted_ce", choices=["combined", "weighted_ce"],
                         help="Loss function to use")
 
-    # --- MODIFIED: new options for multiple data roots ---
+    # --- EXISTING (kept): multiple data roots (old mode)
     parser.add_argument("--data_paths", nargs='+', default=None,
                         help="Additional dataset root paths (space-separated).")
     parser.add_argument("--data_paths_file", type=str, default=None,
                         help="Text file listing dataset root paths (one per line).")
 
+    # --- NEW: split train/val root groups; each can be many or a txt file ---
+    parser.add_argument("--train_data_paths", nargs='+', default=None,
+                        help="Training dataset root paths (space-separated). Use with --train_data_paths_file for a list file.")
+    parser.add_argument("--train_data_paths_file", type=str, default=None,
+                        help="Text file with training dataset roots (one per line).")
+    parser.add_argument("--val_data_paths", nargs='+', default=None,
+                        help="Validation dataset root paths (space-separated). Use with --val_data_paths_file for a list file.")
+    parser.add_argument("--val_data_paths_file", type=str, default=None,
+                        help="Text file with validation dataset roots (one per line).")
+
     args = parser.parse_args()
 
-    # --- MODIFIED: resolve single vs multiple roots; pass through unchanged API name 'data_path' ---
-    data_path_or_paths = _resolve_data_roots(args.data_path, args.data_paths, args.data_paths_file)
+    # --- NEW MODE: if any of the split args are provided, use them ---
+    use_split_mode = any([
+        args.train_data_paths, args.train_data_paths_file,
+        args.val_data_paths, args.val_data_paths_file
+    ])
 
-    train_model(
-        data_path=data_path_or_paths, output_path=args.output_path,
-        save_val_results=args.save_val_results,
-        num_epochs=args.epochs, learning_rate=args.lr,
-        batch_size=args.batch_size, num_workers=args.num_workers,
-        model_save_milestone=args.milestone,
-        loss_type=args.loss_type,
-        # --- MODIFIED: Pass new arguments to the train function ---
-        warmup_epochs=args.warmup_epochs,
-        weight_decay=args.weight_decay,
-        depths=args.depths,
-        dims=args.dims,
-    )
+    if use_split_mode:
+        train_roots = _resolve_paths_arg(args.train_data_paths, args.train_data_paths_file, args.data_path)
+        val_roots   = _resolve_paths_arg(args.val_data_paths, args.val_data_paths_file, args.data_path)
+
+        # Pass a PAIR into get_data_loader; inside it, for each side we load BOTH 'train' and 'val'
+        train_loader, genotype_map = get_data_loader(
+            data_dir=(train_roots, val_roots), dataset_type="train",
+            batch_size=args.batch_size, num_workers=args.num_workers, shuffle=True
+        )
+        try:
+            val_loader, _ = get_data_loader(
+                data_dir=(train_roots, val_roots), dataset_type="val",
+                batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False, return_paths=True
+            )
+        except Exception as e:
+            print_and_log(f"\nFATAL: Could not create validation data loader with 'return_paths=True'.", os.path.join(args.output_path, "training_log_6ch.txt"))
+            print_and_log("Please ensure your 'dataset_pansoma_npy_6ch.py' supports the (train_paths, val_paths) pair and loads BOTH subfolders.", os.path.join(args.output_path, "training_log_6ch.txt"))
+            print_and_log(f"Error details: {e}", os.path.join(args.output_path, "training_log_6ch.txt"))
+            sys.exit(1)
+
+        # Continue training with the resolved pair
+        train_model(
+            data_path=(train_roots, val_roots), output_path=args.output_path,
+            save_val_results=args.save_val_results,
+            num_epochs=args.epochs, learning_rate=args.lr,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+            model_save_milestone=args.milestone,
+            loss_type=args.loss_type,
+            warmup_epochs=args.warmup_epochs,
+            weight_decay=args.weight_decay,
+            depths=args.depths,
+            dims=args.dims,
+        )
+    else:
+        # OLD MODE: preserve original behavior (positional + optional old multi-root flags)
+        data_path_or_paths = _resolve_data_roots(args.data_path, args.data_paths, args.data_paths_file)
+        train_model(
+            data_path=data_path_or_paths, output_path=args.output_path,
+            save_val_results=args.save_val_results,
+            num_epochs=args.epochs, learning_rate=args.lr,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+            model_save_milestone=args.milestone,
+            loss_type=args.loss_type,
+            warmup_epochs=args.warmup_epochs,
+            weight_decay=args.weight_decay,
+            depths=args.depths,
+            dims=args.dims,
+        )
