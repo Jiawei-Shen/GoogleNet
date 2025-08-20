@@ -351,33 +351,24 @@ def _resolve_data_roots(primary_path, extra_paths, paths_file):
     return deduped
 
 
-def _resolve_paths_arg(paths_list, paths_file, fallback_single):
-    """
-    Merge multiple path sources for the new args.
-    Returns a list of absolute paths (can be empty if nothing was provided).
-    """
-    out = []
-    if paths_list:
-        for p in paths_list:
-            out.append(os.path.abspath(os.path.expanduser(p)))
-    if paths_file:
-        out.extend(_read_paths_file(paths_file))
-    # Dedup, preserve order
-    seen = set()
-    out_dedup = []
-    for p in out:
-        if p not in seen:
-            seen.add(p)
-            out_dedup.append(p)
-    # If still empty, optionally use fallback (positional data_path)
-    if not out_dedup and fallback_single:
-        out_dedup = [os.path.abspath(os.path.expanduser(fallback_single))]
-    return out_dedup
-
+# Helper to read a list of roots from a txt file (one path per line)
+def _read_paths_file(file_path):
+    paths = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith('#'):
+                continue
+            paths.append(os.path.abspath(os.path.expanduser(s)))
+    return paths
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Classifier on 6-channel custom .npy dataset")
-    parser.add_argument("data_path", type=str, help="Path to the dataset")
+
+    # Make data_path OPTIONAL; we will enforce XOR with the files mode
+    parser.add_argument("data_path", nargs="?", type=str,
+                        help="Dataset root containing 'train/' and 'val/' (Mode A).")
+
     parser.add_argument("-o", "--output_path", default="./saved_models_6channel", type=str, help="Path to save model")
     parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3],
                         help="A list of depths for the ConvNeXt stages (e.g., 3 3 27 3)")
@@ -390,83 +381,60 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for data loading")
     parser.add_argument("--milestone", type=int, default=10, help="Save model every N epochs")
 
-    # --- MODIFIED: Added arguments for new optimizer and scheduler ---
+    # Optimizer / scheduler (unchanged)
     parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of epochs for linear LR warmup")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
-
     parser.add_argument("--save_val_results", action='store_true', help="Save validation results at each milestone.")
     parser.add_argument("--loss_type", type=str, default="weighted_ce", choices=["combined", "weighted_ce"],
                         help="Loss function to use")
 
-    # --- EXISTING (kept): multiple data roots (old mode)
-    parser.add_argument("--data_paths", nargs='+', default=None,
-                        help="Additional dataset root paths (space-separated).")
-    parser.add_argument("--data_paths_file", type=str, default=None,
-                        help="Text file listing dataset root paths (one per line).")
-
-    # --- NEW: split train/val root groups; each can be many or a txt file ---
-    parser.add_argument("--train_data_paths", nargs='+', default=None,
-                        help="Training dataset root paths (space-separated). Use with --train_data_paths_file for a list file.")
+    # NEW: Mode B (files) — both must be provided together when using files mode
     parser.add_argument("--train_data_paths_file", type=str, default=None,
-                        help="Text file with training dataset roots (one per line).")
-    parser.add_argument("--val_data_paths", nargs='+', default=None,
-                        help="Validation dataset root paths (space-separated). Use with --val_data_paths_file for a list file.")
+                        help="Text file listing TRAIN dataset roots (one per line).")
     parser.add_argument("--val_data_paths_file", type=str, default=None,
-                        help="Text file with validation dataset roots (one per line).")
+                        help="Text file listing VAL dataset roots (one per line).")
 
     args = parser.parse_args()
 
-    # --- NEW MODE: if any of the split args are provided, use them ---
-    use_split_mode = any([
-        args.train_data_paths, args.train_data_paths_file,
-        args.val_data_paths, args.val_data_paths_file
-    ])
+    # ---- Enforce: exactly one of (data_path) OR (both files) ----
+    has_base = args.data_path is not None
+    has_both_files = (args.train_data_paths_file is not None) and (args.val_data_paths_file is not None)
 
-    if use_split_mode:
-        train_roots = _resolve_paths_arg(args.train_data_paths, args.train_data_paths_file, args.data_path)
-        val_roots   = _resolve_paths_arg(args.val_data_paths, args.val_data_paths_file, args.data_path)
+    if has_base and has_both_files:
+        parser.error("Provide either positional data_path (Mode A) OR both --train_data_paths_file and "
+                     "--val_data_paths_file (Mode B), not both.")
+    if not has_base and not has_both_files:
+        parser.error("You must provide exactly one input mode:\n"
+                     "  • Mode A: data_path\n"
+                     "  • Mode B: --train_data_paths_file and --val_data_paths_file")
 
-        # Pass a PAIR into get_data_loader; inside it, for each side we load BOTH 'train' and 'val'
-        train_loader, genotype_map = get_data_loader(
-            data_dir=(train_roots, val_roots), dataset_type="train",
-            batch_size=args.batch_size, num_workers=args.num_workers, shuffle=True
-        )
-        try:
-            val_loader, _ = get_data_loader(
-                data_dir=(train_roots, val_roots), dataset_type="val",
-                batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False, return_paths=True
-            )
-        except Exception as e:
-            print_and_log(f"\nFATAL: Could not create validation data loader with 'return_paths=True'.", os.path.join(args.output_path, "training_log_6ch.txt"))
-            print_and_log("Please ensure your 'dataset_pansoma_npy_6ch.py' supports the (train_paths, val_paths) pair and loads BOTH subfolders.", os.path.join(args.output_path, "training_log_6ch.txt"))
-            print_and_log(f"Error details: {e}", os.path.join(args.output_path, "training_log_6ch.txt"))
-            sys.exit(1)
-
-        # Continue training with the resolved pair
-        train_model(
-            data_path=(train_roots, val_roots), output_path=args.output_path,
-            save_val_results=args.save_val_results,
-            num_epochs=args.epochs, learning_rate=args.lr,
-            batch_size=args.batch_size, num_workers=args.num_workers,
-            model_save_milestone=args.milestone,
-            loss_type=args.loss_type,
-            warmup_epochs=args.warmup_epochs,
-            weight_decay=args.weight_decay,
-            depths=args.depths,
-            dims=args.dims,
-        )
+    # Build the argument passed into train_model:
+    #  - Mode A: a single string root (backward compatible)
+    #  - Mode B: a pair (train_roots, val_roots) for the revised get_data_loader
+    if has_base:
+        data_path_or_pair = os.path.abspath(os.path.expanduser(args.data_path))
     else:
-        # OLD MODE: preserve original behavior (positional + optional old multi-root flags)
-        data_path_or_paths = _resolve_data_roots(args.data_path, args.data_paths, args.data_paths_file)
-        train_model(
-            data_path=data_path_or_paths, output_path=args.output_path,
-            save_val_results=args.save_val_results,
-            num_epochs=args.epochs, learning_rate=args.lr,
-            batch_size=args.batch_size, num_workers=args.num_workers,
-            model_save_milestone=args.milestone,
-            loss_type=args.loss_type,
-            warmup_epochs=args.warmup_epochs,
-            weight_decay=args.weight_decay,
-            depths=args.depths,
-            dims=args.dims,
-        )
+        train_roots = _read_paths_file(args.train_data_paths_file)
+        val_roots   = _read_paths_file(args.val_data_paths_file)
+        if not train_roots:
+            parser.error(f"--train_data_paths_file is empty or unreadable: {args.train_data_paths_file}")
+        if not val_roots:
+            parser.error(f"--val_data_paths_file is empty or unreadable: {args.val_data_paths_file}")
+        # Pair: get_data_loader(dataset_type="train"/"val") will pick the right side and
+        # include BOTH 'train' and 'val' subfolders from each root (per your revised dataloader)
+        data_path_or_pair = (train_roots, val_roots)
+
+    # Hand off; train_model still discovers loaders via get_data_loader(...)
+    train_model(
+        data_path=data_path_or_pair, output_path=args.output_path,
+        save_val_results=args.save_val_results,
+        num_epochs=args.epochs, learning_rate=args.lr,
+        batch_size=args.batch_size, num_workers=args.num_workers,
+        model_save_milestone=args.milestone,
+        loss_type=args.loss_type,
+        warmup_epochs=args.warmup_epochs,
+        weight_decay=args.weight_decay,
+        depths=args.depths,
+        dims=args.dims,
+    )
+

@@ -74,7 +74,7 @@ class NpyDataset(Dataset):
             return image_tensor, label
 
 
-def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=8, shuffle: bool = False,
+def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=16, shuffle: bool = False,
                     return_paths: bool = False):
     """
     Load dataset(s) using NpyDataset.
