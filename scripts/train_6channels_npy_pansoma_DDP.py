@@ -90,10 +90,19 @@ def _state_dict(m):
     return m.module.state_dict() if hasattr(m, "module") else m.state_dict()
 
 
+def _load_state_dict(m, state):
+    # Load into model whether wrapped or not
+    if hasattr(m, "module"):
+        m.module.load_state_dict(state)
+    else:
+        m.load_state_dict(state)
+
+
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
                 batch_size=32, num_workers=4, loss_type='weighted_ce',
                 warmup_epochs=10, weight_decay=0.05, depths=None, dims=None,
-                training_data_ratio=1.0, ddp=False, data_parallel=False, local_rank=0):
+                training_data_ratio=1.0, ddp=False, data_parallel=False, local_rank=0,
+                resume=None):
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if os.path.exists(log_file) and IS_MAIN_PROCESS:
@@ -211,7 +220,8 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     main_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=0)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
 
-    # Track best by F1(true)
+    # ---- Resume support ----
+    start_epoch = 0
     best_epoch = 0
     best_f1_true = float("-inf")
     best_val_acc = float("-inf")
@@ -219,7 +229,28 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     best_prec_true = 0.0
     best_rec_true = 0.0
 
-    for epoch in range(num_epochs):
+    if resume is not None and os.path.isfile(resume):
+        try:
+            checkpoint = torch.load(resume, map_location=device)
+            _load_state_dict(model, checkpoint['model_state_dict'])
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            # epoch in checkpoints was saved as the last finished epoch (1-based)
+            start_epoch = int(checkpoint.get('epoch', 0))
+            # restore best tracking if present
+            best_f1_true = float(checkpoint.get('best_f1_true', best_f1_true))
+            best_rec_true = float(checkpoint.get('best_rec_true', best_rec_true))
+            best_val_acc = float(checkpoint.get('best_val_acc', best_val_acc))
+            best_val_loss = float(checkpoint.get('best_val_loss', best_val_loss))
+            best_epoch = int(checkpoint.get('epoch', best_epoch))
+            print_and_log(f"Resumed from '{resume}' at epoch {start_epoch}.", log_file)
+        except Exception as e:
+            print_and_log(f"WARNING: Failed to load checkpoint '{resume}': {e}", log_file)
+
+    # ---- Training loop ----
+    for epoch in range(start_epoch, num_epochs):
         model.train()
 
         # Ensure different shuffles each epoch with DDP
@@ -513,10 +544,9 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
         if 1 < num_classes:
             pos_idx = 1
         elif num_classes > 0:
-            # choose minority by support
             supports = class_total_counts.clone()
             if supports.sum() > 0:
-                pos_idx = int(torch.nonzero(supports == supports[ supports > 0 ].min(), as_tuple=False)[0].item())
+                pos_idx = int(torch.nonzero(supports == supports[supports > 0].min(), as_tuple=False)[0].item())
             else:
                 pos_idx = 0
         else:
@@ -616,6 +646,10 @@ if __name__ == "__main__":
     parser.add_argument("--data_parallel", action="store_true",
                         help="Use nn.DataParallel across all visible GPUs (single process). Ignored if --ddp is set.")
 
+    # NEW: resume from checkpoint
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to a checkpoint .pth to resume training (loads model/optimizer/scheduler/epoch).")
+
     args = parser.parse_args()
 
     # ---- Enforce: exactly one of (data_path) OR (both files) ----
@@ -678,6 +712,7 @@ if __name__ == "__main__":
         dims=args.dims,
         training_data_ratio=args.training_data_ratio,
         ddp=args.ddp, data_parallel=args.data_parallel, local_rank=local_rank,
+        resume=args.resume,
     )
 
     # Clean up DDP
