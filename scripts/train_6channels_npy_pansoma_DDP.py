@@ -108,7 +108,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
     print_and_log(f"Using Cosine Annealing scheduler with a {warmup_epochs}-epoch linear warmup.", log_file)
     print_and_log(
-        f"Checkpointing: snapshot at epoch {MIN_SAVE_EPOCH}, then save only when validation improves (best so far).",
+        f"Checkpointing: snapshot at epoch {MIN_SAVE_EPOCH}, then save only when validation F1(true) improves.",
         log_file)
     print_and_log(f"Using {num_workers} workers for data loading.", log_file)
     if save_val_results:
@@ -172,7 +172,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            gradient_as_bucket_view=True,  # <- key line
+            gradient_as_bucket_view=True,  # keep grads contiguous for perf
             broadcast_buffers=False,
         )
 
@@ -211,9 +211,13 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     main_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=0)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
 
+    # Track best by F1(true)
+    best_epoch = 0
+    best_f1_true = float("-inf")
     best_val_acc = float("-inf")
     best_val_loss = float("inf")
-    best_epoch = 0
+    best_prec_true = 0.0
+    best_rec_true = 0.0
 
     for epoch in range(num_epochs):
         model.train()
@@ -303,14 +307,22 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                     f"({stats.get('correct', 0)}/{stats.get('total', 0)})",
                     log_file)
 
+        # True-class metrics
+        val_prec_true = val_metrics.get('precision_true', 0.0)
+        val_rec_true  = val_metrics.get('recall_true', 0.0)
+        val_f1_true   = val_metrics.get('f1_true', 0.0)
+        pos_idx       = val_metrics.get('pos_class_idx', None)
+
         summary_msg = (
             f"Epoch {epoch + 1}/{num_epochs} Summary - "
             f"Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.2f}%, "
             f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}% | "
-            f"Prec: {val_metrics['precision_macro'] * 100:.2f}%, "
-            f"Rec: {val_metrics['recall_macro'] * 100:.2f}%, "
-            f"F1: {val_metrics['f1_macro'] * 100:.2f}% "
-            f"(LR: {current_lr:.1e})"
+            f"Prec(true): {val_prec_true * 100:.2f}%, "
+            f"Rec(true): {val_rec_true * 100:.2f}%, "
+            f"F1(true): {val_f1_true * 100:.2f}% "
+            f"(LR: {current_lr:.1e}"
+            + (f", pos_idx={pos_idx}" if pos_idx is not None else "")
+            + ")"
         )
         print_and_log(summary_msg, log_file)
 
@@ -327,9 +339,14 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             }, snap_path)
             print_and_log(f"\nSnapshot saved at epoch {epoch + 1}: {snap_path}", log_file)
 
-        # Save on validation improvement (primary: higher acc; tie-breaker: lower loss), after epoch 5
-        improved = (val_acc > best_val_acc) or (val_acc == best_val_acc and val_loss < best_val_loss)
+        # Save on validation improvement by F1(true); tie-breakers: higher recall_true, then lower val_loss
+        improved = (val_f1_true > best_f1_true) or \
+                   (val_f1_true == best_f1_true and val_rec_true > best_rec_true) or \
+                   (val_f1_true == best_f1_true and val_rec_true == best_rec_true and val_loss < best_val_loss)
+
         if (epoch + 1) >= MIN_SAVE_EPOCH and improved:
+            best_f1_true = val_f1_true
+            best_rec_true = val_rec_true
             best_val_acc = val_acc
             best_val_loss = val_loss
             best_epoch = epoch + 1
@@ -343,12 +360,16 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                     'scheduler_state_dict': scheduler.state_dict(),
                     'genotype_map': genotype_map,
                     'in_channels': 6,
+                    'best_f1_true': best_f1_true,
+                    'best_rec_true': best_rec_true,
                     'best_val_acc': best_val_acc,
                     'best_val_loss': best_val_loss,
                 }, best_path)
                 print_and_log(
-                    f"\nNew BEST at epoch {best_epoch}: Val Acc {best_val_acc:.2f}%, "
-                    f"Val Loss {best_val_loss:.4f}. Saved: {best_path}", log_file)
+                    f"\nNew BEST at epoch {best_epoch}: "
+                    f"F1(true) {best_f1_true*100:.2f}% | Rec(true) {best_rec_true*100:.2f}% | "
+                    f"Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
+                    f"Saved: {best_path}", log_file)
 
                 if save_val_results:
                     result_path = os.path.join(output_path, "validation_results_best.json")
@@ -356,6 +377,8 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                         with open(result_path, 'w') as f:
                             json.dump({
                                 'epoch': best_epoch,
+                                'f1_true': best_f1_true,
+                                'recall_true': best_rec_true,
                                 'val_acc': best_val_acc,
                                 'val_loss': best_val_loss,
                                 'inference_results': val_inference_results
@@ -368,7 +391,9 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         print_and_log("-" * 30, log_file)
 
     print_and_log(
-        f"Training complete. Best epoch: {best_epoch} with Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
+        f"Training complete. Best epoch: {best_epoch} "
+        f"| F1(true) {best_f1_true*100:.2f}% | Rec(true) {best_rec_true*100:.2f}% "
+        f"| Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
         f"Best model: {os.path.join(output_path, 'model_best.pth')}",
         log_file
     )
@@ -398,8 +423,7 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
 
     if not data_loader:
         metrics = {
-            'precision_macro': 0.0, 'recall_macro': 0.0, 'f1_macro': 0.0,
-            'precision_weighted': 0.0, 'recall_weighted': 0.0, 'f1_weighted': 0.0
+            'precision_true': 0.0, 'recall_true': 0.0, 'f1_true': 0.0, 'pos_class_idx': None
         }
         return 0.0, 0.0, {}, {}, metrics
 
@@ -474,39 +498,44 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
                 'acc': acc_c, 'correct': correct_c, 'total': total_c, 'idx': class_idx
             }
 
-    # Precision/Recall/F1 (macro & weighted)
-    if num_classes > 0:
-        supports = (tp + fn).to(torch.float)
-        denom_p = (tp + fp).to(torch.float)
-        denom_r = (tp + fn).to(torch.float)
+    # ---- NEW: precision / recall / F1 for the positive ("true") class only ----
+    # Choose pos_idx:
+    # 1) prefer class named "true" (case-insensitive)
+    # 2) else pick index 1 if present
+    # 3) else choose minority (smallest support)
+    pos_idx = None
+    if genotype_map:
+        for name, idx in genotype_map.items():
+            if str(name).lower() == "true":
+                pos_idx = idx
+                break
+    if pos_idx is None:
+        if 1 < num_classes:
+            pos_idx = 1
+        elif num_classes > 0:
+            # choose minority by support
+            supports = class_total_counts.clone()
+            if supports.sum() > 0:
+                pos_idx = int(torch.nonzero(supports == supports[ supports > 0 ].min(), as_tuple=False)[0].item())
+            else:
+                pos_idx = 0
+        else:
+            pos_idx = 0
 
-        precision_c = torch.where(denom_p > 0, tp.to(torch.float) / denom_p, torch.zeros_like(denom_p))
-        recall_c    = torch.where(denom_r > 0, tp.to(torch.float) / denom_r, torch.zeros_like(denom_r))
-        f1_c        = torch.where((precision_c + recall_c) > 0,
-                                  2 * precision_c * recall_c / (precision_c + recall_c),
-                                  torch.zeros_like(precision_c))
+    tpc = float(tp[pos_idx].item() if pos_idx < num_classes else 0.0)
+    fpc = float(fp[pos_idx].item() if pos_idx < num_classes else 0.0)
+    fnc = float(fn[pos_idx].item() if pos_idx < num_classes else 0.0)
 
-        # macro
-        precision_macro = float(precision_c.mean().item())
-        recall_macro    = float(recall_c.mean().item())
-        f1_macro        = float(f1_c.mean().item())
-
-        # weighted
-        total_support = max(1.0, float(supports.sum().item()))
-        precision_weighted = float((precision_c * supports).sum().item() / total_support)
-        recall_weighted    = float((recall_c * supports).sum().item() / total_support)
-        f1_weighted        = float((f1_c * supports).sum().item() / total_support)
-    else:
-        precision_macro = recall_macro = f1_macro = 0.0
-        precision_weighted = recall_weighted = f1_weighted = 0.0
+    precision_true = (tpc / (tpc + fpc)) if (tpc + fpc) > 0 else 0.0
+    recall_true    = (tpc / (tpc + fnc)) if (tpc + fnc) > 0 else 0.0
+    f1_true        = (2 * precision_true * recall_true / (precision_true + recall_true)) \
+                     if (precision_true + recall_true) > 0 else 0.0
 
     metrics = {
-        'precision_macro': precision_macro,
-        'recall_macro': recall_macro,
-        'f1_macro': f1_macro,
-        'precision_weighted': precision_weighted,
-        'recall_weighted': recall_weighted,
-        'f1_weighted': f1_weighted,
+        'precision_true': precision_true,
+        'recall_true': recall_true,
+        'f1_true': f1_true,
+        'pos_class_idx': pos_idx,
     }
 
     return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results, metrics
