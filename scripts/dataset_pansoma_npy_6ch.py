@@ -1,6 +1,6 @@
 import torch
 import torchvision.transforms as transforms
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 import os
 import numpy as np
 
@@ -148,6 +148,82 @@ def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=16, shuff
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
                         num_workers=num_workers, pin_memory=True)
 
+    return loader, unified_class_to_idx
+
+
+def get_testing_data_loader(data_dir, batch_size=32, num_workers=16, shuffle: bool = False,
+                            return_paths: bool = False):
+    """
+    Build a DataLoader for TESTING where each root dir directly contains .npy files.
+    No 'train'/'val'/'test' subfolders are assumed.
+
+    Accepted inputs:
+      • str: a single directory with .npy files
+      • list/tuple[str]: multiple directories (concatenated)
+      • (train_roots, val_roots): 2-tuple; the second element is used for testing
+
+    Returns:
+      (DataLoader, class_to_idx)
+    """
+
+    def _to_list(x):
+        if x is None:
+            return []
+        if isinstance(x, (list, tuple)):
+            return list(x)
+        return [x]
+
+    # Resolve testing roots
+    if (
+        isinstance(data_dir, (list, tuple)) and len(data_dir) == 2
+        and isinstance(data_dir[0], (str, list, tuple))
+        and isinstance(data_dir[1], (str, list, tuple))
+    ):
+        roots = _to_list(data_dir[1])  # use the "val/test" side for testing
+    else:
+        roots = _to_list(data_dir)
+
+    dataset_dirs = [os.path.abspath(os.path.expanduser(r)) for r in roots]
+
+    missing = [p for p in dataset_dirs if not os.path.isdir(p)]
+    if missing:
+        raise FileNotFoundError(f"Dataset directory(ies) do not exist: {missing}")
+
+    # 6-channel normalization (same as your training)
+    transform = transforms.Compose([
+        transforms.Normalize(
+            mean=[18.417816162109375, 12.649129867553711, -0.5452527403831482,
+                  24.723854064941406, 4.690611362457275, 10.659969329833984],
+            std=[25.028322219848633, 14.809632301330566, 0.6181337833404541,
+                 29.972835540771484, 7.923179149780273, 27.151996612548828]
+        )
+    ])
+
+    # Build datasets and ensure consistent mapping
+    datasets = []
+    unified_class_to_idx = None
+    for d in dataset_dirs:
+        ds = NpyDataset(root_dir=d, transform=transform, return_paths=return_paths)
+        if unified_class_to_idx is None:
+            unified_class_to_idx = ds.class_to_idx
+        else:
+            if ds.class_to_idx != unified_class_to_idx:
+                raise ValueError(
+                    f"class_to_idx mismatch across roots. "
+                    f"First: {unified_class_to_idx} vs {ds.class_to_idx} in {d}"
+                )
+        datasets.append(ds)
+
+    dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+    )
     return loader, unified_class_to_idx
 
 
