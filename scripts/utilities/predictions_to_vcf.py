@@ -13,14 +13,9 @@ INFO fields written (when available from inputs):
   SRC    : source .npy path
   AF     : alt_allele_frequency (variant_summary.json)
   DP     : coverage_at_locus (variant_summary.json)
-  AD     : "ref,alt" counts (ref_allele_count_at_locus,alt_allele_count)
+  AD     : "ref,alt" counts (ref_allele_count_at_locus, alt_allele_count)
   OTHER  : other_allele_count_at_locus
   BQ     : mean_alt_allele_base_quality
-
-Progress:
-  - Single-line flashing bar while scanning predictions (shows kept true count).
-  - Logs when a node's variant_summary is loaded (tqdm-safe).
-  - Single-line flashing bar while writing the VCF.
 
 Examples:
   python predictions_to_node_vcf.py \
@@ -211,8 +206,6 @@ def main():
             node_dir = os.path.dirname(path)
             if node_id not in by_node_cache:
                 by_node_cache[node_id] = load_variant_summary_for_node(node_dir)
-                tqdm.write(f"[summary] loaded for node {node_id} "
-                           f"(entries={len(by_node_cache[node_id])})")
 
             info = {
                 "PROB": f"{prob:.6g}" if prob is not None else None,
@@ -292,8 +285,6 @@ def main():
             node_dir = os.path.dirname(path)
             if node_id not in by_node_cache:
                 by_node_cache[node_id] = load_variant_summary_for_node(node_dir)
-                tqdm.write(f"[summary] loaded for node {node_id} "
-                           f"(entries={len(by_node_cache[node_id])})")
 
             info = {
                 "PROB": f"{prob:.6g}" if prob is not None else None,
