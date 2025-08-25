@@ -109,7 +109,7 @@ def organize_node_data(source_dir, output_dir, num_workers):
                 print(f"\nError processing node {node_id_str}: {exc}")
 
             # --- ADDED: Milestone printing logic ---
-            if nodes_processed_count % 1000 == 0 and nodes_processed_count > 0:
+            if nodes_processed_count % 10000 == 0 and nodes_processed_count > 0:
                 tqdm.write(f"--- Milestone: {nodes_processed_count}/{len(node_dirs)} nodes processed. ---")
 
     # --- 4. Write the Final Merged JSON ---
