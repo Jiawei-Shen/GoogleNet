@@ -4,7 +4,6 @@ import os
 import sys
 import json
 import time
-import math
 from collections import defaultdict
 
 import torch
@@ -19,7 +18,7 @@ import torch.nn.functional as F
 # Local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from mynet import ConvNeXtCBAMClassifier
-from dataset_pansoma_npy_6ch import get_testing_data_loader  # uses flat-dir .npy loader
+from dataset_pansoma_npy_6ch import get_testing_data_loader  # <-- using testing loader
 
 # Globals updated in __main__ when using DDP
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -30,7 +29,7 @@ IS_MAIN_PROCESS = True  # rank-0 only printing
 def print_and_log(message, log_path):
     if not IS_MAIN_PROCESS:
         return
-    print(message)
+    print(message, flush=True)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(message + "\n")
 
@@ -68,39 +67,25 @@ def _fmt_int(n):
 @torch.no_grad()
 def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1,
              save_predictions=False, predictions_limit=None):
-    """
-    Returns:
-      metrics (dict)
-      class_stats (dict)
-      confusion (torch.Tensor num_classes x num_classes) on CPU
-      predictions (list of dict) [optional/requested, rank0 gathered]
-    """
     model.eval()
     num_classes = len(genotype_map) if genotype_map else 0
     idx_to_class = {v: k for k, v in genotype_map.items()} if genotype_map else {}
 
-    # Global counters on device
     correct = torch.zeros(1, device=device, dtype=torch.long)
     total   = torch.zeros(1, device=device, dtype=torch.long)
 
-    # Per-class accuracy counters
     class_correct = torch.zeros(num_classes, device=device, dtype=torch.long)
     class_total   = torch.zeros(num_classes, device=device, dtype=torch.long)
 
-    # Confusion matrix (true as rows, pred as cols)
     confusion = torch.zeros((num_classes, num_classes), device=device, dtype=torch.long)
 
-    # Per-class tp/fp/fn for precision/recall/F1
     tp = torch.zeros(num_classes, device=device, dtype=torch.long)
     fp = torch.zeros(num_classes, device=device, dtype=torch.long)
     fn = torch.zeros(num_classes, device=device, dtype=torch.long)
 
-    # Optional: collect predictions (path, true, pred, prob)
     local_predictions = []
     total_batches = len(data_loader) if hasattr(data_loader, "__len__") else None
-    log_every = 1
-    if total_batches and total_batches > 0:
-        log_every = max(1, total_batches // 20)  # ~5% increments
+    log_every = max(1, (total_batches or 1) // 20)  # ~5%
 
     start_time = time.time()
     pbar = tqdm(data_loader, desc="Testing", disable=not IS_MAIN_PROCESS)
@@ -116,7 +101,7 @@ def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1
         labels = labels.to(device, non_blocking=True)
 
         outputs = model(images)
-        if isinstance(outputs, tuple):  # in case model returns (main, aux1, aux2)
+        if isinstance(outputs, tuple):
             outputs = outputs[0]
 
         probs = F.softmax(outputs, dim=1)
@@ -125,10 +110,8 @@ def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1
         correct += (pred == labels).sum()
         total += labels.size(0)
 
-        # Update per-class stats & confusion
         for i in range(labels.size(0)):
-            ti = int(labels[i])
-            pi = int(pred[i])
+            ti = int(labels[i]); pi = int(pred[i])
             class_total[ti] += 1
             if ti == pi:
                 class_correct[ti] += 1
@@ -137,40 +120,33 @@ def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1
                 if pi < num_classes:
                     fp[pi] += 1
                 fn[ti] += 1
-
             if ti < num_classes and pi < num_classes:
                 confusion[ti, pi] += 1
 
-            if save_predictions:
-                # keep list from overflowing if predictions_limit provided
-                if (predictions_limit is None) or (len(local_predictions) < predictions_limit):
-                    local_predictions.append({
-                        "path": os.path.basename(paths[i]) if paths[i] else "",
-                        "true_idx": ti,
-                        "true_name": idx_to_class.get(ti, str(ti)),
-                        "pred_idx": pi,
-                        "pred_name": idx_to_class.get(pi, str(pi)),
-                        "pred_prob": float(conf[i].item())
-                    })
+            if save_predictions and (predictions_limit is None or len(local_predictions) < predictions_limit):
+                local_predictions.append({
+                    "path": os.path.basename(paths[i]) if paths[i] else "",
+                    "true_idx": ti,
+                    "true_name": idx_to_class.get(ti, str(ti)),
+                    "pred_idx": pi,
+                    "pred_name": idx_to_class.get(pi, str(pi)),
+                    "pred_prob": float(conf[i].item())
+                })
 
-        # Periodic progress logs (rank 0)
-        if IS_MAIN_PROCESS and ( (b_idx == 0) or ((b_idx + 1) % log_every == 0) ):
+        if IS_MAIN_PROCESS and ((b_idx == 0) or ((b_idx + 1) % log_every == 0)):
             seen = total.item()
             acc_so_far = (correct.item() / max(1, seen)) * 100.0
             if total_batches:
                 print_and_log(
-                    f"[Eval] Batch {b_idx + 1}/{total_batches} | Seen { _fmt_int(seen) } samples | "
-                    f"Acc-so-far {acc_so_far:.2f}%",
+                    f"[Eval] Batch {b_idx + 1}/{total_batches} | Seen { _fmt_int(seen) } | Acc-so-far {acc_so_far:.2f}%",
                     log_file
                 )
             else:
                 print_and_log(
-                    f"[Eval] Batch {b_idx + 1} | Seen { _fmt_int(seen) } samples | "
-                    f"Acc-so-far {acc_so_far:.2f}%",
+                    f"[Eval] Batch {b_idx + 1} | Seen { _fmt_int(seen) } | Acc-so-far {acc_so_far:.2f}%",
                     log_file
                 )
 
-    # DDP reductions
     if ddp and world_size > 1 and dist.is_initialized():
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
         dist.all_reduce(total,   op=dist.ReduceOp.SUM)
@@ -182,7 +158,6 @@ def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1
             dist.all_reduce(fn, op=dist.ReduceOp.SUM)
             dist.all_reduce(confusion, op=dist.ReduceOp.SUM)
 
-        # Gather predictions from all ranks to rank 0 (as Python objects)
         if save_predictions:
             gathered = [None for _ in range(world_size)]
             dist.all_gather_object(gathered, local_predictions)
@@ -197,44 +172,29 @@ def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1
 
     elapsed = time.time() - start_time
     if IS_MAIN_PROCESS and elapsed > 0:
-        print_and_log(f"[Eval] Done in {elapsed:.2f}s | ~{_fmt_int(int(total.item() / elapsed))} samples/sec (global, approx.)",
+        print_and_log(f"[Eval] Done in {elapsed:.2f}s | ~{_fmt_int(int(total.item() / max(1e-9, elapsed)))} samples/s",
                       log_file)
 
-    # Overall accuracy
-    overall_acc = (correct.item() / max(1, total.item())) * 100.0
-
-    # Class-wise accuracy and per-class precision/recall/F1
-    class_stats = {}
     confusion_cpu = confusion.detach().cpu()
+    class_stats = {}
     for cname, cidx in (genotype_map.items() if genotype_map else []):
         c_correct = int(class_correct[cidx].item())
         c_total   = int(class_total[cidx].item())
         acc = (c_correct / c_total * 100.0) if c_total > 0 else 0.0
-
-        # From confusion:
         tp_i = int(confusion_cpu[cidx, cidx].item())
         fp_i = int(confusion_cpu[:, cidx].sum().item()) - tp_i
         fn_i = int(confusion_cpu[cidx, :].sum().item()) - tp_i
         prec = (tp_i / (tp_i + fp_i)) if (tp_i + fp_i) > 0 else 0.0
         rec  = (tp_i / (tp_i + fn_i)) if (tp_i + fn_i) > 0 else 0.0
         f1   = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+        class_stats[cname] = {"idx": cidx, "acc": acc, "precision": prec, "recall": rec, "f1": f1, "support": c_total}
 
-        class_stats[cname] = {
-            "idx": cidx,
-            "acc": acc,
-            "precision": prec,
-            "recall": rec,
-            "f1": f1,
-            "support": c_total
-        }
-
-    # Pick positive class index ("true" class) using same rules as training
+    # pick positive class
     pos_idx = None
     if genotype_map:
         for name, idx in genotype_map.items():
             if str(name).lower() == "true":
-                pos_idx = idx
-                break
+                pos_idx = idx; break
     if pos_idx is None:
         if len(genotype_map) > 1:
             pos_idx = 1
@@ -247,17 +207,15 @@ def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1
         else:
             pos_idx = 0
 
-    # true-class metrics
     tpc = float(tp[pos_idx].item() if pos_idx < len(genotype_map) else 0.0)
     fpc = float(fp[pos_idx].item() if pos_idx < len(genotype_map) else 0.0)
     fnc = float(fn[pos_idx].item() if pos_idx < len(genotype_map) else 0.0)
     precision_true = (tpc / (tpc + fpc)) if (tpc + fpc) > 0 else 0.0
     recall_true    = (tpc / (tpc + fnc)) if (tpc + fnc) > 0 else 0.0
-    f1_true        = (2 * precision_true * recall_true / (precision_true + recall_true)) \
-                     if (precision_true + recall_true) > 0 else 0.0
+    f1_true        = (2 * precision_true * recall_true / (precision_true + recall_true)) if (precision_true + recall_true) > 0 else 0.0
 
     metrics = {
-        "overall_accuracy": overall_acc,
+        "overall_accuracy": (correct.item() / max(1, total.item())) * 100.0,
         "precision_true": precision_true,
         "recall_true": recall_true,
         "f1_true": f1_true,
@@ -269,30 +227,40 @@ def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1
 def _build_loader_for_test(data_spec, batch_size, num_workers, ddp=False):
     """
     Build a test DataLoader using get_testing_data_loader (no subfolders).
-    `data_spec` can be:
-      • str: a directory of .npy files
-      • list[str]: multiple directories (concatenated)
-      • (train_roots, val_roots): a 2-tuple; the second element is used for testing
+    Re-wrap the dataset to force persistent_workers=False and small prefetch.
     """
+    # Initial loader from your utility (may set persistent_workers=True internally)
     loader, genotype_map = get_testing_data_loader(
         data_spec, batch_size=batch_size, num_workers=num_workers,
         shuffle=False, return_paths=True
     )
+    ds = loader.dataset
 
+    # Rebuild DataLoader ourselves to avoid hangs with persistent_workers
+    common_kwargs = dict(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=False,
+    )
     if ddp:
-        ds = loader.dataset
         sampler = DistributedSampler(ds, shuffle=False, drop_last=False)
-        loader = DataLoader(
-            ds, batch_size=batch_size, num_workers=num_workers,
-            pin_memory=True, sampler=sampler
-        )
+        common_kwargs.update(dict(sampler=sampler))
+    else:
+        common_kwargs.update(dict(shuffle=False))
+
+    # prefetch_factor only valid when num_workers > 0
+    if num_workers and num_workers > 0:
+        common_kwargs["prefetch_factor"] = 2
+
+    loader = DataLoader(ds, **common_kwargs)
     return loader, genotype_map
 
 
 def _ensure_model(depths, dims, in_channels):
     model = ConvNeXtCBAMClassifier(
         in_channels=in_channels,
-        class_num=1,  # temp override; will be fixed after we know num_classes
+        class_num=1,  # temp; fixed after we know num_classes
         depths=depths, dims=dims
     )
     return model
@@ -301,48 +269,40 @@ def _ensure_model(depths, dims, in_channels):
 # ---------------- Main ----------------
 def main():
     parser = argparse.ArgumentParser(description="Test/Evaluate a 6-channel classifier on .npy dataset")
-    # Input mode (A) single root OR (B) paths file
-    parser.add_argument("data_path", nargs="?", type=str,
-                        help="Directory containing .npy files (Mode A).")
+    parser.add_argument("data_path", nargs="?", type=str, help="Directory containing .npy files (Mode A).")
     parser.add_argument("--test_data_paths_file", type=str, default=None,
-                        help="Text file listing one or more directories with .npy files (Mode B).")
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to checkpoint .pth (e.g., model_best.pth).")
+                        help="Text file: one or more directories with .npy files (Mode B).")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint .pth (e.g., model_best.pth).")
 
     parser.add_argument("-o", "--output_path", default="./test_results_6channel", type=str,
                         help="Directory to save logs/metrics (created if missing).")
-    parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=16, help="DataLoader workers")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--num_workers", type=int, default=8, help="DataLoader workers")
 
-    # Model arch (should match training); if missing, we trust defaults
-    parser.add_argument("--depths", type=int, nargs="+", default=[3, 3, 27, 3],
-                        help="ConvNeXt stage depths")
-    parser.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536],
-                        help="ConvNeXt dims")
+    parser.add_argument("--depths", type=int, nargs="+", default=[3, 3, 27, 3], help="ConvNeXt stage depths")
+    parser.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536], help="ConvNeXt dims")
 
-    # Multi-GPU
     parser.add_argument("--ddp", action="store_true", help="Use DistributedDataParallel (torchrun).")
-    parser.add_argument("--data_parallel", action="store_true",
-                        help="Use nn.DataParallel (ignored if --ddp).")
-
-    # Saving options
+    parser.add_argument("--data_parallel", action="store_true", help="Use nn.DataParallel (ignored if --ddp).")
     parser.add_argument("--save_predictions", action="store_true", help="Save per-sample predictions CSV/JSON.")
-    parser.add_argument("--predictions_limit", type=int, default=None,
-                        help="Optional cap on number of saved predictions (for huge test sets).")
+    parser.add_argument("--predictions_limit", type=int, default=None, help="Cap saved predictions.")
 
     args = parser.parse_args()
 
-    # Input mode enforcement
+    # Safer start method with CUDA + workers
+    try:
+        import multiprocessing as mp
+        mp.set_start_method("spawn", force=True)
+    except Exception:
+        pass
+
+    # Build data spec (no subfolders)
     has_base = args.data_path is not None
     has_file = args.test_data_paths_file is not None
     if has_base and has_file:
         parser.error("Provide either positional data_path (Mode A) OR --test_data_paths_file (Mode B), not both.")
     if not has_base and not has_file:
-        parser.error("You must provide exactly one input mode:\n"
-                     "  • Mode A: data_path\n"
-                     "  • Mode B: --test_data_paths_file")
-
-    # Build data spec (no subfolders)
+        parser.error("You must provide exactly one input mode: data_path OR --test_data_paths_file")
     if has_base:
         data_spec = os.path.abspath(os.path.expanduser(args.data_path))
         roots_for_log = [data_spec]
@@ -357,7 +317,7 @@ def main():
     if os.path.exists(log_file):
         os.remove(log_file)
 
-    # Args summary (rank 0)
+    # Args summary
     print_and_log("======== Inference Args ========", log_file)
     print_and_log(f"Output path: {args.output_path}", log_file)
     print_and_log(f"Checkpoint : {args.checkpoint}", log_file)
@@ -392,9 +352,27 @@ def main():
         print_and_log(f"[Runtime] Device={device} | CUDA available={torch.cuda.is_available()}", log_file)
 
     # Build loader (test)
+    print_and_log("[Data] Building test DataLoader...", log_file)
     test_loader, genotype_map = _build_loader_for_test(
         data_spec, batch_size=args.batch_size, num_workers=args.num_workers, ddp=args.ddp
     )
+    print_and_log("[Data] Test DataLoader built.", log_file)
+
+    # (Optional) smoke test to surface worker issues early (non-DDP only)
+    if IS_MAIN_PROCESS and not args.ddp:
+        try:
+            print_and_log("[Data] Running one-batch smoke test...", log_file)
+            first_batch = next(iter(test_loader))
+            if isinstance(first_batch, (list, tuple)) and len(first_batch) >= 2:
+                bx = first_batch[0].shape[0]
+                print_and_log(f"[Data] Smoke test OK. First batch size: {bx}", log_file)
+            else:
+                print_and_log("[Data] Smoke test OK.", log_file)
+        except Exception as e:
+            print_and_log(f"[Data] Smoke test FAILED: {e}", log_file)
+            print_and_log("[Hint] Retry with --num_workers 0 to disable multiprocessing.", log_file)
+            return
+
     try:
         ds_len = len(test_loader.dataset)
     except Exception:
@@ -420,7 +398,6 @@ def main():
     in_channels = 6
     model = _ensure_model(args.depths, args.dims, in_channels=in_channels).to(device)
 
-    # Optional DataParallel (single-process)
     if (not args.ddp) and args.data_parallel and torch.cuda.is_available():
         n = torch.cuda.device_count()
         if n > 1:
@@ -434,15 +411,13 @@ def main():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device)
     if IS_MAIN_PROCESS:
-        ep = ckpt.get("epoch", None)
-        best_f1 = ckpt.get("best_f1_true", None)
+        ep = ckpt.get("epoch", None); best_f1 = ckpt.get("best_f1_true", None)
         print_and_log(f"[Checkpoint] Loaded: {args.checkpoint}", log_file)
         if ep is not None:
             print_and_log(f"[Checkpoint] epoch={ep}", log_file)
         if best_f1 is not None:
             print_and_log(f"[Checkpoint] best_f1_true={best_f1:.4f}", log_file)
 
-    # If saved, prefer in_channels from checkpoint
     if "in_channels" in ckpt:
         in_ckpt = int(ckpt["in_channels"])
         if in_ckpt != in_channels:
@@ -450,7 +425,6 @@ def main():
             if IS_MAIN_PROCESS:
                 print_and_log(f"[Model] Rebuilt with in_channels={in_ckpt} (from checkpoint).", log_file)
 
-    # Replace classifier head to match num_classes if needed
     class_num_target = num_classes
     fresh_model = ConvNeXtCBAMClassifier(
         in_channels=getattr(model, "in_channels", 6) if hasattr(model, "in_channels") else 6,
@@ -459,17 +433,14 @@ def main():
         dims=args.dims
     ).to(device)
 
-    # Load weights (strict=False to allow class head size mismatch handled by reinit)
     missing, unexpected = fresh_model.load_state_dict(ckpt["model_state_dict"], strict=False)
     if IS_MAIN_PROCESS:
         if missing:
             print_and_log(f"[Model] Missing keys (ok if only classifier head): {missing}", log_file)
         if unexpected:
             print_and_log(f"[Model] Unexpected keys: {unexpected}", log_file)
-
     model = fresh_model
 
-    # DDP wrap (after loading)
     if args.ddp:
         model = DistributedDataParallel(
             model,
@@ -481,7 +452,6 @@ def main():
         if IS_MAIN_PROCESS:
             print_and_log("[Runtime] Model wrapped with DistributedDataParallel.", log_file)
 
-    # Run evaluation
     if IS_MAIN_PROCESS:
         print_and_log("[Eval] Starting evaluation...", log_file)
     world_size = dist.get_world_size() if args.ddp and dist.is_initialized() else 1
@@ -492,7 +462,6 @@ def main():
         predictions_limit=args.predictions_limit
     )
 
-    # Log + Save outputs (rank 0)
     if IS_MAIN_PROCESS:
         print_and_log("\nOverall Test Results:", log_file)
         print_and_log(f"  Accuracy: {metrics['overall_accuracy']:.2f}%", log_file)
@@ -508,23 +477,17 @@ def main():
         for cname in sorted_class_names:
             s = class_stats[cname]
             print_and_log(
-                f"  {cname} (idx {s['idx']}): "
-                f"Acc {s['acc']:.2f}% | Prec {s['precision']*100:.2f}% | "
-                f"Rec {s['recall']*100:.2f}% | F1 {s['f1']*100:.2f}% | n={_fmt_int(s['support'])}",
+                f"  {cname} (idx {s['idx']}): Acc {s['acc']:.2f}% | "
+                f"Prec {s['precision']*100:.2f}% | Rec {s['recall']*100:.2f}% | "
+                f"F1 {s['f1']*100:.2f}% | n={_fmt_int(s['support'])}",
                 log_file
             )
 
-        # Save metrics.json
-        out_metrics = {
-            "overall": metrics,
-            "class_stats": class_stats,
-            "genotype_map": genotype_map,
-        }
+        out_metrics = {"overall": metrics, "class_stats": class_stats, "genotype_map": genotype_map}
         with open(os.path.join(args.output_path, "metrics.json"), "w") as f:
             json.dump(out_metrics, f, indent=2)
         print_and_log(f"[Save] Wrote metrics.json", log_file)
 
-        # Save confusion_matrix.csv
         import csv
         cm_path = os.path.join(args.output_path, "confusion_matrix.csv")
         with open(cm_path, "w", newline="") as f:
@@ -540,9 +503,7 @@ def main():
                 writer.writerow(row)
         print_and_log(f"[Save] Wrote confusion_matrix.csv", log_file)
 
-        # Save predictions if requested
         if args.save_predictions and predictions is not None:
-            # CSV
             pred_csv = os.path.join(args.output_path, "predictions.csv")
             with open(pred_csv, "w", newline="") as f:
                 import csv
@@ -550,7 +511,6 @@ def main():
                 writer.writeheader()
                 for r in predictions:
                     writer.writerow(r)
-            # JSON
             pred_json = os.path.join(args.output_path, "predictions.json")
             with open(pred_json, "w") as f:
                 json.dump(predictions, f, indent=2)
@@ -558,7 +518,6 @@ def main():
 
         print_and_log("[Eval] Finished. See test_log_6ch.txt for details.", log_file)
 
-    # Cleanup DDP
     if args.ddp and dist.is_initialized():
         dist.destroy_process_group()
 
