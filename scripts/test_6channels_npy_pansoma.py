@@ -1,29 +1,22 @@
 #!/usr/bin/env python3
 """
-Batch inference over a directory of .npy files (recursively).
+Batch inference over a directory of .npy files (recursively) with print-only logs.
 
 Example:
     python infer_npy_dir.py \
-        --input_dir /path/to/npy_root \
-        --ckpt /path/to/model_best.pth \
-        --output_csv preds.csv \
-        --output_json preds.json \
-        --batch_size 64 --num_workers 8 --fp16
-
-Notes:
-- Assumes your checkpoint (from the provided training script) includes:
-    * 'model_state_dict'
-    * 'genotype_map' (class_name -> idx)
-    * 'in_channels'
-- Model architecture depths/dims default to [3,3,27,3] / [192,384,768,1536].
-  If you trained with different values, pass --depths / --dims to match.
+      --input_dir /path/to/npy_root \
+      --ckpt /path/to/model_best.pth \
+      --output_csv preds.csv \
+      --output_json preds.json \
+      --batch_size 128 --num_workers 8 --fp16 --mmap \
+      --print_every_n 1000 --sample_info_k 3
 """
 
 import argparse
 import os
 import sys
 import json
-import math
+import time
 from typing import List, Tuple, Dict, Any
 
 import numpy as np
@@ -31,7 +24,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-# Make sure we can import your model class the same way as in training
+# Import your model the same way as in training
 THIS_DIR = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(os.path.abspath(os.path.join(THIS_DIR, "..")))
 from mynet import ConvNeXtCBAMClassifier  # noqa: E402
@@ -55,33 +48,27 @@ def ensure_chw(x: np.ndarray, channels: int, tile_single_channel: bool = False) 
     Accepts [C,H,W], [H,W,C], [H,W]; can tile single-channel if requested.
     """
     if x.ndim == 3:
-        # Either CHW or HWC
         if x.shape[0] == channels:
             chw = x
         elif x.shape[-1] == channels:
             chw = np.transpose(x, (2, 0, 1))
         elif x.shape[0] == 1 and tile_single_channel and channels > 1:
-            # [1,H,W] -> tile
             chw = np.tile(x, (channels, 1, 1))
         elif x.shape[-1] == 1 and tile_single_channel and channels > 1:
-            # [H,W,1] -> [1,H,W] -> tile
             chw = np.transpose(x, (2, 0, 1))
             chw = np.tile(chw, (channels, 1, 1))
         else:
             raise ValueError(f"Cannot infer channel axis for shape {x.shape} with channels={channels}")
     elif x.ndim == 2:
-        # [H,W]
         if tile_single_channel and channels > 1:
             chw = np.tile(x[None, ...], (channels, 1, 1))
         else:
             if channels != 1:
-                raise ValueError(f"Input is 2D but channels={channels}. "
-                                 f"Use --tile_single_channel if you want to tile it.")
-            chw = x[None, ...]  # [1,H,W]
+                raise ValueError(f"Input is 2D but channels={channels}. Use --tile_single_channel to tile.")
+            chw = x[None, ...]
     else:
         raise ValueError(f"Unsupported tensor ndim={x.ndim}, shape={x.shape}")
 
-    # ensure dtype float32
     if chw.dtype != np.float32:
         chw = chw.astype(np.float32, copy=False)
     return chw
@@ -91,6 +78,37 @@ def softmax_np(logits: np.ndarray, axis: int = -1) -> np.ndarray:
     m = logits.max(axis=axis, keepdims=True)
     y = np.exp(logits - m)
     return y / y.sum(axis=axis, keepdims=True)
+
+
+def print_data_info(
+    files: List[str],
+    in_channels: int,
+    normalize: bool,
+    tile_single_channel: bool,
+    mmap: bool,
+    sample_info_k: int,
+) -> None:
+    print("\n=== Data Information ===")
+    print(f"Total .npy files: {len(files)}")
+    print(f"Expected input channels: {in_channels}")
+    print(f"normalize={normalize} | tile_single_channel={tile_single_channel} | mmap={mmap}")
+    k = min(sample_info_k, len(files))
+    if k == 0:
+        print("No files to sample.")
+        print("=" * 26)
+        return
+
+    print(f"Sampling {k} file(s) for shape/dtype (using mmap to avoid loading data):")
+    for i in range(k):
+        p = files[i]
+        try:
+            arr = np.load(p, allow_pickle=False, mmap_mode="r" if mmap else None)
+            print(f"  [{i+1}] {p}")
+            print(f"      shape={tuple(arr.shape)}, dtype={arr.dtype}, ndim={arr.ndim}")
+        except Exception as e:
+            print(f"  [{i+1}] {p}")
+            print(f"      <error reading header> {e}")
+    print("=" * 26)
 
 
 # ---------------------------- Dataset ---------------------------------------- #
@@ -115,10 +133,8 @@ class NpyDirDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
         path = self.files[idx]
-        # Safe load
         arr = np.load(path, allow_pickle=False, mmap_mode=('r' if self.mmap else None))
 
-        # Common case: uint8 images or features; allow optional normalization
         if arr.dtype == np.uint8 and self.normalize:
             arr = arr.astype(np.float32) / 255.0
 
@@ -143,23 +159,19 @@ def build_and_load_model(
 
     checkpoint = torch.load(ckpt_path, map_location=device)
 
-    # Try to read the training-time metadata saved by your script
     genotype_map = checkpoint.get("genotype_map", {})
     in_channels = int(checkpoint.get("in_channels", 6))
 
-    # Construct the model with provided (or default) depths/dims
     model = ConvNeXtCBAMClassifier(in_channels=in_channels, class_num=len(genotype_map) or 2,
                                    depths=depths, dims=dims).to(device)
 
-    # Load weights (handles both wrapped and unwrapped state dicts)
     state = checkpoint.get("model_state_dict", checkpoint)
     try:
         model.load_state_dict(state, strict=True)
     except RuntimeError as e:
-        # Helpful message if depths/dims mismatch
         raise RuntimeError(
-            f"Failed to load state dict. If you trained with non-default depths/dims, "
-            f"re-run with matching --depths and --dims. Original error:\n{e}"
+            "Failed to load state dict. If you trained with non-default depths/dims, "
+            "re-run with matching --depths and --dims. Original error:\n" + str(e)
         )
 
     model.eval()
@@ -174,13 +186,18 @@ def run_inference(
     dl: DataLoader,
     device: torch.device,
     fp16: bool,
-    class_names: List[str]
+    class_names: List[str],
+    total_files: int,
+    print_every_n: int,
 ) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     use_amp = fp16 and device.type == "cuda"
 
-    for batch in tqdm(dl, desc="Infer", leave=True):
-        images, paths = batch
+    processed = 0
+    next_milestone = max(1, print_every_n)
+    t0 = time.time()
+
+    for images, paths in tqdm(dl, desc="Infer", leave=True):
         images = images.to(device, non_blocking=True)
         if use_amp:
             images = images.half()
@@ -188,9 +205,8 @@ def run_inference(
         with (torch.cuda.amp.autocast() if use_amp else torch.no_grad()):
             outputs = model(images)
             if isinstance(outputs, tuple):
-                outputs = outputs[0]  # use main head
+                outputs = outputs[0]
 
-        # logits -> probs (cpu numpy)
         logits = outputs.detach().float().cpu().numpy()
         probs = softmax_np(logits, axis=1)
         top_idx = probs.argmax(axis=1)
@@ -208,6 +224,18 @@ def run_inference(
                 "probs": prob_dict
             })
 
+        # ---- Progress prints ----
+        processed += len(paths)
+        if processed >= next_milestone or processed == total_files:
+            elapsed = time.time() - t0
+            speed = processed / max(1e-6, elapsed)
+            pct = 100.0 * processed / max(1, total_files)
+            remaining = total_files - processed
+            eta = remaining / max(1e-6, speed)
+            print(f"[{processed}/{total_files} | {pct:.1f}%] elapsed={elapsed:.1f}s "
+                  f"| speed={speed:.1f} files/s | ETA={eta:.1f}s")
+            next_milestone += print_every_n
+
     return results
 
 
@@ -215,10 +243,10 @@ def write_outputs(results: List[Dict[str, Any]], csv_path: str, json_path: str) 
     if json_path:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
+        print(f"Wrote JSON predictions: {os.path.abspath(json_path)}")
 
     if csv_path:
         import csv
-        # Collect all class names to produce consistent columns
         all_classes = set()
         for r in results:
             all_classes.update(r["probs"].keys())
@@ -229,10 +257,10 @@ def write_outputs(results: List[Dict[str, Any]], csv_path: str, json_path: str) 
             w.writerow(header)
             for r in results:
                 row = [r["path"], r["pred_idx"], r["pred_class"], f"{r['pred_prob']:.6f}"]
-                # Append probs in the same sorted order
                 for cname in sorted(all_classes):
                     row.append(f"{r['probs'].get(cname, 0.0):.6f}")
                 w.writerow(row)
+        print(f"Wrote CSV predictions:  {os.path.abspath(csv_path)}")
 
 
 # ----------------------------- Main ------------------------------------------ #
@@ -256,21 +284,23 @@ def main():
                         help="ConvNeXt stage depths used in training (match if you changed it)")
     parser.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536],
                         help="ConvNeXt dims used in training (match if you changed it)")
+    # Print config
+    parser.add_argument("--print_every_n", type=int, default=500,
+                        help="Print a progress line every N files")
+    parser.add_argument("--sample_info_k", type=int, default=3,
+                        help="Print header info (shape/dtype) for the first K files")
     args = parser.parse_args()
 
     # Resolve device
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     elif args.device == "cuda":
-        if not torch.cuda.is_available():
-            print("CUDA not available, falling back to CPU.")
-            device = torch.device("cpu")
-        else:
-            device = torch.device("cuda")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device.type == "cpu":
+            print("CUDA not available; falling back to CPU.")
     else:
         device = torch.device("cpu")
 
-    # For faster inference on varying shapes
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         try:
@@ -280,31 +310,25 @@ def main():
 
     # Build model & load weights
     model, genotype_map, in_channels = build_and_load_model(
-        ckpt_path=args.ckpt,
-        device=device,
-        depths=args.depths,
-        dims=args.dims,
+        ckpt_path=args.ckpt, device=device, depths=args.depths, dims=args.dims
     )
 
+    # Class names
     if len(genotype_map) == 0:
-        # Fallback if checkpoint lacks class names; we try to infer count from the head
-        # But your training script stores genotype_map, so this is unlikely.
         print("WARNING: 'genotype_map' missing in checkpoint; using numeric class names.")
-        # Try to peek classifier out-features
         num_classes = None
-        for n, m in model.named_modules():
-            if isinstance(m, torch.nn.Linear) and (num_classes is None or m.out_features < num_classes):
+        for _, m in model.named_modules():
+            if isinstance(m, torch.nn.Linear):
                 num_classes = m.out_features
+                break
         if num_classes is None:
             num_classes = 2
         class_names = [str(i) for i in range(num_classes)]
     else:
-        # Map indices -> names in the correct order
         class_names = [None] * len(genotype_map)
         for cname, cidx in genotype_map.items():
             if 0 <= int(cidx) < len(class_names):
                 class_names[cidx] = str(cname)
-        # fill any None (just in case)
         for i in range(len(class_names)):
             if class_names[i] is None:
                 class_names[i] = str(i)
@@ -314,7 +338,27 @@ def main():
     if len(files) == 0:
         raise SystemExit(f"No .npy files found under: {args.input_dir}")
 
-    # Build dataset/dataloader
+    # Startup prints
+    print("=== Inference Configuration ===")
+    print(f"Device: {device} | FP16: {bool(args.fp16 and device.type=='cuda')}")
+    print(f"Input dir: {os.path.abspath(args.input_dir)}")
+    print(f"Found files: {len(files)}")
+    print(f"In-channels: {in_channels}")
+    print(f"Classes ({len(class_names)}): {class_names}")
+    print(f"Batch size: {args.batch_size} | Workers: {args.num_workers} | mmap={args.mmap}")
+    print("=" * 30)
+
+    # Data info peek
+    print_data_info(
+        files=files,
+        in_channels=in_channels,
+        normalize=args.normalize,
+        tile_single_channel=args.tile_single_channel,
+        mmap=args.mmap,
+        sample_info_k=max(0, args.sample_info_k),
+    )
+
+    # Dataset & DataLoader
     ds = NpyDirDataset(
         files=files,
         channels=in_channels,
@@ -335,18 +379,23 @@ def main():
         ),
     )
 
-    # Optionally convert model to half
     if args.fp16 and device.type == "cuda":
         model = model.half()
 
     # Run
+    t0 = time.time()
     results = run_inference(
         model=model,
         dl=dl,
         device=device,
         fp16=args.fp16,
-        class_names=class_names
+        class_names=class_names,
+        total_files=len(files),
+        print_every_n=max(1, args.print_every_n),
     )
+    elapsed = time.time() - t0
+    speed = len(files) / max(1e-6, elapsed)
+    print(f"\nFinished inference: {len(files)} files | elapsed={elapsed:.2f}s | avg speed={speed:.2f} files/s")
 
     # Save
     csv_path = args.output_csv if args.output_csv.strip() else None
