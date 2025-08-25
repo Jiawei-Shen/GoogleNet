@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Batch inference over a directory of .npy files (recursively) with print-only logs.
+Batch inference over a directory of .npy files (recursively) with single-line flashing progress.
 
 Example:
     python infer_npy_dir.py \
@@ -55,9 +55,22 @@ def _scan_tree(start_dir: str) -> List[str]:
             continue
     return out
 
-def list_npy_files_parallel(root: str, workers: int, progress_every: int = 500) -> List[str]:
+
+def _format_eta(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:d}h{m:02d}m{s:02d}s"
+    elif m > 0:
+        return f"{m:d}m{s:02d}s"
+    else:
+        return f"{s:d}s"
+
+
+def list_npy_files_parallel(root: str, workers: int) -> List[str]:
     """
-    Parallel file discovery using exactly `workers` threads.
+    Parallel file discovery using exactly `workers` threads, with a single-line tqdm bar.
     """
     root = os.path.abspath(os.path.expanduser(root))
 
@@ -79,24 +92,28 @@ def list_npy_files_parallel(root: str, workers: int, progress_every: int = 500) 
     except FileNotFoundError:
         return []
 
+    # If no subdirs, just return what we found at root
     if workers <= 1 or not top_dirs:
         for d in top_dirs:
             files.extend(_scan_tree(d))
         files.sort()
         return files
 
-    scanned = 0
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+    start = time.time()
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex, \
+         tqdm(total=len(top_dirs), desc="Scan", unit="dir", leave=False, dynamic_ncols=True) as bar:
         futures = [ex.submit(_scan_tree, d) for d in top_dirs]
         for fut in as_completed(futures):
             files.extend(fut.result())
-            scanned += 1
-            if progress_every and (scanned % progress_every == 0 or scanned == len(top_dirs)):
-                print(f"[scan] {scanned}/{len(top_dirs)} top-level dirs done")
+            done = bar.n + 1
+            elapsed = time.time() - start
+            speed = done / max(1e-9, elapsed)
+            eta = (len(top_dirs) - done) / max(1e-9, speed)
+            bar.set_postfix_str(f"speed={speed:.1f} dir/s ETA={_format_eta(eta)}")
+            bar.update(1)
 
     files.sort()
     return files
-
 
 
 def ensure_chw(x: np.ndarray, channels: int, tile_single_channel: bool = False) -> np.ndarray:
@@ -245,53 +262,50 @@ def run_inference(
     fp16: bool,
     class_names: List[str],
     total_files: int,
-    print_every_n: int,
 ) -> List[Dict[str, Any]]:
+    """
+    Single-line flashing progress using one tqdm bar (total = number of files).
+    """
     results: List[Dict[str, Any]] = []
     use_amp = fp16 and device.type == "cuda"
 
     processed = 0
-    next_milestone = max(1, print_every_n)
     t0 = time.time()
 
-    for images, paths in tqdm(dl, desc="Infer", leave=True):
-        images = images.to(device, non_blocking=True)
-        if use_amp:
-            images = images.half()
+    with tqdm(total=total_files, desc="Infer", unit="file", dynamic_ncols=True, leave=True) as bar:
+        for images, paths in dl:
+            images = images.to(device, non_blocking=True)
+            if use_amp:
+                images = images.half()
 
-        with (torch.cuda.amp.autocast() if use_amp else torch.no_grad()):
-            outputs = model(images)
-            if isinstance(outputs, tuple):
-                outputs = outputs[0]
+            with (torch.cuda.amp.autocast() if use_amp else torch.no_grad()):
+                outputs = model(images)
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]
 
-        logits = outputs.detach().float().cpu().numpy()
-        probs = softmax_np(logits, axis=1)
-        top_idx = probs.argmax(axis=1)
-        top_prob = probs.max(axis=1)
+            logits = outputs.detach().float().cpu().numpy()
+            probs = softmax_np(logits, axis=1)
+            top_idx = probs.argmax(axis=1)
+            top_prob = probs.max(axis=1)
 
-        for i in range(len(paths)):
-            pred_idx = int(top_idx[i])
-            pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
-            prob_dict = {class_names[j]: float(probs[i, j]) for j in range(len(class_names))}
-            results.append({
-                "path": paths[i],
-                "pred_idx": pred_idx,
-                "pred_class": pred_name,
-                "pred_prob": float(top_prob[i]),
-                "probs": prob_dict
-            })
+            for i in range(len(paths)):
+                pred_idx = int(top_idx[i])
+                pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
+                prob_dict = {class_names[j]: float(probs[i, j]) for j in range(len(class_names))}
+                results.append({
+                    "path": paths[i],
+                    "pred_idx": pred_idx,
+                    "pred_class": pred_name,
+                    "pred_prob": float(top_prob[i]),
+                    "probs": prob_dict
+                })
 
-        # ---- Progress prints ----
-        processed += len(paths)
-        if processed >= next_milestone or processed == total_files:
+            processed += len(paths)
+            bar.update(len(paths))
             elapsed = time.time() - t0
-            speed = processed / max(1e-6, elapsed)
-            pct = 100.0 * processed / max(1, total_files)
-            remaining = total_files - processed
-            eta = remaining / max(1e-6, speed)
-            print(f"[{processed}/{total_files} | {pct:.1f}%] elapsed={elapsed:.1f}s "
-                  f"| speed={speed:.1f} files/s | ETA={eta:.1f}s")
-            next_milestone += print_every_n
+            speed = processed / max(1e-9, elapsed)
+            eta = (total_files - processed) / max(1e-9, speed)
+            bar.set_postfix_str(f"speed={speed:.1f} file/s ETA={_format_eta(eta)}")
 
     return results
 
@@ -342,8 +356,8 @@ def main():
     parser.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536],
                         help="ConvNeXt dims used in training (match if you changed it)")
     # Print config
-    parser.add_argument("--print_every_n", type=int, default=500,
-                        help="Print a progress line every N files")
+    parser.add_argument("--print_every_n", type=int, default=500,  # kept for backwards compat; unused with tqdm bar
+                        help="(Unused in single-line mode) Print a progress line every N files")
     parser.add_argument("--sample_info_k", type=int, default=3,
                         help="Print header info (shape/dtype) for the first K files")
     args = parser.parse_args()
@@ -390,9 +404,8 @@ def main():
             if class_names[i] is None:
                 class_names[i] = str(i)
 
-    # Gather files
-    # replace previous file listing
-    files = list_npy_files_parallel(args.input_dir, workers=args.num_workers, progress_every=10000)
+    # Gather files (single-line progress)
+    files = list_npy_files_parallel(args.input_dir, workers=args.num_workers)
 
     if len(files) == 0:
         raise SystemExit(f"No .npy files found under: {args.input_dir}")
@@ -430,6 +443,8 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=(8 if args.num_workers > 0 else None),
         shuffle=False,
         drop_last=False,
         collate_fn=lambda batch: (
@@ -441,7 +456,7 @@ def main():
     if args.fp16 and device.type == "cuda":
         model = model.half()
 
-    # Run
+    # Run (single-line flashing bar)
     t0 = time.time()
     results = run_inference(
         model=model,
@@ -450,10 +465,9 @@ def main():
         fp16=args.fp16,
         class_names=class_names,
         total_files=len(files),
-        print_every_n=max(1, args.print_every_n),
     )
     elapsed = time.time() - t0
-    speed = len(files) / max(1e-6, elapsed)
+    speed = len(files) / max(1e-9, elapsed)
     print(f"\nFinished inference: {len(files)} files | elapsed={elapsed:.2f}s | avg speed={speed:.2f} files/s")
 
     # Save
