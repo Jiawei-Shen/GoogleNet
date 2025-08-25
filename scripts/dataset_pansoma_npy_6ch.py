@@ -152,57 +152,50 @@ def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=16, shuff
     return loader, unified_class_to_idx
 
 
-class NpyUnlabeledDataset(Dataset):
-    """Loads 6-channel .npy files (flat or nested dirs). Returns (x, -1, path)."""
-    def __init__(self, files, transform=None, return_paths=False):
-        self.files = files
-        self.transform = transform
-        self.return_paths = return_paths
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        path = self.files[idx]
-        arr = np.load(path)  # add mmap_mode="r" if desired
-        # Ensure channel-first [6,H,W]
-        if arr.ndim != 3:
-            raise RuntimeError(f"{os.path.basename(path)} has {arr.ndim} dims; expected 3")
-        if arr.shape[0] == 6:
-            pass
-        elif arr.shape[-1] == 6:
-            arr = np.transpose(arr, (2, 0, 1))
-        else:
-            raise RuntimeError(f"{os.path.basename(path)} shape {arr.shape}; 6 channels required")
-
-        x = torch.from_numpy(arr).float()
-        if self.transform:
-            x = self.transform(x)
-        y = -1  # unlabeled
-        if self.return_paths:
-            return x, y, path
-        return x, y
-
-
-def get_inference_data_loader(data_dir, batch_size=32, num_workers=16, shuffle=False, return_paths=True):
+def get_inference_data_loader(
+    data_dir,
+    batch_size: int = 256,
+    num_workers: int = 4,
+    shuffle: bool = False,
+    return_paths: bool = True,
+    allow_transpose: bool = True,   # if arrays are [H,W,6], transpose to [6,H,W] (slower)
+    enforce_float32: bool = True,   # cast to float32 if needed
+    pin_memory: bool = True,
+):
     """
-    Recursively loads ALL *.npy files under the given dir(s), including subfolders.
-    Accepts: str, list[str], or (train_roots, val/test_roots) — uses the second element if a pair.
-    Returns: (DataLoader, {})  # empty class map => unlabeled
+    High-throughput *inference* DataLoader for unlabeled 6-channel .npy tensors.
+    - Recursively loads ALL *.npy files under the given dir(s), including subfolders.
+    - Accepts: str, list[str], or (train_roots, val/test_roots) — uses the second element if a pair.
+    - No CPU normalization (do it on GPU for speed).
+    - Uses np.load(..., mmap_mode="r") to avoid extra copies.
+
+    Returns:
+        (loader, {})  # empty class map signals 'unlabeled' mode
     """
+    import os
+    import glob
+    import numpy as np
+    import torch
+    from torch.utils.data import Dataset, DataLoader
+
     def _to_list(x):
-        if x is None: return []
-        if isinstance(x, (list, tuple)): return list(x)
+        if x is None:
+            return []
+        if isinstance(x, (list, tuple)):
+            return list(x)
         return [x]
 
-    # Accept str, list[str], or (train, val/test)
-    if (isinstance(data_dir, (list, tuple)) and len(data_dir) == 2
-        and isinstance(data_dir[1], (str, list, tuple))):
-        roots = _to_list(data_dir[1])
+    # Resolve roots: str | list[str] | (train_roots, val/test_roots)
+    if (
+        isinstance(data_dir, (list, tuple))
+        and len(data_dir) == 2
+        and isinstance(data_dir[1], (str, list, tuple))
+    ):
+        roots = _to_list(data_dir[1])  # use "val/test" side for inference when a pair is given
     else:
         roots = _to_list(data_dir)
 
-    # Collect *.npy recursively (dedup + stable order)
+    # Collect *.npy recursively (stable order, de-duplicated)
     files = []
     for r in roots:
         r = os.path.abspath(os.path.expanduser(r))
@@ -211,33 +204,66 @@ def get_inference_data_loader(data_dir, batch_size=32, num_workers=16, shuffle=F
         found = glob.glob(os.path.join(r, "**", "*.npy"), recursive=True)
         files.extend(found)
 
-    # De-duplicate while preserving order
     seen = set()
     files = [f for f in sorted(files) if not (f in seen or seen.add(f))]
-
     if not files:
-        raise FileNotFoundError(f"No .npy files found under: {', '.join(roots)}")
+        raise FileNotFoundError(f"No .npy files found under: {', '.join(map(str, roots))}")
 
-    # Same normalization as training
-    transform = transforms.Compose([
-        transforms.Normalize(
-            mean=[18.417816162109375, 12.649129867553711, -0.5452527403831482,
-                  24.723854064941406, 4.690611362457275, 10.659969329833984],
-            std=[25.028322219848633, 14.809632301330566, 0.6181337833404541,
-                 29.972835540771484, 7.923179149780273, 27.151996612548828]
-        )
-    ])
+    class _NpyUnlabeledDataset(Dataset):
+        """Loads 6-channel arrays; returns (tensor, -1, path) for inference."""
+        def __init__(self, paths, return_paths: bool):
+            self.paths = paths
+            self.return_paths = return_paths
 
-    ds = NpyUnlabeledDataset(files, transform=transform, return_paths=return_paths)
-    loader = DataLoader(
-        ds,
+        def __len__(self):
+            return len(self.paths)
+
+        def __getitem__(self, idx):
+            path = self.paths[idx]
+            # Memory-map to reduce CPU copies
+            arr = np.load(path, mmap_mode="r")
+
+            # Ensure channel-first [6,H,W]
+            if arr.ndim != 3:
+                raise RuntimeError(f"{os.path.basename(path)} has {arr.ndim} dims; expected 3")
+
+            if arr.shape[0] == 6:
+                pass  # already [6,H,W]
+            elif allow_transpose and arr.shape[-1] == 6:
+                # NOTE: transpose is slower; prefer saving arrays channel-first for speed
+                arr = np.transpose(arr, (2, 0, 1))
+            else:
+                raise RuntimeError(
+                    f"{os.path.basename(path)} shape {arr.shape}; expected [6,H,W]"
+                    + (" or [H,W,6] (set allow_transpose=True)" if not allow_transpose else "")
+                )
+
+            x = torch.from_numpy(arr)
+            if enforce_float32 and x.dtype != torch.float32:
+                x = x.float()  # cheap cast when underlying is float32 memmap
+
+            y = -1  # unlabeled
+            if self.return_paths:
+                return x, y, path
+            return x, y
+
+    ds = _NpyUnlabeledDataset(files, return_paths=return_paths)
+
+    # IMPORTANT loader knobs for shared storage / many small files:
+    # - persistent_workers=False (avoids stuck workers & reduces contention)
+    # - prefetch_factor small (2) if workers > 0
+    loader_kwargs = dict(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=(num_workers > 0),
+        pin_memory=pin_memory,
+        persistent_workers=False,
     )
-    return loader, {}  # unlabeled
+    if num_workers and num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+
+    loader = DataLoader(ds, **loader_kwargs)
+    return loader, {}  # {} => unlabeled/inference mode
 
 
 if __name__ == "__main__":
