@@ -1,72 +1,133 @@
-import os
-import torch
 import numpy as np
-from tqdm import tqdm
+import os
 import argparse
+from tqdm import tqdm
 
-def calculate_mean_std(root_dir: str, num_channels: int):
+
+def calculate_channel_stats(directory, topn=None):
     """
-    Calculates the mean and standard deviation of a dataset of .npy files.
+    Recursively finds all .npy files in a directory and calculates the mean and
+    standard deviation for each channel across all files.
+
+    This function uses Welford's algorithm for a numerically stable, one-pass
+    calculation of the mean and variance, which is memory-efficient.
+
+    Args:
+        directory (str): The path to the directory to scan for .npy files.
+        topn (int, optional): The number of files to process. If None, all
+                              files are processed. Defaults to None.
+
+    Returns:
+        tuple: A tuple containing two numpy arrays (mean, std).
     """
-    filepaths = []
-    for dirpath, _, filenames in os.walk(root_dir):
-        for f in filenames:
-            if f.lower().endswith('.npy'):
-                filepaths.append(os.path.join(dirpath, f))
+    print(f"Scanning for .npy files in '{directory}'...")
 
-    if not filepaths:
-        raise ValueError(f"No .npy files found in directory: {root_dir}")
+    # Find all .npy files recursively
+    npy_files = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith(".npy"):
+                npy_files.append(os.path.join(root, file))
 
-    print(f"Found {len(filepaths)} .npy files. Starting calculation for {num_channels} channels...")
+    if not npy_files:
+        print("Error: No .npy files found in the specified directory.")
+        return None, None
 
-    sum_channels = torch.zeros(num_channels)
-    sum_sq_channels = torch.zeros(num_channels)
-    pixel_count = 0
+    # Sort the list of files to ensure consistent selection for --topn
+    npy_files.sort()
 
-    # --- REVISED: Define a custom format for the progress bar ---
-    # {n_fmt} is processed count, {total_fmt} is total count.
-    custom_bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
+    # If topn is specified, slice the list of files
+    if topn is not None and topn > 0:
+        if topn < len(npy_files):
+            print(f"--- Processing only the top {topn} of {len(npy_files)} files found. ---")
+            npy_files = npy_files[:topn]
+        else:
+            print(
+                f"Warning: --topn value ({topn}) is greater than or equal to the number of files found ({len(npy_files)}). Processing all files.")
 
-    # --- Pass the custom format to tqdm ---
-    for path in tqdm(filepaths, desc="Calculating Stats", bar_format=custom_bar_format):
-        image_np = np.load(path)
+    print(f"Found {len(npy_files)} files to process. Starting calculation...")
 
-        if image_np.ndim != 3 or image_np.shape[0] != num_channels:
-            print(f"\nSkipping file with incorrect shape: {path} has shape {image_np.shape}")
+    # Initialize variables for Welford's algorithm
+    count = 0
+    mean = None
+    M2 = None  # Sum of squares of differences from the current mean
+
+    # Use tqdm for a progress bar
+    for file_path in tqdm(npy_files, desc="Processing files"):
+        try:
+            # Load the numpy array from the file
+            data = np.load(file_path)
+
+            # Initialize mean and M2 on the first file
+            if mean is None:
+                # Assuming data shape is (channels, height, width) or just (channels,)
+                # We calculate stats along the channel axis (axis 0)
+                num_channels = data.shape[0]
+                mean = np.zeros(num_channels)
+                M2 = np.zeros(num_channels)
+
+            # Flatten the spatial dimensions to get a (channels, num_pixels) array
+            # This handles both 1D and multi-dimensional channel data
+            reshaped_data = data.reshape(data.shape[0], -1)
+
+            # Iterate over each pixel/data point in the file
+            for i in range(reshaped_data.shape[1]):
+                pixel = reshaped_data[:, i]
+                count += 1
+                delta = pixel - mean
+                mean += delta / count
+                delta2 = pixel - mean
+                M2 += delta * delta2
+
+        except Exception as e:
+            print(f"\nWarning: Could not process file {file_path}. Error: {e}")
             continue
 
-        image_tensor = torch.from_numpy(image_np.astype(np.float32))
+    if count == 0:
+        print("Error: Could not process any files successfully.")
+        return None, None
 
-        sum_channels += torch.sum(image_tensor, dim=[1, 2])
-        sum_sq_channels += torch.sum(image_tensor ** 2, dim=[1, 2])
-        pixel_count += image_tensor.shape[1] * image_tensor.shape[2]
+    # Calculate variance and standard deviation
+    variance = M2 / (count - 1)  # Use (count - 1) for sample variance
+    std_dev = np.sqrt(variance)
 
-    if pixel_count == 0:
-        raise ValueError("Could not process any images. Check file shapes and paths.")
+    return mean, std_dev
 
-    mean = sum_channels / pixel_count
-    var = (sum_sq_channels / pixel_count) - (mean ** 2)
-    std = torch.sqrt(var)
 
-    return mean.tolist(), std.tolist()
+def main():
+    """Main function to parse arguments and run the calculation."""
+    parser = argparse.ArgumentParser(
+        description="Calculate mean and standard deviation from .npy files for dataset normalization.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        "directory",
+        type=str,
+        help="The root directory containing the .npy files."
+    )
+    # Add the optional --topn argument
+    parser.add_argument(
+        "--topn",
+        type=int,
+        default=None,
+        help="Optional: Process only the top N .npy files found. Processes all files by default."
+    )
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.directory):
+        print(f"Error: Directory not found at '{args.directory}'")
+        return
+
+    # Pass the topn argument to the calculation function
+    mean, std = calculate_channel_stats(args.directory, topn=args.topn)
+
+    if mean is not None and std is not None:
+        print("\n--- Calculation Complete ---")
+        print(f"Calculated Mean:\n{list(mean)}")
+        print(f"\nCalculated Std Dev:\n{list(std)}")
+        print("\n--- PyTorch transforms.Normalize format ---")
+        print(f"transforms.Normalize(\n    mean={list(mean)},\n    std={list(std)}\n)")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Calculate mean and std for a dataset of .npy files.")
-    parser.add_argument("data_dir", type=str, help="Path to the root directory of the training dataset.")
-    parser.add_argument("--channels", type=int, default=6, help="Number of channels in the image files (default: 6).")
-    args = parser.parse_args()
-
-    try:
-        mean, std = calculate_mean_std(args.data_dir, args.channels)
-
-        print("\n" + "="*40)
-        print("✅ Calculation Complete!")
-        print("="*40)
-        print("\nCopy these values into your dataloader script:\n")
-        print(f"mean = {mean}")
-        print(f"std  = {std}")
-        print("\n" + "="*40)
-
-    except (ValueError, FileNotFoundError) as e:
-        print(f"\nError: {e}")
+    main()
