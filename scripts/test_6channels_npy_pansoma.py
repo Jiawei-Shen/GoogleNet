@@ -1,227 +1,364 @@
 #!/usr/bin/env python3
+"""
+Batch inference over a directory of .npy files (recursively).
+
+Example:
+    python infer_npy_dir.py \
+        --input_dir /path/to/npy_root \
+        --ckpt /path/to/model_best.pth \
+        --output_csv preds.csv \
+        --output_json preds.json \
+        --batch_size 64 --num_workers 8 --fp16
+
+Notes:
+- Assumes your checkpoint (from the provided training script) includes:
+    * 'model_state_dict'
+    * 'genotype_map' (class_name -> idx)
+    * 'in_channels'
+- Model architecture depths/dims default to [3,3,27,3] / [192,384,768,1536].
+  If you trained with different values, pass --depths / --dims to match.
+"""
+
 import argparse
 import os
 import sys
 import json
-import time
-from collections import defaultdict
+import math
+from typing import List, Tuple, Dict, Any
 
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.distributed as dist
-from torch.utils.data import DataLoader
-from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-import torch.nn.functional as F
 
-# Local imports
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from mynet import ConvNeXtCBAMClassifier
-from dataset_pansoma_npy_6ch import get_inference_data_loader  # <-- unlabeled loader
+# Make sure we can import your model class the same way as in training
+THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+sys.path.append(os.path.abspath(os.path.join(THIS_DIR, "..")))
+from mynet import ConvNeXtCBAMClassifier  # noqa: E402
 
-# Globals updated in __main__ when using DDP
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-IS_MAIN_PROCESS = True  # rank-0 only printing
 
-def print_and_log(msg, log_path):
-    if IS_MAIN_PROCESS:
-        print(msg, flush=True)
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
+# ----------------------------- Utilities ------------------------------------- #
 
-def _fmt_int(n):
-    try: return f"{int(n):,}"
-    except Exception: return str(n)
+def list_npy_files(root: str) -> List[str]:
+    files = []
+    for dp, _, fns in os.walk(root):
+        for fn in fns:
+            if fn.lower().endswith(".npy"):
+                files.append(os.path.join(dp, fn))
+    files.sort()
+    return files
 
-@torch.no_grad()
-def run_inference(model, data_loader, class_names, log_file, topk=1, save_probs=False, save_logits=False):
+
+def ensure_chw(x: np.ndarray, channels: int, tile_single_channel: bool = False) -> np.ndarray:
     """
-    Returns list of dicts:
-      {"path": <str>, "top1_idx": int, "top1_name": str, "top1_prob": float,
-       "topk_idxs": [...], "topk_names": [...], "topk_probs": [...],
-       "probs": [...], "logits": [...]}
+    Convert numpy array to float32 CHW.
+    Accepts [C,H,W], [H,W,C], [H,W]; can tile single-channel if requested.
     """
-    model.eval()
-    results = []
-    total = 0
-    start = time.time()
-
-    pbar = tqdm(data_loader, desc="Infer", disable=not IS_MAIN_PROCESS)
-    for batch in pbar:
-        # loader returns (x, -1, path)
-        if isinstance(batch, (list, tuple)) and len(batch) == 3:
-            images, _, paths = batch
+    if x.ndim == 3:
+        # Either CHW or HWC
+        if x.shape[0] == channels:
+            chw = x
+        elif x.shape[-1] == channels:
+            chw = np.transpose(x, (2, 0, 1))
+        elif x.shape[0] == 1 and tile_single_channel and channels > 1:
+            # [1,H,W] -> tile
+            chw = np.tile(x, (channels, 1, 1))
+        elif x.shape[-1] == 1 and tile_single_channel and channels > 1:
+            # [H,W,1] -> [1,H,W] -> tile
+            chw = np.transpose(x, (2, 0, 1))
+            chw = np.tile(chw, (channels, 1, 1))
         else:
-            images, _ = batch
-            paths = [""] * images.size(0)
+            raise ValueError(f"Cannot infer channel axis for shape {x.shape} with channels={channels}")
+    elif x.ndim == 2:
+        # [H,W]
+        if tile_single_channel and channels > 1:
+            chw = np.tile(x[None, ...], (channels, 1, 1))
+        else:
+            if channels != 1:
+                raise ValueError(f"Input is 2D but channels={channels}. "
+                                 f"Use --tile_single_channel if you want to tile it.")
+            chw = x[None, ...]  # [1,H,W]
+    else:
+        raise ValueError(f"Unsupported tensor ndim={x.ndim}, shape={x.shape}")
 
+    # ensure dtype float32
+    if chw.dtype != np.float32:
+        chw = chw.astype(np.float32, copy=False)
+    return chw
+
+
+def softmax_np(logits: np.ndarray, axis: int = -1) -> np.ndarray:
+    m = logits.max(axis=axis, keepdims=True)
+    y = np.exp(logits - m)
+    return y / y.sum(axis=axis, keepdims=True)
+
+
+# ---------------------------- Dataset ---------------------------------------- #
+
+class NpyDirDataset(Dataset):
+    def __init__(
+        self,
+        files: List[str],
+        channels: int,
+        normalize: bool = False,
+        tile_single_channel: bool = False,
+        mmap: bool = False,
+    ):
+        self.files = files
+        self.channels = channels
+        self.normalize = normalize
+        self.tile_single_channel = tile_single_channel
+        self.mmap = mmap
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
+        path = self.files[idx]
+        # Safe load
+        arr = np.load(path, allow_pickle=False, mmap_mode=('r' if self.mmap else None))
+
+        # Common case: uint8 images or features; allow optional normalization
+        if arr.dtype == np.uint8 and self.normalize:
+            arr = arr.astype(np.float32) / 255.0
+
+        chw = ensure_chw(arr, self.channels, tile_single_channel=self.tile_single_channel)
+        tensor = torch.from_numpy(chw)  # float32 CHW
+        return tensor, path
+
+
+# --------------------------- Model Loading ----------------------------------- #
+
+def build_and_load_model(
+    ckpt_path: str,
+    device: torch.device,
+    depths: List[int],
+    dims: List[int]
+) -> Tuple[torch.nn.Module, Dict[str, int], int]:
+    """
+    Returns: (model.eval() on device, genotype_map, in_channels)
+    """
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    checkpoint = torch.load(ckpt_path, map_location=device)
+
+    # Try to read the training-time metadata saved by your script
+    genotype_map = checkpoint.get("genotype_map", {})
+    in_channels = int(checkpoint.get("in_channels", 6))
+
+    # Construct the model with provided (or default) depths/dims
+    model = ConvNeXtCBAMClassifier(in_channels=in_channels, class_num=len(genotype_map) or 2,
+                                   depths=depths, dims=dims).to(device)
+
+    # Load weights (handles both wrapped and unwrapped state dicts)
+    state = checkpoint.get("model_state_dict", checkpoint)
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as e:
+        # Helpful message if depths/dims mismatch
+        raise RuntimeError(
+            f"Failed to load state dict. If you trained with non-default depths/dims, "
+            f"re-run with matching --depths and --dims. Original error:\n{e}"
+        )
+
+    model.eval()
+    return model, genotype_map, in_channels
+
+
+# --------------------------- Inference Core ---------------------------------- #
+
+@torch.inference_mode()
+def run_inference(
+    model: torch.nn.Module,
+    dl: DataLoader,
+    device: torch.device,
+    fp16: bool,
+    class_names: List[str]
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    use_amp = fp16 and device.type == "cuda"
+
+    for batch in tqdm(dl, desc="Infer", leave=True):
+        images, paths = batch
         images = images.to(device, non_blocking=True)
-        outputs = model(images)
-        if isinstance(outputs, tuple):
-            outputs = outputs[0]
+        if use_amp:
+            images = images.half()
 
-        probs = F.softmax(outputs, dim=1)
-        k = min(topk, probs.shape[1])
-        top_p, top_i = torch.topk(probs, k=k, dim=1)
+        with (torch.cuda.amp.autocast() if use_amp else torch.no_grad()):
+            outputs = model(images)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]  # use main head
 
-        for i in range(images.size(0)):
-            top_idxs = top_i[i].tolist()
-            top_probs = top_p[i].tolist()
-            rec = {
-                "path": os.path.basename(paths[i]) if paths[i] else f"sample_{total+i:06d}",
-                "top1_idx": int(top_idxs[0]),
-                "top1_name": class_names[top_idxs[0]] if 0 <= top_idxs[0] < len(class_names) else str(top_idxs[0]),
-                "top1_prob": float(top_probs[0]),
-            }
-            if k > 1:
-                rec["topk_idxs"] = [int(x) for x in top_idxs]
-                rec["topk_names"] = [class_names[j] if 0 <= j < len(class_names) else str(j) for j in top_idxs]
-                rec["topk_probs"] = [float(x) for x in top_probs]
-            if save_probs:
-                rec["probs"] = [float(x) for x in probs[i].tolist()]
-            if save_logits:
-                rec["logits"] = [float(x) for x in outputs[i].tolist()]
-            results.append(rec)
+        # logits -> probs (cpu numpy)
+        logits = outputs.detach().float().cpu().numpy()
+        probs = softmax_np(logits, axis=1)
+        top_idx = probs.argmax(axis=1)
+        top_prob = probs.max(axis=1)
 
-        total += images.size(0)
-        if IS_MAIN_PROCESS:
-            pbar.set_postfix(seen=_fmt_int(total))
+        for i in range(len(paths)):
+            pred_idx = int(top_idx[i])
+            pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
+            prob_dict = {class_names[j]: float(probs[i, j]) for j in range(len(class_names))}
+            results.append({
+                "path": paths[i],
+                "pred_idx": pred_idx,
+                "pred_class": pred_name,
+                "pred_prob": float(top_prob[i]),
+                "probs": prob_dict
+            })
 
-    elapsed = time.time() - start
-    if IS_MAIN_PROCESS and elapsed > 0:
-        print_and_log(f"[Infer] Processed {_fmt_int(total)} samples in {elapsed:.2f}s "
-                      f"({int(total/max(1e-9, elapsed))} samples/s).", log_file)
     return results
 
-def _ensure_model(depths, dims, in_channels, class_num):
-    return ConvNeXtCBAMClassifier(
-        in_channels=in_channels,
-        class_num=class_num,
-        depths=depths, dims=dims
-    )
+
+def write_outputs(results: List[Dict[str, Any]], csv_path: str, json_path: str) -> None:
+    if json_path:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+    if csv_path:
+        import csv
+        # Collect all class names to produce consistent columns
+        all_classes = set()
+        for r in results:
+            all_classes.update(r["probs"].keys())
+        header = ["path", "pred_idx", "pred_class", "pred_prob"] + sorted(all_classes)
+
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for r in results:
+                row = [r["path"], r["pred_idx"], r["pred_class"], f"{r['pred_prob']:.6f}"]
+                # Append probs in the same sorted order
+                for cname in sorted(all_classes):
+                    row.append(f"{r['probs'].get(cname, 0.0):.6f}")
+                w.writerow(row)
+
+
+# ----------------------------- Main ------------------------------------------ #
 
 def main():
-    parser = argparse.ArgumentParser(description="Inference on 6-channel .npy folder (no labels)")
-    parser.add_argument("data_path", type=str, help="Directory containing .npy files.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint .pth (model_best.pth).")
-    parser.add_argument("-o", "--output_path", default="./inference_results_6channel", type=str,
-                        help="Directory to save logs/predictions.")
-    parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=8, help="DataLoader workers")
-    parser.add_argument("--depths", type=int, nargs="+", default=[3, 3, 27, 3], help="ConvNeXt stage depths")
-    parser.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536], help="ConvNeXt dims")
-
-    # Multi-GPU (optional)
-    parser.add_argument("--data_parallel", action="store_true", help="Use nn.DataParallel (single-process).")
-
-    # Outputs
-    parser.add_argument("--topk", type=int, default=1, help="Also save top-k predictions (k>=1).")
-    parser.add_argument("--save_probs", action="store_true", help="Include full per-class probabilities.")
-    parser.add_argument("--save_logits", action="store_true", help="Include raw logits.")
+    parser = argparse.ArgumentParser(description="Infer over .npy files (recursively) with ConvNeXtCBAMClassifier")
+    parser.add_argument("--input_dir", required=True, type=str, help="Root dir to scan for .npy files")
+    parser.add_argument("--ckpt", required=True, type=str, help="Path to checkpoint .pth")
+    parser.add_argument("--output_csv", default="predictions.csv", type=str, help="CSV output path (or '' to skip)")
+    parser.add_argument("--output_json", default="predictions.json", type=str, help="JSON output path (or '' to skip)")
+    parser.add_argument("--batch_size", default=64, type=int)
+    parser.add_argument("--num_workers", default=8, type=int)
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device choice")
+    parser.add_argument("--fp16", action="store_true", help="Enable half-precision inference (CUDA only)")
+    parser.add_argument("--normalize", action="store_true",
+                        help="If input dtype is uint8, scale to [0,1] by /255.0")
+    parser.add_argument("--tile_single_channel", action="store_true",
+                        help="If an array is single-channel, tile it to match required channels")
+    parser.add_argument("--mmap", action="store_true", help="Load .npy via mmap_mode='r' (lower RAM peak)")
+    parser.add_argument("--depths", type=int, nargs="+", default=[3, 3, 27, 3],
+                        help="ConvNeXt stage depths used in training (match if you changed it)")
+    parser.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536],
+                        help="ConvNeXt dims used in training (match if you changed it)")
     args = parser.parse_args()
 
-    # Safer start method for multiprocess loading
-    try:
-        import multiprocessing as mp
-        mp.set_start_method("spawn", force=True)
-    except Exception:
-        pass
-
-    data_dir = os.path.abspath(os.path.expanduser(args.data_path))
-    os.makedirs(args.output_path, exist_ok=True)
-    log_file = os.path.join(args.output_path, "inference_log_6ch.txt")
-    if os.path.exists(log_file):
-        os.remove(log_file)
-
-    # Summary
-    print_and_log("======== Inference Args ========", log_file)
-    print_and_log(f"Output path : {args.output_path}", log_file)
-    print_and_log(f"Checkpoint  : {args.checkpoint}", log_file)
-    print_and_log(f"Batch size  : {args.batch_size}", log_file)
-    print_and_log(f"Workers     : {args.num_workers}", log_file)
-    print_and_log(f"Device      : {'cuda' if torch.cuda.is_available() else 'cpu'}", log_file)
-    print_and_log(f"Data dir    : {data_dir}", log_file)
-    print_and_log("================================", log_file)
-
-    # Build loader (unlabeled)
-    print_and_log("[Data] Building inference DataLoader...", log_file)
-    infer_loader, genotype_map = get_inference_data_loader(
-        data_dir, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False, return_paths=True
-    )
-    print_and_log("[Data] Inference DataLoader built.", log_file)
-    try:
-        ds_len = len(infer_loader.dataset)
-        print_and_log(f"[Data] Files: {_fmt_int(ds_len)}", log_file)
-    except Exception:
-        pass
-
-    # Load checkpoint
-    if not os.path.isfile(args.checkpoint):
-        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    ckpt_classes = ckpt.get("genotype_map", None)
-    if not ckpt_classes:
-        raise RuntimeError("Checkpoint must contain 'genotype_map' to name classes.")
-    num_classes = len(ckpt_classes)
-    class_names = [None] * num_classes
-    for name, idx in ckpt_classes.items():
-        if 0 <= idx < num_classes:
-            class_names[idx] = str(name)
-    # Fill any gaps with the index to be safe
-    for i in range(num_classes):
-        if class_names[i] is None:
-            class_names[i] = str(i)
-
-    in_channels = int(ckpt.get("in_channels", 6))
-    model = _ensure_model(args.depths, args.dims, in_channels=in_channels, class_num=num_classes).to(device)
-
-    # Load weights
-    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    if missing: print_and_log(f"[Model] Missing keys (ok if only classifier head): {missing}", log_file)
-    if unexpected: print_and_log(f"[Model] Unexpected keys: {unexpected}", log_file)
-
-    # Optional DataParallel
-    if args.data_parallel and torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-        print_and_log(f"[Runtime] Using DataParallel across {torch.cuda.device_count()} GPUs.", log_file)
+    # Resolve device
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            print("CUDA not available, falling back to CPU.")
+            device = torch.device("cpu")
+        else:
+            device = torch.device("cuda")
     else:
-        print_and_log(f"[Runtime] Using device: {device}", log_file)
+        device = torch.device("cpu")
 
-    # Run inference
-    print_and_log("[Infer] Starting...", log_file)
-    preds = run_inference(
-        model, infer_loader, class_names, log_file,
-        topk=max(1, args.topk), save_probs=args.save_probs, save_logits=args.save_logits
+    # For faster inference on varying shapes
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    # Build model & load weights
+    model, genotype_map, in_channels = build_and_load_model(
+        ckpt_path=args.ckpt,
+        device=device,
+        depths=args.depths,
+        dims=args.dims,
     )
 
-    # Save predictions
-    import csv
-    csv_path = os.path.join(args.output_path, "predictions.csv")
-    json_path = os.path.join(args.output_path, "predictions.json")
-    with open(csv_path, "w", newline="") as f:
-        base_fields = ["path", "top1_idx", "top1_name", "top1_prob"]
-        extra = []
-        if args.topk > 1:
-            extra += ["topk_idxs", "topk_names", "topk_probs"]
-        if args.save_probs:
-            extra += ["probs"]
-        if args.save_logits:
-            extra += ["logits"]
-        writer = csv.DictWriter(f, fieldnames=base_fields + extra)
-        writer.writeheader()
-        for r in preds:
-            row = {k: r[k] for k in base_fields}
-            for k in extra:
-                # store lists as JSON strings to keep CSV tidy
-                row[k] = json.dumps(r.get(k, []))
-            writer.writerow(row)
-    with open(json_path, "w") as f:
-        json.dump(preds, f, indent=2)
+    if len(genotype_map) == 0:
+        # Fallback if checkpoint lacks class names; we try to infer count from the head
+        # But your training script stores genotype_map, so this is unlikely.
+        print("WARNING: 'genotype_map' missing in checkpoint; using numeric class names.")
+        # Try to peek classifier out-features
+        num_classes = None
+        for n, m in model.named_modules():
+            if isinstance(m, torch.nn.Linear) and (num_classes is None or m.out_features < num_classes):
+                num_classes = m.out_features
+        if num_classes is None:
+            num_classes = 2
+        class_names = [str(i) for i in range(num_classes)]
+    else:
+        # Map indices -> names in the correct order
+        class_names = [None] * len(genotype_map)
+        for cname, cidx in genotype_map.items():
+            if 0 <= int(cidx) < len(class_names):
+                class_names[cidx] = str(cname)
+        # fill any None (just in case)
+        for i in range(len(class_names)):
+            if class_names[i] is None:
+                class_names[i] = str(i)
 
-    print_and_log(f"[Save] Wrote {len(preds)} predictions to:", log_file)
-    print_and_log(f"       {csv_path}", log_file)
-    print_and_log(f"       {json_path}", log_file)
-    print_and_log("[Infer] Finished.", log_file)
+    # Gather files
+    files = list_npy_files(os.path.abspath(os.path.expanduser(args.input_dir)))
+    if len(files) == 0:
+        raise SystemExit(f"No .npy files found under: {args.input_dir}")
+
+    # Build dataset/dataloader
+    ds = NpyDirDataset(
+        files=files,
+        channels=in_channels,
+        normalize=args.normalize,
+        tile_single_channel=args.tile_single_channel,
+        mmap=args.mmap,
+    )
+    dl = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        shuffle=False,
+        drop_last=False,
+        collate_fn=lambda batch: (
+            torch.stack([b[0] for b in batch], dim=0),
+            [b[1] for b in batch],
+        ),
+    )
+
+    # Optionally convert model to half
+    if args.fp16 and device.type == "cuda":
+        model = model.half()
+
+    # Run
+    results = run_inference(
+        model=model,
+        dl=dl,
+        device=device,
+        fp16=args.fp16,
+        class_names=class_names
+    )
+
+    # Save
+    csv_path = args.output_csv if args.output_csv.strip() else None
+    json_path = args.output_json if args.output_json.strip() else None
+    write_outputs(results, csv_path=csv_path, json_path=json_path)
+
+    print(f"\nDone. Files scanned: {len(files)}")
+    if csv_path:
+        print(f"CSV:  {os.path.abspath(csv_path)}")
+    if json_path:
+        print(f"JSON: {os.path.abspath(json_path)}")
+
 
 if __name__ == "__main__":
     main()
