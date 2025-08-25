@@ -153,7 +153,7 @@ def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=16, shuff
 
 
 class NpyUnlabeledDataset(Dataset):
-    """Loads 6-channel .npy files from flat dirs. Returns (x, -1, path)."""
+    """Loads 6-channel .npy files (flat or nested dirs). Returns (x, -1, path)."""
     def __init__(self, files, transform=None, return_paths=False):
         self.files = files
         self.transform = transform
@@ -186,9 +186,9 @@ class NpyUnlabeledDataset(Dataset):
 
 def get_inference_data_loader(data_dir, batch_size=32, num_workers=16, shuffle=False, return_paths=True):
     """
-    Flat unlabeled loader: glob all *.npy from the provided dir(s).
-    Returns (loader, {}) — empty class map signals 'unlabeled mode'.
-    Accepts: str, list[str], or (train_roots, val_roots) — uses the second element if a pair.
+    Recursively loads ALL *.npy files under the given dir(s), including subfolders.
+    Accepts: str, list[str], or (train_roots, val/test_roots) — uses the second element if a pair.
+    Returns: (DataLoader, {})  # empty class map => unlabeled
     """
     def _to_list(x):
         if x is None: return []
@@ -202,17 +202,23 @@ def get_inference_data_loader(data_dir, batch_size=32, num_workers=16, shuffle=F
     else:
         roots = _to_list(data_dir)
 
+    # Collect *.npy recursively (dedup + stable order)
     files = []
     for r in roots:
         r = os.path.abspath(os.path.expanduser(r))
         if not os.path.isdir(r):
             raise FileNotFoundError(f"Not a directory: {r}")
-        files.extend(sorted(glob.glob(os.path.join(r, "*.npy"))))
+        found = glob.glob(os.path.join(r, "**", "*.npy"), recursive=True)
+        files.extend(found)
+
+    # De-duplicate while preserving order
+    seen = set()
+    files = [f for f in sorted(files) if not (f in seen or seen.add(f))]
 
     if not files:
-        raise FileNotFoundError(f"No .npy files found in: {roots}")
+        raise FileNotFoundError(f"No .npy files found under: {', '.join(roots)}")
 
-    # same normalization as training
+    # Same normalization as training
     transform = transforms.Compose([
         transforms.Normalize(
             mean=[18.417816162109375, 12.649129867553711, -0.5452527403831482,
@@ -231,7 +237,7 @@ def get_inference_data_loader(data_dir, batch_size=32, num_workers=16, shuffle=F
         pin_memory=True,
         persistent_workers=(num_workers > 0),
     )
-    return loader, {}  # empty map => unlabeled
+    return loader, {}  # unlabeled
 
 
 if __name__ == "__main__":
