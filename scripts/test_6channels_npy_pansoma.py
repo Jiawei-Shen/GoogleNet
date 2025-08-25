@@ -17,7 +17,7 @@ import torch.nn.functional as F
 # Local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from mynet import ConvNeXtCBAMClassifier
-from dataset_pansoma_npy_6ch import get_data_loader  # NEW: uses the revised no-subfolder loader
+from dataset_pansoma_npy_6ch import get_testing_data_loader  # <-- CHANGED
 
 # Globals updated in __main__ when using DDP
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -231,16 +231,16 @@ def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1
 
 def _build_loader_for_test(data_spec, batch_size, num_workers, ddp=False):
     """
-    Build a test DataLoader using the new get_data_loader (no subfolders).
+    Build a test DataLoader using get_testing_data_loader (no subfolders).
     `data_spec` can be:
       • str: a directory of .npy files
       • list[str]: multiple directories (concatenated)
       • (train_roots, val_roots): a 2-tuple; the second element is used for testing
     """
-    # Direct call: dataset_type="test" (the new loader chooses the right roots)
-    loader, genotype_map = get_data_loader(
-        data_dir=data_spec, dataset_type="test", batch_size=batch_size,
-        num_workers=num_workers, shuffle=False, return_paths=True
+    # <-- CHANGED: call get_testing_data_loader directly -->
+    loader, genotype_map = get_testing_data_loader(
+        data_spec, batch_size=batch_size, num_workers=num_workers,
+        shuffle=False, return_paths=True
     )
 
     if ddp:
@@ -306,7 +306,7 @@ def main():
                      "  • Mode A: data_path\n"
                      "  • Mode B: --test_data_paths_file")
 
-    # Build data spec for get_data_loader (no subfolders)
+    # Build data spec (no subfolders)
     if has_base:
         data_spec = os.path.abspath(os.path.expanduser(args.data_path))
     else:
@@ -337,7 +337,7 @@ def main():
         IS_MAIN_PROCESS = True
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Build loader (test) using the new get_data_loader
+    # Build loader (test) using get_testing_data_loader
     test_loader, genotype_map = _build_loader_for_test(
         data_spec, batch_size=args.batch_size, num_workers=args.num_workers, ddp=args.ddp
     )
