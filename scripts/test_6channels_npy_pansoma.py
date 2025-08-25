@@ -3,6 +3,8 @@ import argparse
 import os
 import sys
 import json
+import time
+import math
 from collections import defaultdict
 
 import torch
@@ -17,7 +19,7 @@ import torch.nn.functional as F
 # Local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from mynet import ConvNeXtCBAMClassifier
-from dataset_pansoma_npy_6ch import get_testing_data_loader  # <-- CHANGED
+from dataset_pansoma_npy_6ch import get_testing_data_loader  # uses flat-dir .npy loader
 
 # Globals updated in __main__ when using DDP
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -55,6 +57,13 @@ def _read_paths_file(file_path):
     return paths
 
 
+def _fmt_int(n):
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return str(n)
+
+
 # ---------------- Evaluation ----------------
 @torch.no_grad()
 def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1,
@@ -88,9 +97,15 @@ def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1
 
     # Optional: collect predictions (path, true, pred, prob)
     local_predictions = []
+    total_batches = len(data_loader) if hasattr(data_loader, "__len__") else None
+    log_every = 1
+    if total_batches and total_batches > 0:
+        log_every = max(1, total_batches // 20)  # ~5% increments
+
+    start_time = time.time()
     pbar = tqdm(data_loader, desc="Testing", disable=not IS_MAIN_PROCESS)
 
-    for batch in pbar:
+    for b_idx, batch in enumerate(pbar):
         if len(batch) == 3:
             images, labels, paths = batch
         else:
@@ -138,6 +153,23 @@ def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1
                         "pred_prob": float(conf[i].item())
                     })
 
+        # Periodic progress logs (rank 0)
+        if IS_MAIN_PROCESS and ( (b_idx == 0) or ((b_idx + 1) % log_every == 0) ):
+            seen = total.item()
+            acc_so_far = (correct.item() / max(1, seen)) * 100.0
+            if total_batches:
+                print_and_log(
+                    f"[Eval] Batch {b_idx + 1}/{total_batches} | Seen { _fmt_int(seen) } samples | "
+                    f"Acc-so-far {acc_so_far:.2f}%",
+                    log_file
+                )
+            else:
+                print_and_log(
+                    f"[Eval] Batch {b_idx + 1} | Seen { _fmt_int(seen) } samples | "
+                    f"Acc-so-far {acc_so_far:.2f}%",
+                    log_file
+                )
+
     # DDP reductions
     if ddp and world_size > 1 and dist.is_initialized():
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
@@ -162,6 +194,11 @@ def evaluate(model, data_loader, genotype_map, log_file, ddp=False, world_size=1
                 local_predictions = merged
             else:
                 local_predictions = None
+
+    elapsed = time.time() - start_time
+    if IS_MAIN_PROCESS and elapsed > 0:
+        print_and_log(f"[Eval] Done in {elapsed:.2f}s | ~{_fmt_int(int(total.item() / elapsed))} samples/sec (global, approx.)",
+                      log_file)
 
     # Overall accuracy
     overall_acc = (correct.item() / max(1, total.item())) * 100.0
@@ -237,7 +274,6 @@ def _build_loader_for_test(data_spec, batch_size, num_workers, ddp=False):
       • list[str]: multiple directories (concatenated)
       • (train_roots, val_roots): a 2-tuple; the second element is used for testing
     """
-    # <-- CHANGED: call get_testing_data_loader directly -->
     loader, genotype_map = get_testing_data_loader(
         data_spec, batch_size=batch_size, num_workers=num_workers,
         shuffle=False, return_paths=True
@@ -309,16 +345,32 @@ def main():
     # Build data spec (no subfolders)
     if has_base:
         data_spec = os.path.abspath(os.path.expanduser(args.data_path))
+        roots_for_log = [data_spec]
     else:
-        roots = _read_paths_file(args.test_data_paths_file)
-        if not roots:
+        roots_for_log = _read_paths_file(args.test_data_paths_file)
+        if not roots_for_log:
             parser.error(f"--test_data_paths_file is empty or unreadable: {args.test_data_paths_file}")
-        data_spec = roots
+        data_spec = roots_for_log
 
     os.makedirs(args.output_path, exist_ok=True)
     log_file = os.path.join(args.output_path, "test_log_6ch.txt")
     if os.path.exists(log_file):
         os.remove(log_file)
+
+    # Args summary (rank 0)
+    print_and_log("======== Inference Args ========", log_file)
+    print_and_log(f"Output path: {args.output_path}", log_file)
+    print_and_log(f"Checkpoint : {args.checkpoint}", log_file)
+    print_and_log(f"Batch size : {args.batch_size}", log_file)
+    print_and_log(f"Workers    : {args.num_workers}", log_file)
+    print_and_log(f"DDP        : {args.ddp}", log_file)
+    print_and_log(f"DataParallel: {args.data_parallel}", log_file)
+    if len(roots_for_log) == 1:
+        print_and_log(f"Roots      : {roots_for_log[0]}", log_file)
+    else:
+        show = ", ".join(roots_for_log[:3]) + (" ..." if len(roots_for_log) > 3 else "")
+        print_and_log(f"Roots (n={len(roots_for_log)}): {show}", log_file)
+    print_and_log("================================", log_file)
 
     # DDP init (takes precedence)
     if args.ddp:
@@ -331,21 +383,38 @@ def main():
         dist.init_process_group(backend="nccl", init_method="env://")
         IS_MAIN_PROCESS = (dist.get_rank() == 0)
         if IS_MAIN_PROCESS:
-            print(f"[DDP] World size={dist.get_world_size()} | Local rank={local_rank} | Global rank={dist.get_rank()}")
+            print_and_log(f"[DDP] World size={dist.get_world_size()} | Local rank={local_rank} | Global rank={dist.get_rank()}",
+                          log_file)
     else:
         local_rank = 0
         IS_MAIN_PROCESS = True
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print_and_log(f"[Runtime] Device={device} | CUDA available={torch.cuda.is_available()}", log_file)
 
-    # Build loader (test) using get_testing_data_loader
+    # Build loader (test)
     test_loader, genotype_map = _build_loader_for_test(
         data_spec, batch_size=args.batch_size, num_workers=args.num_workers, ddp=args.ddp
     )
+    try:
+        ds_len = len(test_loader.dataset)
+    except Exception:
+        ds_len = None
+    if IS_MAIN_PROCESS:
+        if ds_len is not None:
+            steps = len(test_loader) if hasattr(test_loader, "__len__") else "?"
+            print_and_log(f"[Data] Test samples: {_fmt_int(ds_len)} | Batches per rank: {steps}", log_file)
+        else:
+            print_and_log(f"[Data] Built test DataLoader.", log_file)
+
     if not genotype_map:
         print_and_log("FATAL: genotype_map is empty from dataloader.", log_file)
         return
     num_classes = len(genotype_map)
     sorted_class_names = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
+    if IS_MAIN_PROCESS:
+        print_and_log(f"[Data] num_classes={num_classes}", log_file)
+        for cname in sorted_class_names:
+            print_and_log(f"  - class '{cname}' -> idx {genotype_map[cname]}", log_file)
 
     # Prepare model
     in_channels = 6
@@ -355,22 +424,31 @@ def main():
     if (not args.ddp) and args.data_parallel and torch.cuda.is_available():
         n = torch.cuda.device_count()
         if n > 1:
-            print_and_log(f"Wrapping model in DataParallel across {n} GPUs.", log_file)
+            print_and_log(f"[Runtime] Wrapping model in DataParallel across {n} GPUs.", log_file)
             model = nn.DataParallel(model)
         else:
-            print_and_log("DataParallel requested but single CUDA device found; running on one GPU.", log_file)
+            print_and_log("[Runtime] DataParallel requested but single CUDA device found; running on one GPU.", log_file)
 
     # Load checkpoint
     if not os.path.isfile(args.checkpoint):
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device)
+    if IS_MAIN_PROCESS:
+        ep = ckpt.get("epoch", None)
+        best_f1 = ckpt.get("best_f1_true", None)
+        print_and_log(f"[Checkpoint] Loaded: {args.checkpoint}", log_file)
+        if ep is not None:
+            print_and_log(f"[Checkpoint] epoch={ep}", log_file)
+        if best_f1 is not None:
+            print_and_log(f"[Checkpoint] best_f1_true={best_f1:.4f}", log_file)
 
     # If saved, prefer in_channels from checkpoint
     if "in_channels" in ckpt:
         in_ckpt = int(ckpt["in_channels"])
         if in_ckpt != in_channels:
-            # Rebuild model with checkpoint's channel count
             model = _ensure_model(args.depths, args.dims, in_channels=in_ckpt).to(device)
+            if IS_MAIN_PROCESS:
+                print_and_log(f"[Model] Rebuilt with in_channels={in_ckpt} (from checkpoint).", log_file)
 
     # Replace classifier head to match num_classes if needed
     class_num_target = num_classes
@@ -384,11 +462,10 @@ def main():
     # Load weights (strict=False to allow class head size mismatch handled by reinit)
     missing, unexpected = fresh_model.load_state_dict(ckpt["model_state_dict"], strict=False)
     if IS_MAIN_PROCESS:
-        print(f"Loaded checkpoint: {args.checkpoint}")
         if missing:
-            print_and_log(f"Missing keys (ok if only classifier head): {missing}", log_file)
+            print_and_log(f"[Model] Missing keys (ok if only classifier head): {missing}", log_file)
         if unexpected:
-            print_and_log(f"Unexpected keys: {unexpected}", log_file)
+            print_and_log(f"[Model] Unexpected keys: {unexpected}", log_file)
 
     model = fresh_model
 
@@ -401,8 +478,12 @@ def main():
             gradient_as_bucket_view=True,
             broadcast_buffers=False,
         )
+        if IS_MAIN_PROCESS:
+            print_and_log("[Runtime] Model wrapped with DistributedDataParallel.", log_file)
 
     # Run evaluation
+    if IS_MAIN_PROCESS:
+        print_and_log("[Eval] Starting evaluation...", log_file)
     world_size = dist.get_world_size() if args.ddp and dist.is_initialized() else 1
     metrics, class_stats, confusion, predictions = evaluate(
         model, test_loader, genotype_map, log_file,
@@ -429,7 +510,7 @@ def main():
             print_and_log(
                 f"  {cname} (idx {s['idx']}): "
                 f"Acc {s['acc']:.2f}% | Prec {s['precision']*100:.2f}% | "
-                f"Rec {s['recall']*100:.2f}% | F1 {s['f1']*100:.2f}% | n={s['support']}",
+                f"Rec {s['recall']*100:.2f}% | F1 {s['f1']*100:.2f}% | n={_fmt_int(s['support'])}",
                 log_file
             )
 
@@ -441,6 +522,7 @@ def main():
         }
         with open(os.path.join(args.output_path, "metrics.json"), "w") as f:
             json.dump(out_metrics, f, indent=2)
+        print_and_log(f"[Save] Wrote metrics.json", log_file)
 
         # Save confusion_matrix.csv
         import csv
@@ -456,7 +538,7 @@ def main():
                     pj = genotype_map[pj_name]
                     row.append(int(confusion[ti, pj]))
                 writer.writerow(row)
-        print_and_log(f"\nSaved metrics.json and confusion_matrix.csv to: {args.output_path}", log_file)
+        print_and_log(f"[Save] Wrote confusion_matrix.csv", log_file)
 
         # Save predictions if requested
         if args.save_predictions and predictions is not None:
@@ -472,7 +554,9 @@ def main():
             pred_json = os.path.join(args.output_path, "predictions.json")
             with open(pred_json, "w") as f:
                 json.dump(predictions, f, indent=2)
-            print_and_log(f"Saved predictions to: {pred_csv} and {pred_json}", log_file)
+            print_and_log(f"[Save] Wrote predictions ({_fmt_int(len(predictions))} rows) to predictions.csv/json", log_file)
+
+        print_and_log("[Eval] Finished. See test_log_6ch.txt for details.", log_file)
 
     # Cleanup DDP
     if args.ddp and dist.is_initialized():
