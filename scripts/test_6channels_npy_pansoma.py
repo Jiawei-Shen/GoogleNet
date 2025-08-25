@@ -18,6 +18,7 @@ import sys
 import json
 import time
 from typing import List, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -32,14 +33,70 @@ from mynet import ConvNeXtCBAMClassifier  # noqa: E402
 
 # ----------------------------- Utilities ------------------------------------- #
 
-def list_npy_files(root: str) -> List[str]:
-    files = []
-    for dp, _, fns in os.walk(root):
-        for fn in fns:
-            if fn.lower().endswith(".npy"):
-                files.append(os.path.join(dp, fn))
+def _scan_tree(start_dir: str) -> List[str]:
+    """Iteratively scan one subtree with os.scandir (fast)."""
+    stack = [start_dir]
+    out: List[str] = []
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        else:
+                            name = e.name
+                            if len(name) >= 4 and name[-4:].lower() == ".npy":
+                                out.append(e.path)
+                    except OSError:
+                        continue
+        except (PermissionError, FileNotFoundError):
+            continue
+    return out
+
+def list_npy_files_parallel(root: str, workers: int, progress_every: int = 500) -> List[str]:
+    """
+    Parallel file discovery using exactly `workers` threads.
+    """
+    root = os.path.abspath(os.path.expanduser(root))
+
+    # Collect top-level dirs + any .npy directly under root
+    top_dirs: List[str] = []
+    files: List[str] = []
+    try:
+        with os.scandir(root) as it:
+            for e in it:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        top_dirs.append(e.path)
+                    else:
+                        name = e.name
+                        if len(name) >= 4 and name[-4:].lower() == ".npy":
+                            files.append(e.path)
+                except OSError:
+                    continue
+    except FileNotFoundError:
+        return []
+
+    if workers <= 1 or not top_dirs:
+        for d in top_dirs:
+            files.extend(_scan_tree(d))
+        files.sort()
+        return files
+
+    scanned = 0
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futures = [ex.submit(_scan_tree, d) for d in top_dirs]
+        for fut in as_completed(futures):
+            files.extend(fut.result())
+            scanned += 1
+            if progress_every and (scanned % progress_every == 0 or scanned == len(top_dirs)):
+                print(f"[scan] {scanned}/{len(top_dirs)} top-level dirs done")
+
     files.sort()
     return files
+
 
 
 def ensure_chw(x: np.ndarray, channels: int, tile_single_channel: bool = False) -> np.ndarray:
@@ -334,7 +391,9 @@ def main():
                 class_names[i] = str(i)
 
     # Gather files
-    files = list_npy_files(os.path.abspath(os.path.expanduser(args.input_dir)))
+    # replace previous file listing
+    files = list_npy_files_parallel(args.input_dir, workers=args.num_workers, progress_every=10000)
+
     if len(files) == 0:
         raise SystemExit(f"No .npy files found under: {args.input_dir}")
 
