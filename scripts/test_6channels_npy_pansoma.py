@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Batch inference over a directory of .npy files (recursively) with single-line flashing progress.
+Batch inference over a directory of .npy files (recursively) with single-line flashing progress,
+using the SAME preprocessing as the validation loader (channel-wise Normalize).
 
 Example:
     python infer_npy_dir.py \
@@ -8,8 +9,7 @@ Example:
       --ckpt /path/to/model_best.pth \
       --output_csv preds.csv \
       --output_json preds.json \
-      --batch_size 128 --num_workers 8 --fp16 --mmap \
-      --print_every_n 1000 --sample_info_k 3
+      --batch_size 128 --num_workers 8 --mmap
 """
 
 import argparse
@@ -29,6 +29,16 @@ from tqdm import tqdm
 THIS_DIR = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(os.path.abspath(os.path.join(THIS_DIR, "..")))
 from mynet import ConvNeXtCBAMClassifier  # noqa: E402
+
+# --- EXACT SAME NORMALIZATION AS VAL ---
+VAL_MEAN = torch.tensor([
+    18.417816162109375, 12.649129867553711, -0.5452527403831482,
+    24.723854064941406, 4.690611362457275, 10.659969329833984
+], dtype=torch.float32)
+VAL_STD = torch.tensor([
+    25.028322219848633, 14.809632301330566, 0.6181337833404541,
+    29.972835540771484, 7.9231791496276855, 27.151996612548828
+], dtype=torch.float32)
 
 
 # ----------------------------- Utilities ------------------------------------- #
@@ -157,7 +167,6 @@ def softmax_np(logits: np.ndarray, axis: int = -1) -> np.ndarray:
 def print_data_info(
     files: List[str],
     in_channels: int,
-    normalize: bool,
     tile_single_channel: bool,
     mmap: bool,
     sample_info_k: int,
@@ -165,7 +174,7 @@ def print_data_info(
     print("\n=== Data Information ===")
     print(f"Total .npy files: {len(files)}")
     print(f"Expected input channels: {in_channels}")
-    print(f"normalize={normalize} | tile_single_channel={tile_single_channel} | mmap={mmap}")
+    print(f"tile_single_channel={tile_single_channel} | mmap={mmap}")
     k = min(sample_info_k, len(files))
     if k == 0:
         print("No files to sample.")
@@ -192,15 +201,20 @@ class NpyDirDataset(Dataset):
         self,
         files: List[str],
         channels: int,
-        normalize: bool = False,
         tile_single_channel: bool = False,
         mmap: bool = False,
     ):
         self.files = files
         self.channels = channels
-        self.normalize = normalize
         self.tile_single_channel = tile_single_channel
         self.mmap = mmap
+
+        if self.channels != 6:
+            raise ValueError(f"inference expects 6 channels to match training/val; got {self.channels}")
+
+        # Precompute mean/std on CPU for CHW broadcasting
+        self.mean = VAL_MEAN.view(-1, 1, 1)  # (6,1,1)
+        self.std = VAL_STD.view(-1, 1, 1)    # (6,1,1)
 
     def __len__(self) -> int:
         return len(self.files)
@@ -209,12 +223,13 @@ class NpyDirDataset(Dataset):
         path = self.files[idx]
         arr = np.load(path, allow_pickle=False, mmap_mode=('r' if self.mmap else None))
 
-        if arr.dtype == np.uint8 and self.normalize:
-            arr = arr.astype(np.float32) / 255.0
-
         chw = ensure_chw(arr, self.channels, tile_single_channel=self.tile_single_channel)
-        tensor = torch.from_numpy(chw)  # float32 CHW
-        return tensor, path
+
+        t = torch.from_numpy(chw).float()  # CHW float32
+        # --- EXACT SAME NORMALIZATION AS VAL ---
+        t = (t - self.mean) / self.std
+
+        return t, path
 
 
 # --------------------------- Model Loading ----------------------------------- #
@@ -267,7 +282,8 @@ def run_inference(
     Single-line flashing progress using one tqdm bar (total = number of files).
     """
     results: List[Dict[str, Any]] = []
-    use_amp = fp16 and device.type == "cuda"
+    # For apples-to-apples with val: keep FP32 unless explicitly requested
+    use_amp = (fp16 and device.type == "cuda")
 
     processed = 0
     t0 = time.time()
@@ -337,7 +353,7 @@ def write_outputs(results: List[Dict[str, Any]], csv_path: str, json_path: str) 
 # ----------------------------- Main ------------------------------------------ #
 
 def main():
-    parser = argparse.ArgumentParser(description="Infer over .npy files (recursively) with ConvNeXtCBAMClassifier")
+    parser = argparse.ArgumentParser(description="Infer over .npy files (recursively) with ConvNeXtCBAMClassifier, matching val preprocessing.")
     parser.add_argument("--input_dir", required=True, type=str, help="Root dir to scan for .npy files")
     parser.add_argument("--ckpt", required=True, type=str, help="Path to checkpoint .pth")
     parser.add_argument("--output_csv", default="predictions.csv", type=str, help="CSV output path (or '' to skip)")
@@ -345,21 +361,12 @@ def main():
     parser.add_argument("--batch_size", default=64, type=int)
     parser.add_argument("--num_workers", default=8, type=int)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device choice")
-    parser.add_argument("--fp16", action="store_true", help="Enable half-precision inference (CUDA only)")
-    parser.add_argument("--normalize", action="store_true",
-                        help="If input dtype is uint8, scale to [0,1] by /255.0")
-    parser.add_argument("--tile_single_channel", action="store_true",
-                        help="If an array is single-channel, tile it to match required channels")
+    parser.add_argument("--fp16", action="store_true", help="Enable half-precision inference (CUDA only). For val parity, leave off.")
+    parser.add_argument("--tile_single_channel", action="store_true", help="If an array is single-channel, tile it to 6 channels")
     parser.add_argument("--mmap", action="store_true", help="Load .npy via mmap_mode='r' (lower RAM peak)")
-    parser.add_argument("--depths", type=int, nargs="+", default=[3, 3, 27, 3],
-                        help="ConvNeXt stage depths used in training (match if you changed it)")
-    parser.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536],
-                        help="ConvNeXt dims used in training (match if you changed it)")
-    # Print config
-    parser.add_argument("--print_every_n", type=int, default=500,  # kept for backwards compat; unused with tqdm bar
-                        help="(Unused in single-line mode) Print a progress line every N files")
-    parser.add_argument("--sample_info_k", type=int, default=3,
-                        help="Print header info (shape/dtype) for the first K files")
+    parser.add_argument("--depths", type=int, nargs="+", default=[3, 3, 27, 3], help="ConvNeXt stage depths used in training")
+    parser.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536], help="ConvNeXt dims used in training")
+    parser.add_argument("--sample_info_k", type=int, default=3, help="Print header info (shape/dtype) for the first K files")
     args = parser.parse_args()
 
     # Resolve device
@@ -383,6 +390,8 @@ def main():
     model, genotype_map, in_channels = build_and_load_model(
         ckpt_path=args.ckpt, device=device, depths=args.depths, dims=args.dims
     )
+    if in_channels != 6:
+        raise ValueError(f"Checkpoint expects in_channels={in_channels}; this script assumes 6-channel normalization.")
 
     # Class names
     if len(genotype_map) == 0:
@@ -406,13 +415,12 @@ def main():
 
     # Gather files (single-line progress)
     files = list_npy_files_parallel(args.input_dir, workers=args.num_workers)
-
     if len(files) == 0:
         raise SystemExit(f"No .npy files found under: {args.input_dir}")
 
     # Startup prints
     print("=== Inference Configuration ===")
-    print(f"Device: {device} | FP16: {bool(args.fp16 and device.type=='cuda')}")
+    print(f"Device: {device} | FP16: {bool(args.fp16 and device.type=='cuda')} (val uses FP32)")
     print(f"Input dir: {os.path.abspath(args.input_dir)}")
     print(f"Found files: {len(files)}")
     print(f"In-channels: {in_channels}")
@@ -424,7 +432,6 @@ def main():
     print_data_info(
         files=files,
         in_channels=in_channels,
-        normalize=args.normalize,
         tile_single_channel=args.tile_single_channel,
         mmap=args.mmap,
         sample_info_k=max(0, args.sample_info_k),
@@ -434,7 +441,6 @@ def main():
     ds = NpyDirDataset(
         files=files,
         channels=in_channels,
-        normalize=args.normalize,
         tile_single_channel=args.tile_single_channel,
         mmap=args.mmap,
     )
@@ -453,6 +459,7 @@ def main():
         ),
     )
 
+    # Keep model in FP32 unless explicitly asked otherwise
     if args.fp16 and device.type == "cuda":
         model = model.half()
 
