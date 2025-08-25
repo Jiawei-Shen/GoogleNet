@@ -311,8 +311,8 @@ def main():
 
     parser.add_argument("-o", "--output_path", default="./test_results_6channel", type=str,
                         help="Directory to save logs/metrics (created if missing).")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=8, help="DataLoader workers")
+    parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
+    parser.add_argument("--num_workers", type=int, default=16, help="DataLoader workers")
 
     # Model arch (should match training); if missing, we trust defaults
     parser.add_argument("--depths", type=int, nargs="+", default=[3, 3, 27, 3],
