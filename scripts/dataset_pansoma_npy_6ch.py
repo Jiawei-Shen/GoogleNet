@@ -1,8 +1,9 @@
 import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
-import os
 import numpy as np
+import os, glob, torch
+
 
 
 class NpyDataset(Dataset):
@@ -151,45 +152,67 @@ def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=16, shuff
     return loader, unified_class_to_idx
 
 
-def get_testing_data_loader(data_dir, batch_size=32, num_workers=16, shuffle: bool = False,
-                            return_paths: bool = False):
+class NpyUnlabeledDataset(Dataset):
+    """Loads 6-channel .npy files from flat dirs. Returns (x, -1, path)."""
+    def __init__(self, files, transform=None, return_paths=False):
+        self.files = files
+        self.transform = transform
+        self.return_paths = return_paths
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        path = self.files[idx]
+        arr = np.load(path)  # add mmap_mode="r" if desired
+        # Ensure channel-first [6,H,W]
+        if arr.ndim != 3:
+            raise RuntimeError(f"{os.path.basename(path)} has {arr.ndim} dims; expected 3")
+        if arr.shape[0] == 6:
+            pass
+        elif arr.shape[-1] == 6:
+            arr = np.transpose(arr, (2, 0, 1))
+        else:
+            raise RuntimeError(f"{os.path.basename(path)} shape {arr.shape}; 6 channels required")
+
+        x = torch.from_numpy(arr).float()
+        if self.transform:
+            x = self.transform(x)
+        y = -1  # unlabeled
+        if self.return_paths:
+            return x, y, path
+        return x, y
+
+
+def get_inference_data_loader(data_dir, batch_size=32, num_workers=16, shuffle=False, return_paths=True):
     """
-    Build a DataLoader for TESTING where each root dir directly contains .npy files.
-    No 'train'/'val'/'test' subfolders are assumed.
-
-    Accepted inputs:
-      • str: a single directory with .npy files
-      • list/tuple[str]: multiple directories (concatenated)
-      • (train_roots, val_roots): 2-tuple; the second element is used for testing
-
-    Returns:
-      (DataLoader, class_to_idx)
+    Flat unlabeled loader: glob all *.npy from the provided dir(s).
+    Returns (loader, {}) — empty class map signals 'unlabeled mode'.
+    Accepts: str, list[str], or (train_roots, val_roots) — uses the second element if a pair.
     """
-
     def _to_list(x):
-        if x is None:
-            return []
-        if isinstance(x, (list, tuple)):
-            return list(x)
+        if x is None: return []
+        if isinstance(x, (list, tuple)): return list(x)
         return [x]
 
-    # Resolve testing roots
-    if (
-        isinstance(data_dir, (list, tuple)) and len(data_dir) == 2
-        and isinstance(data_dir[0], (str, list, tuple))
-        and isinstance(data_dir[1], (str, list, tuple))
-    ):
-        roots = _to_list(data_dir[1])  # use the "val/test" side for testing
+    # Accept str, list[str], or (train, val/test)
+    if (isinstance(data_dir, (list, tuple)) and len(data_dir) == 2
+        and isinstance(data_dir[1], (str, list, tuple))):
+        roots = _to_list(data_dir[1])
     else:
         roots = _to_list(data_dir)
 
-    dataset_dirs = [os.path.abspath(os.path.expanduser(r)) for r in roots]
+    files = []
+    for r in roots:
+        r = os.path.abspath(os.path.expanduser(r))
+        if not os.path.isdir(r):
+            raise FileNotFoundError(f"Not a directory: {r}")
+        files.extend(sorted(glob.glob(os.path.join(r, "*.npy"))))
 
-    missing = [p for p in dataset_dirs if not os.path.isdir(p)]
-    if missing:
-        raise FileNotFoundError(f"Dataset directory(ies) do not exist: {missing}")
+    if not files:
+        raise FileNotFoundError(f"No .npy files found in: {roots}")
 
-    # 6-channel normalization (same as your training)
+    # same normalization as training
     transform = transforms.Compose([
         transforms.Normalize(
             mean=[18.417816162109375, 12.649129867553711, -0.5452527403831482,
@@ -199,32 +222,16 @@ def get_testing_data_loader(data_dir, batch_size=32, num_workers=16, shuffle: bo
         )
     ])
 
-    # Build datasets and ensure consistent mapping
-    datasets = []
-    unified_class_to_idx = None
-    for d in dataset_dirs:
-        ds = NpyDataset(root_dir=d, transform=transform, return_paths=return_paths)
-        if unified_class_to_idx is None:
-            unified_class_to_idx = ds.class_to_idx
-        else:
-            if ds.class_to_idx != unified_class_to_idx:
-                raise ValueError(
-                    f"class_to_idx mismatch across roots. "
-                    f"First: {unified_class_to_idx} vs {ds.class_to_idx} in {d}"
-                )
-        datasets.append(ds)
-
-    dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
-
+    ds = NpyUnlabeledDataset(files, transform=transform, return_paths=return_paths)
     loader = DataLoader(
-        dataset,
+        ds,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=(num_workers > 0),
     )
-    return loader, unified_class_to_idx
+    return loader, {}  # empty map => unlabeled
 
 
 if __name__ == "__main__":
