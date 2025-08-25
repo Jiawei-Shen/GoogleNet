@@ -9,9 +9,9 @@ from tqdm import tqdm
 from collections import defaultdict
 import torch.nn.functional as F
 from torch.utils.data import Subset, DataLoader
-from torch.utils.data.distributed import DistributedSampler  # NEW
-import torch.distributed as dist                             # NEW
-from torch.nn.parallel import DistributedDataParallel        # NEW
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 import json
 
 # --- MODIFIED: Import new schedulers ---
@@ -27,9 +27,6 @@ IS_MAIN_PROCESS = True  # rank-0 logging only when DDP is enabled
 
 
 class MultiClassFocalLoss(nn.Module):
-    """
-    Focal Loss for multi-class classification.
-    """
     def __init__(self, gamma=2.0, weight=None, reduction='mean'):
         super(MultiClassFocalLoss, self).__init__()
         self.gamma = gamma
@@ -77,7 +74,6 @@ def init_weights(m):
 
 
 def print_and_log(message, log_path):
-    # Only rank 0 logs in DDP
     if not IS_MAIN_PROCESS:
         return
     print(message)
@@ -86,16 +82,27 @@ def print_and_log(message, log_path):
 
 
 def _state_dict(m):
-    # Works for nn.DataParallel and DDP, or plain nn.Module
     return m.module.state_dict() if hasattr(m, "module") else m.state_dict()
 
 
 def _load_state_dict(m, state):
-    # Load into model whether wrapped or not
     if hasattr(m, "module"):
         m.module.load_state_dict(state)
     else:
         m.load_state_dict(state)
+
+
+def _unique_path(path: str) -> str:
+    """Return a path that does not exist by appending _v{n} if needed."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    n = 2
+    cand = f"{base}_v{n}{ext}"
+    while os.path.exists(cand):
+        n += 1
+        cand = f"{base}_v{n}{ext}"
+    return cand
 
 
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
@@ -108,7 +115,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     if os.path.exists(log_file) and IS_MAIN_PROCESS:
         os.remove(log_file)
 
-    MIN_SAVE_EPOCH = 5  # save first checkpoint after 5 epochs
+    MIN_SAVE_EPOCH = 5  # first checkpoint after 5 epochs
 
     if not (0 < training_data_ratio <= 1.0):
         raise ValueError(f"--training_data_ratio must be in (0,1], got {training_data_ratio}")
@@ -117,11 +124,11 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
     print_and_log(f"Using Cosine Annealing scheduler with a {warmup_epochs}-epoch linear warmup.", log_file)
     print_and_log(
-        f"Checkpointing: snapshot at epoch {MIN_SAVE_EPOCH}, then save only when validation F1(true) improves.",
+        f"Checkpointing: snapshot at epoch {MIN_SAVE_EPOCH}, then save a NEW file whenever validation F1(true) improves.",
         log_file)
     print_and_log(f"Using {num_workers} workers for data loading.", log_file)
     if save_val_results:
-        print_and_log("Will save validation results when a new best is found.", log_file)
+        print_and_log("Will save validation results JSON alongside each new best.", log_file)
 
     # Build loaders (train)
     train_loader, genotype_map = get_data_loader(
@@ -181,7 +188,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            gradient_as_bucket_view=True,  # keep grads contiguous for perf
+            gradient_as_bucket_view=True,
             broadcast_buffers=False,
         )
 
@@ -228,6 +235,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     best_val_loss = float("inf")
     best_prec_true = 0.0
     best_rec_true = 0.0
+    last_best_ckpt_path = None
 
     if resume is not None and os.path.isfile(resume):
         try:
@@ -237,9 +245,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if 'scheduler_state_dict' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            # epoch in checkpoints was saved as the last finished epoch (1-based)
             start_epoch = int(checkpoint.get('epoch', 0))
-            # restore best tracking if present
             best_f1_true = float(checkpoint.get('best_f1_true', best_f1_true))
             best_rec_true = float(checkpoint.get('best_rec_true', best_rec_true))
             best_val_acc = float(checkpoint.get('best_val_acc', best_val_acc))
@@ -253,7 +259,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     for epoch in range(start_epoch, num_epochs):
         model.train()
 
-        # Ensure different shuffles each epoch with DDP
         if ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -266,7 +271,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             train_loader,
             desc=f"Epoch {epoch + 1}/{num_epochs} LR: {current_lr:.1e}",
             leave=True,
-            disable=not IS_MAIN_PROCESS  # tqdm only on rank 0
+            disable=not IS_MAIN_PROCESS
         )
 
         batch_count = 0
@@ -324,15 +329,15 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         epoch_train_acc = (correct_train / total_train) * 100 if total_train > 0 else 0.0
 
         world_size = dist.get_world_size() if ddp and dist.is_initialized() else 1
-        val_loss, val_acc, class_performance_stats_val, val_inference_results, val_metrics = evaluate_model(
+        val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = evaluate_model(
             model, val_loader, criterion, genotype_map, log_file, loss_type, current_lr,
             ddp=ddp, world_size=world_size
         )
 
-        if IS_MAIN_PROCESS and class_performance_stats_val:
+        if IS_MAIN_PROCESS and class_stats_val:
             print_and_log("\nClass-wise Validation Accuracy:", log_file)
             for class_name in sorted_class_names_from_map:
-                stats = class_performance_stats_val.get(class_name, {})
+                stats = class_stats_val.get(class_name, {})
                 print_and_log(
                     f"  {class_name} (Index {stats.get('idx', 'N/A')}): {stats.get('acc', 0):.2f}% "
                     f"({stats.get('correct', 0)}/{stats.get('total', 0)})",
@@ -350,16 +355,15 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}% | "
             f"Prec(true): {val_prec_true * 100:.2f}%, "
             f"Rec(true): {val_rec_true * 100:.2f}%, "
-            f"F1(true): {val_f1_true * 100:.2f}% "
-            f"(LR: {current_lr:.1e}"
-            + (f", pos_idx={pos_idx}" if pos_idx is not None else "")
-            + ")"
+            f"F1(true): {val_f1_true:.4f} "
+            f"(LR: {current_lr:.1e}" + (f", pos_idx={pos_idx}" if pos_idx is not None else "") + ")"
         )
         print_and_log(summary_msg, log_file)
 
         # Snapshot at epoch 5 (rank 0 only)
         if (epoch + 1) == MIN_SAVE_EPOCH and IS_MAIN_PROCESS:
             snap_path = os.path.join(output_path, f"model_epoch_{MIN_SAVE_EPOCH}.pth")
+            snap_path = _unique_path(snap_path)
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': _state_dict(model),
@@ -375,59 +379,70 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                    (val_f1_true == best_f1_true and val_rec_true > best_rec_true) or \
                    (val_f1_true == best_f1_true and val_rec_true == best_rec_true and val_loss < best_val_loss)
 
-        if (epoch + 1) >= MIN_SAVE_EPOCH and improved:
+        if (epoch + 1) >= MIN_SAVE_EPOCH and improved and IS_MAIN_PROCESS:
             best_f1_true = val_f1_true
             best_rec_true = val_rec_true
             best_val_acc = val_acc
             best_val_loss = val_loss
             best_epoch = epoch + 1
 
-            if IS_MAIN_PROCESS:
-                best_path = os.path.join(output_path, "model_best.pth")
-                torch.save({
-                    'epoch': best_epoch,
-                    'model_state_dict': _state_dict(model),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'genotype_map': genotype_map,
-                    'in_channels': 6,
-                    'best_f1_true': best_f1_true,
-                    'best_rec_true': best_rec_true,
-                    'best_val_acc': best_val_acc,
-                    'best_val_loss': best_val_loss,
-                }, best_path)
-                print_and_log(
-                    f"\nNew BEST at epoch {best_epoch}: "
-                    f"F1(true) {best_f1_true*100:.2f}% | Rec(true) {best_rec_true*100:.2f}% | "
-                    f"Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
-                    f"Saved: {best_path}", log_file)
+            # --- NEW: filename encodes epoch and F1; never overwrite previous bests ---
+            ckpt_name = f"model_e{best_epoch:03d}_f1_{best_f1_true:.4f}.pth"
+            best_path = os.path.join(output_path, ckpt_name)
+            best_path = _unique_path(best_path)
 
-                if save_val_results:
-                    result_path = os.path.join(output_path, "validation_results_best.json")
-                    try:
-                        with open(result_path, 'w') as f:
-                            json.dump({
-                                'epoch': best_epoch,
-                                'f1_true': best_f1_true,
-                                'recall_true': best_rec_true,
-                                'val_acc': best_val_acc,
-                                'val_loss': best_val_loss,
-                                'inference_results': val_inference_results
-                            }, f, indent=4)
-                        print_and_log(f"Saved best validation results to {result_path}", log_file)
-                    except Exception as e:
-                        print_and_log(f"Error saving best validation results: {e}", log_file)
+            payload = {
+                'epoch': best_epoch,
+                'model_state_dict': _state_dict(model),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'genotype_map': genotype_map,
+                'in_channels': 6,
+                'best_f1_true': best_f1_true,
+                'best_rec_true': best_rec_true,
+                'best_val_acc': best_val_acc,
+                'best_val_loss': best_val_loss,
+            }
+            torch.save(payload, best_path)
+            last_best_ckpt_path = best_path
+
+            print_and_log(
+                f"\nNew BEST at epoch {best_epoch}: "
+                f"F1(true) {best_f1_true:.4f} | Rec(true) {best_rec_true*100:.2f}% | "
+                f"Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
+                f"Saved: {best_path}", log_file)
+
+            if save_val_results:
+                result_name = f"validation_results_e{best_epoch:03d}_f1_{best_f1_true:.4f}.json"
+                result_path = os.path.join(output_path, result_name)
+                result_path = _unique_path(result_path)
+                try:
+                    with open(result_path, 'w') as f:
+                        json.dump({
+                            'epoch': best_epoch,
+                            'f1_true': best_f1_true,
+                            'recall_true': best_rec_true,
+                            'val_acc': best_val_acc,
+                            'val_loss': best_val_loss,
+                            'inference_results': val_infer_lists
+                        }, f, indent=4)
+                    print_and_log(f"Saved best validation results to {result_path}", log_file)
+                except Exception as e:
+                    print_and_log(f"Error saving best validation results: {e}", log_file)
 
         scheduler.step()
         print_and_log("-" * 30, log_file)
 
-    print_and_log(
+    final_msg = (
         f"Training complete. Best epoch: {best_epoch} "
-        f"| F1(true) {best_f1_true*100:.2f}% | Rec(true) {best_rec_true*100:.2f}% "
+        f"| F1(true) {best_f1_true:.4f} | Rec(true) {best_rec_true*100:.2f}% "
         f"| Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
-        f"Best model: {os.path.join(output_path, 'model_best.pth')}",
-        log_file
     )
+    if last_best_ckpt_path:
+        final_msg += f"Best model: {last_best_ckpt_path}"
+    else:
+        final_msg += "No best checkpoint saved."
+    print_and_log(final_msg, log_file)
 
 
 def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_type, current_lr,
@@ -460,7 +475,6 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
 
     with torch.no_grad():
         for batch in data_loader:
-            # Support both (images, labels) and (images, labels, paths)
             if len(batch) == 3:
                 images, labels, paths = batch
             else:
@@ -472,17 +486,14 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
 
-            # Loss
             loss = criterion(outputs, labels, current_lr) if loss_type == "combined" else criterion(outputs, labels)
             loss_sum += loss.detach()
             batch_count_eval += 1
 
-            # Predictions
             _, predicted = torch.max(outputs, 1)
             correct_eval += (predicted == labels).sum()
             total_eval += labels.size(0)
 
-            # Per-class counters
             for i in range(labels.size(0)):
                 pred_idx = int(predicted[i])
                 true_idx = int(labels[i])
@@ -500,7 +511,6 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
                     predicted_class_name = idx_to_class.get(pred_idx, str(pred_idx))
                     inference_results[predicted_class_name].append(os.path.basename(paths[i]))
 
-    # --- DDP: reduce sums across all processes ---
     if ddp and world_size > 1 and dist.is_initialized():
         dist.all_reduce(correct_eval, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_eval,   op=dist.ReduceOp.SUM)
@@ -513,12 +523,10 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
             dist.all_reduce(class_correct_counts, op=dist.ReduceOp.SUM)
             dist.all_reduce(class_total_counts,   op=dist.ReduceOp.SUM)
 
-    # Global averages
     denom_batches = max(1, batch_count_eval * (world_size if (ddp and world_size > 1) else 1))
     avg_loss_eval = (loss_sum.item() / denom_batches)
     overall_accuracy_eval = (correct_eval.item() / max(1, total_eval.item())) * 100.0
 
-    # Class-wise stats
     class_performance_stats = {}
     if genotype_map:
         for class_name, class_idx in genotype_map.items():
@@ -529,11 +537,7 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
                 'acc': acc_c, 'correct': correct_c, 'total': total_c, 'idx': class_idx
             }
 
-    # ---- NEW: precision / recall / F1 for the positive ("true") class only ----
-    # Choose pos_idx:
-    # 1) prefer class named "true" (case-insensitive)
-    # 2) else pick index 1 if present
-    # 3) else choose minority (smallest support)
+    # Positive ("true") class F1
     pos_idx = None
     if genotype_map:
         for name, idx in genotype_map.items():
@@ -667,9 +671,7 @@ if __name__ == "__main__":
                      "  • Mode A: data_path\n"
                      "  • Mode B: --train_data_paths_file and --val_data_paths_file")
 
-    # Build the argument passed into train_model:
-    #  - Mode A: a single string root (backward compatible)
-    #  - Mode B: a pair (train_roots, val_roots) for the revised get_data_loader
+    # Build the argument passed into train_model
     if has_base:
         data_path_or_pair = os.path.abspath(os.path.expanduser(args.data_path))
     else:
@@ -679,8 +681,6 @@ if __name__ == "__main__":
             parser.error(f"--train_data_paths_file is empty or unreadable: {args.train_data_paths_file}")
         if not val_roots:
             parser.error(f"--val_data_paths_file is empty or unreadable: {args.val_data_paths_file}")
-        # Pair: get_data_loader(dataset_type="train"/"val") will pick the right side and
-        # include BOTH 'train' and 'val' subfolders from each root (per your revised dataloader)
         data_path_or_pair = (train_roots, val_roots)
 
     # --- DDP init (takes precedence over DataParallel) ---
@@ -715,6 +715,5 @@ if __name__ == "__main__":
         resume=args.resume,
     )
 
-    # Clean up DDP
     if args.ddp and dist.is_initialized():
         dist.destroy_process_group()
