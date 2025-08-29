@@ -570,10 +570,6 @@ def main():
         prefetch_factor=(8 if args.num_workers > 0 else None),
         shuffle=False,
         drop_last=False,
-        collate_fn=lambda batch: (
-            torch.stack([b[0] for b in batch], dim=0),
-            [b[1] for b in batch],
-        ),
         multiprocessing_context=("forkserver" if args.num_workers > 0 else None),
     )
 
