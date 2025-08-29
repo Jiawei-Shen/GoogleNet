@@ -1,569 +1,258 @@
 #!/usr/bin/env python3
+"""
+Validation over a large, SCATTERED directory tree of .npy tiles (thousands of subfolders).
+
+Highlights
+---------
+• Recursively discovers files from one or many ROOTS (fast os.scandir).
+• Flexible label sourcing:
+   - --label_mode parent    → label = immediate parent folder name
+   - --label_mode regex     → label extracted by --label_regex with a named group (?P<label>...)
+   - --label_mode csv       → read a CSV with columns: path,label (relative or absolute)
+• Stable class mapping: optional --class_map_json to lock name→index mapping; otherwise inferred.
+• 6‑channel normalization values (from your earlier setup) applied on GPU for speed.
+• Works on single GPU/CPU. Supports FP16 (inference) if CUDA available.
+• Outputs summary metrics + optional per-class prediction lists JSON + optional predictions CSV.
+
+Example (labels by parent folder):
+  python validate_scattered_npy.py \
+    --roots /data/big_tree \
+    --label_mode parent \
+    --ckpt /path/to/model_best.pth \
+    --batch_size 256 --num_workers 16 --mmap --fp16
+
+Example (labels by regex over full path):
+  python validate_scattered_npy.py \
+    --roots /data/a /data/b \
+    --label_mode regex --label_regex ".*/(?P<label>true|false)/.*" \
+    --ckpt /path/to/model_best.pth
+
+Example (labels from CSV):
+  python validate_scattered_npy.py \
+    --roots /data/big_tree \
+    --label_mode csv --labels_csv /data/labels.csv \
+    --ckpt /path/to/model_best.pth
+"""
+
 import argparse
-import torch
-import torch.optim as optim
-import torch.nn as nn
-import sys
 import os
-from tqdm import tqdm
-from collections import defaultdict
-import torch.nn.functional as F
-from torch.utils.data import Subset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
+import re
+import csv
 import json
+import time
+from typing import List, Tuple, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- MODIFIED: Import new schedulers ---
-from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from mynet import ConvNeXtCBAMClassifier
-from dataset_pansoma_npy_6ch import get_data_loader
+# ---- Your model import (same as training) ----
+THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+import sys
+sys.path.append(os.path.abspath(os.path.join(THIS_DIR, "..")))
+from mynet import ConvNeXtCBAMClassifier  # noqa: E402
 
-# Globals updated in __main__ when using DDP
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-IS_MAIN_PROCESS = True  # rank-0 logging only when DDP is enabled
+# --- 6-channel normalization (Testing set numbers from your message) ---
+VAL_MEAN = torch.tensor([
+    18.417816162109375, 12.649129867553711, -0.5452527403831482,
+    24.723854064941406, 4.690611362457275, 0.2813551473402196
+], dtype=torch.float32)
+VAL_STD = torch.tensor([
+    25.028322219848633, 14.809632301330566, 0.6181337833404541,
+    29.972835540771484, 7.9231791496276855, 0.7659083659074717
+], dtype=torch.float32)
 
+# --------------------- Fast recursive file discovery --------------------- #
 
-class MultiClassFocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, weight=None, reduction='mean'):
-        super(MultiClassFocalLoss, self).__init__()
-        self.gamma = gamma
-        self.weight = weight
-        self.reduction = reduction
-
-    def forward(self, logits, targets):
-        log_probs = F.log_softmax(logits, dim=1)
-        log_pt = log_probs.gather(1, targets.view(-1, 1)).squeeze(1)
-        pt = torch.exp(log_pt)
-
-        if self.weight is not None:
-            at = self.weight.gather(0, targets)
-            log_pt = log_pt * at
-
-        focal_loss = -1 * (1 - pt)**self.gamma * log_pt
-
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        return focal_loss
-
-
-class CombinedFocalWeightedCELoss(nn.Module):
-    def __init__(self, initial_lr, pos_weight=None, gamma=2.0):
-        super().__init__()
-        self.initial_lr = initial_lr
-        self.focal_loss = MultiClassFocalLoss(gamma=gamma, weight=pos_weight)
-        self.wce_loss = nn.CrossEntropyLoss(weight=pos_weight)
-
-    def forward(self, logits, targets, current_lr):
-        focal_weight = 1.0 - (current_lr / self.initial_lr)
-        wce_weight = 1.0 - focal_weight
-        loss_focal = self.focal_loss(logits, targets)
-        loss_wce = self.wce_loss(logits, targets)
-        return focal_weight * loss_focal + wce_weight * loss_wce
+def _scan_tree(start_dir: str, ext: str) -> List[str]:
+    stack = [start_dir]
+    out: List[str] = []
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        else:
+                            if e.name.lower().endswith(ext):
+                                out.append(e.path)
+                    except OSError:
+                        continue
+        except (PermissionError, FileNotFoundError):
+            continue
+    return out
 
 
-def init_weights(m):
-    if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
-        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
+def list_files_parallel(roots: List[str], ext: str, workers: int) -> List[str]:
+    roots = [os.path.abspath(os.path.expanduser(r)) for r in roots]
+    files: List[str] = []
+    if workers <= 1 or len(roots) <= 1:
+        for r in roots:
+            files.extend(_scan_tree(r, ext))
+        files.sort()
+        return files
+
+    start = time.time()
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex, \
+         tqdm(total=len(roots), desc="Scan", unit="root", leave=False, dynamic_ncols=True) as bar:
+        futs = [ex.submit(_scan_tree, r, ext) for r in roots]
+        for fut in as_completed(futs):
+            files.extend(fut.result())
+            done = bar.n + 1
+            elapsed = time.time() - start
+            speed = done / max(1e-9, elapsed)
+            remain = (len(roots) - done) / max(1e-9, speed)
+            bar.set_postfix_str(f"speed={speed:.1f} root/s ETA={int(remain)}s")
+            bar.update(1)
+    files.sort()
+    return files
+
+# --------------------- Label extraction strategies ---------------------- #
+
+def labels_from_parent(files: List[str]) -> Tuple[List[str], List[str]]:
+    labels = [os.path.basename(os.path.dirname(p)) for p in files]
+    return files, labels
 
 
-def print_and_log(message, log_path):
-    if not IS_MAIN_PROCESS:
-        return
-    print(message)
-    with open(log_path, 'a', encoding='utf-8') as f:
-        f.write(message + '\n')
+def labels_from_regex(files: List[str], pattern: str) -> Tuple[List[str], List[str]]:
+    rx = re.compile(pattern)
+    labels: List[str] = []
+    for p in files:
+        m = rx.match(p)
+        if not m or ("label" not in m.groupdict()):
+            raise ValueError(f"Regex did not capture a 'label' group for path: {p}")
+        labels.append(str(m.group("label")))
+    return files, labels
 
 
-def _state_dict(m):
-    return m.module.state_dict() if hasattr(m, "module") else m.state_dict()
+def labels_from_csv(csv_path: str, roots: List[str]) -> Tuple[List[str], List[str]]:
+    # Accept absolute or relative paths; if relative, resolve against the first root.
+    base = os.path.abspath(os.path.expanduser(roots[0])) if roots else os.getcwd()
+    files: List[str] = []
+    labels: List[str] = []
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        rdr = csv.DictReader(f)
+        if not {"path", "label"}.issubset(set(rdr.fieldnames or [])):
+            raise ValueError("CSV must have columns: path,label")
+        for row in rdr:
+            rp = row["path"].strip()
+            ap = os.path.abspath(os.path.join(base, rp)) if not os.path.isabs(rp) else rp
+            files.append(ap)
+            labels.append(str(row["label"]).strip())
+    return files, labels
 
+# ---------------------------- Dataset ---------------------------------- #
 
-def _load_state_dict(m, state):
-    if hasattr(m, "module"):
-        m.module.load_state_dict(state)
+def ensure_chw(x: np.ndarray, channels: int, tile_single_channel: bool) -> np.ndarray:
+    if x.ndim == 3:
+        if x.shape[0] == channels:
+            chw = x
+        elif x.shape[-1] == channels:
+            chw = np.transpose(x, (2, 0, 1))
+        elif x.shape[0] == 1 and tile_single_channel and channels > 1:
+            chw = np.tile(x, (channels, 1, 1))
+        elif x.shape[-1] == 1 and tile_single_channel and channels > 1:
+            chw = np.transpose(x, (2, 0, 1))
+            chw = np.tile(chw, (channels, 1, 1))
+        else:
+            raise ValueError(f"Cannot infer channel axis for shape {x.shape} with channels={channels}")
+    elif x.ndim == 2:
+        if tile_single_channel and channels > 1:
+            chw = np.tile(x[None, ...], (channels, 1, 1))
+        else:
+            if channels != 1:
+                raise ValueError(f"Input is 2D but channels={channels}. Use --tile_single_channel to tile.")
+            chw = x[None, ...]
     else:
-        m.load_state_dict(state)
+        raise ValueError(f"Unsupported tensor ndim={x.ndim}, shape={x.shape}")
+
+    if chw.dtype != np.float32:
+        chw = chw.astype(np.float32, copy=False)
+    if not chw.flags['C_CONTIGUOUS']:
+        chw = np.ascontiguousarray(chw)
+    return chw
 
 
-def _unique_path(path: str) -> str:
-    """Return a path that does not exist by appending _v{n} if needed."""
-    if not os.path.exists(path):
-        return path
-    base, ext = os.path.splitext(path)
-    n = 2
-    cand = f"{base}_v{n}{ext}"
-    while os.path.exists(cand):
-        n += 1
-        cand = f"{base}_v{n}{ext}"
-    return cand
+class ScatteredNpyDataset(Dataset):
+    def __init__(self,
+                 files: List[str],
+                 labels: List[str],
+                 class_to_idx: Dict[str, int],
+                 channels: int = 6,
+                 tile_single_channel: bool = False,
+                 mmap: bool = True):
+        assert len(files) == len(labels), "files and labels must align"
+        self.files = files
+        self.labels = labels
+        self.class_to_idx = class_to_idx
+        self.channels = channels
+        self.tile_single_channel = tile_single_channel
+        self.mmap = mmap
+        if self.channels != 6:
+            raise ValueError(f"This script expects 6 channels; got {self.channels}")
 
+    def __len__(self) -> int:
+        return len(self.files)
 
-def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
-                batch_size=32, num_workers=4, loss_type='weighted_ce',
-                warmup_epochs=10, weight_decay=0.05, depths=None, dims=None,
-                training_data_ratio=1.0, ddp=False, data_parallel=False, local_rank=0,
-                resume=None):
-    os.makedirs(output_path, exist_ok=True)
-    log_file = os.path.join(output_path, "training_log_6ch.txt")
-    if os.path.exists(log_file) and IS_MAIN_PROCESS:
-        os.remove(log_file)
+    def __getitem__(self, idx: int):
+        path = self.files[idx]
+        y_name = self.labels[idx]
+        y = self.class_to_idx[y_name]
+        arr = np.load(path, allow_pickle=False, mmap_mode=('r' if self.mmap else None))
+        chw = ensure_chw(arr, self.channels, tile_single_channel=self.tile_single_channel)
+        t = torch.from_numpy(chw).float()  # CHW, float32 (no CPU normalization)
+        return t, torch.tensor(y, dtype=torch.long), path
 
-    MIN_SAVE_EPOCH = 5  # first checkpoint after 5 epochs
+# --------------------------- Model loading ------------------------------ #
 
-    if not (0 < training_data_ratio <= 1.0):
-        raise ValueError(f"--training_data_ratio must be in (0,1], got {training_data_ratio}")
+def load_model(ckpt_path: str, device: torch.device, in_channels: int, depths: List[int], dims: List[int], num_classes: int) -> torch.nn.Module:
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    # Try to honor saved in_channels / genotype_map if present
+    ckpt_in_ch = int(checkpoint.get('in_channels', in_channels))
+    if ckpt_in_ch != in_channels:
+        raise ValueError(f"Checkpoint was trained with in_channels={ckpt_in_ch}, but script is set to {in_channels}")
 
-    print_and_log(f"Using device: {device}", log_file)
-    print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
-    print_and_log(f"Using Cosine Annealing scheduler with a {warmup_epochs}-epoch linear warmup.", log_file)
-    print_and_log(
-        f"Checkpointing: snapshot at epoch {MIN_SAVE_EPOCH}, then save a NEW file whenever validation F1(true) improves.",
-        log_file)
-    print_and_log(f"Using {num_workers} workers for data loading.", log_file)
-    if save_val_results:
-        print_and_log("Will save validation results JSON alongside each new best.", log_file)
+    ckpt_map = checkpoint.get('genotype_map', None)
+    if ckpt_map is not None:
+        num_classes = max(int(v) for v in ckpt_map.values()) + 1
 
-    # Build loaders (train)
-    train_loader, genotype_map = get_data_loader(
-        data_dir=data_path, dataset_type="train", batch_size=batch_size,
-        num_workers=num_workers, shuffle=True
-    )
-
-    # Randomly subsample training data if requested
-    if training_data_ratio < 1.0:
-        full_ds = train_loader.dataset
-        n = len(full_ds)
-        k = max(1, int(round(n * training_data_ratio)))
-        idx = torch.randperm(n, device=device)[:k].cpu().tolist()
-        subset = Subset(full_ds, idx)
-        train_loader = DataLoader(subset, batch_size=batch_size, shuffle=True,
-                                  num_workers=num_workers, pin_memory=True)
-        print_and_log(f"Training subset: using {k}/{n} samples (~{training_data_ratio:.2f} of data).", log_file)
-
-    # Build loader (val)
-    try:
-        val_loader, _ = get_data_loader(
-            data_dir=data_path, dataset_type="val", batch_size=batch_size,
-            num_workers=num_workers, shuffle=False, return_paths=True
-        )
-    except Exception as e:
-        print_and_log(f"\nFATAL: Could not create validation data loader with 'return_paths=True'.", log_file)
-        print_and_log("Please ensure your 'dataset_pansoma_npy_6ch.py' can handle this flag.", log_file)
-        print_and_log(f"Error details: {e}", log_file)
-        return
-
-    if not genotype_map:
-        print_and_log("Error: genotype_map is empty. Check dataloader.", log_file)
-        return
-    num_classes = len(genotype_map)
-    if num_classes == 0:
-        print_and_log("Error: Number of classes is 0. Check dataloader.", log_file)
-        return
-    print_and_log(f"Number of classes: {num_classes}", log_file)
-    sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
-
-    model = ConvNeXtCBAMClassifier(in_channels=6, class_num=num_classes,
+    model = ConvNeXtCBAMClassifier(in_channels=in_channels, class_num=num_classes,
                                    depths=depths, dims=dims).to(device)
 
-    # Optional DataParallel (single-process, multi-GPU), ignored when DDP
-    if (not ddp) and data_parallel and torch.cuda.is_available():
-        n = torch.cuda.device_count()
-        if n > 1:
-            print_and_log(f"Wrapping model in DataParallel across {n} GPUs.", log_file)
-            model = nn.DataParallel(model)
-        else:
-            print_and_log("DataParallel requested but only one CUDA device found; running on a single GPU.", log_file)
-
-    # DDP (multi-process) takes precedence if requested
-    if ddp:
-        print_and_log(f"Wrapping model in DistributedDataParallel on cuda:{local_rank}.", log_file)
-        model = DistributedDataParallel(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            gradient_as_bucket_view=True,
-            broadcast_buffers=False,
-        )
-
-        # Attach DistributedSampler to train/val datasets
-        train_dataset = train_loader.dataset
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=num_workers,
-                                  pin_memory=True, sampler=train_sampler)
-
-        val_dataset = val_loader.dataset
-        val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=num_workers,
-                                pin_memory=True, sampler=val_sampler)
-    else:
-        train_sampler = None  # for uniform API below
-
-    model.apply(init_weights)
-    false_count = 48736
-    true_count = 268
-    pos_weight_value = min(88.0, false_count / true_count)
-    class_weights = torch.tensor([1.0, pos_weight_value], device=device)
-
-    if loss_type == "combined":
-        criterion = CombinedFocalWeightedCELoss(initial_lr=learning_rate, pos_weight=class_weights)
-        print_and_log(f"Using Combined Focal Loss and Weighted CE Loss.", log_file)
-    elif loss_type == "weighted_ce":
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-        print_and_log(f"Using Weighted CE Loss.", log_file)
-    else:
-        raise ValueError(f"Unsupported loss_type: {loss_type}")
-
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    print_and_log(f"Using AdamW optimizer with weight decay: {weight_decay}", log_file)
-
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
-    main_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=0)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
-
-    # ---- Resume support ----
-    start_epoch = 0
-    best_epoch = 0
-    best_f1_true = float("-inf")
-    best_val_acc = float("-inf")
-    best_val_loss = float("inf")
-    best_prec_true = 0.0
-    best_rec_true = 0.0
-    last_best_ckpt_path = None
-
-    if resume is not None and os.path.isfile(resume):
-        try:
-            checkpoint = torch.load(resume, map_location=device)
-            _load_state_dict(model, checkpoint['model_state_dict'])
-            if 'optimizer_state_dict' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if 'scheduler_state_dict' in checkpoint:
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            start_epoch = int(checkpoint.get('epoch', 0))
-            best_f1_true = float(checkpoint.get('best_f1_true', best_f1_true))
-            best_rec_true = float(checkpoint.get('best_rec_true', best_rec_true))
-            best_val_acc = float(checkpoint.get('best_val_acc', best_val_acc))
-            best_val_loss = float(checkpoint.get('best_val_loss', best_val_loss))
-            best_epoch = int(checkpoint.get('epoch', best_epoch))
-            print_and_log(f"Resumed from '{resume}' at epoch {start_epoch}.", log_file)
-        except Exception as e:
-            print_and_log(f"WARNING: Failed to load checkpoint '{resume}': {e}", log_file)
-
-    # ---- Training loop ----
-    for epoch in range(start_epoch, num_epochs):
-        model.train()
-
-        if ddp and train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-
-        running_loss = 0.0
-        correct_train = 0
-        total_train = 0
-
-        current_lr = optimizer.param_groups[0]['lr']
-        progress_bar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch + 1}/{num_epochs} LR: {current_lr:.1e}",
-            leave=True,
-            disable=not IS_MAIN_PROCESS
-        )
-
-        batch_count = 0
-        for images, labels in progress_bar:
-            images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(images)
-
-            if loss_type == "combined":
-                if isinstance(outputs, tuple) and len(outputs) == 3:
-                    main_output, aux1, aux2 = outputs
-                    loss1 = criterion(main_output, labels, current_lr)
-                    loss2 = criterion(aux1, labels, current_lr)
-                    loss3 = criterion(aux2, labels, current_lr)
-                    loss = loss1 + 0.3 * loss2 + 0.3 * loss3
-                    outputs_for_acc = main_output
-                elif isinstance(outputs, torch.Tensor):
-                    loss = criterion(outputs, labels, current_lr)
-                    outputs_for_acc = outputs
-                else:
-                    if IS_MAIN_PROCESS:
-                        progress_bar.close()
-                    raise TypeError(f"Model output type not recognized: {type(outputs)}")
-            else:
-                if isinstance(outputs, tuple) and len(outputs) == 3:
-                    main_output, aux1, aux2 = outputs
-                    loss1 = criterion(main_output, labels)
-                    loss2 = criterion(aux1, labels)
-                    loss3 = criterion(aux2, labels)
-                    loss = loss1 + 0.3 * loss2 + 0.3 * loss3
-                    outputs_for_acc = main_output
-                elif isinstance(outputs, torch.Tensor):
-                    loss = criterion(outputs, labels)
-                    outputs_for_acc = outputs
-                else:
-                    if IS_MAIN_PROCESS:
-                        progress_bar.close()
-                    raise TypeError(f"Model output type not recognized: {type(outputs)}")
-
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-            batch_count += 1
-            _, predicted = torch.max(outputs_for_acc, 1)
-            correct_train += (predicted == labels).sum().item()
-            total_train += labels.size(0)
-
-            if IS_MAIN_PROCESS and total_train > 0 and batch_count > 0:
-                avg_loss_train = running_loss / batch_count
-                avg_acc_train = (correct_train / total_train) * 100
-                progress_bar.set_postfix(loss=f"{avg_loss_train:.4f}", acc=f"{avg_acc_train:.2f}%")
-
-        epoch_train_loss = (running_loss / batch_count) if batch_count > 0 else 0.0
-        epoch_train_acc = (correct_train / total_train) * 100 if total_train > 0 else 0.0
-
-        world_size = dist.get_world_size() if ddp and dist.is_initialized() else 1
-        val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = evaluate_model(
-            model, val_loader, criterion, genotype_map, log_file, loss_type, current_lr,
-            ddp=ddp, world_size=world_size
-        )
-
-        if IS_MAIN_PROCESS and class_stats_val:
-            print_and_log("\nClass-wise Validation Accuracy:", log_file)
-            for class_name in sorted_class_names_from_map:
-                stats = class_stats_val.get(class_name, {})
-                print_and_log(
-                    f"  {class_name} (Index {stats.get('idx', 'N/A')}): {stats.get('acc', 0):.2f}% "
-                    f"({stats.get('correct', 0)}/{stats.get('total', 0)})",
-                    log_file)
-
-        # True-class metrics
-        val_prec_true = val_metrics.get('precision_true', 0.0)
-        val_rec_true  = val_metrics.get('recall_true', 0.0)
-        val_f1_true   = val_metrics.get('f1_true', 0.0)
-        pos_idx       = val_metrics.get('pos_class_idx', None)
-
-        summary_msg = (
-            f"Epoch {epoch + 1}/{num_epochs} Summary - "
-            f"Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.2f}%, "
-            f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}% | "
-            f"Prec(true): {val_prec_true * 100:.2f}%, "
-            f"Rec(true): {val_rec_true * 100:.2f}%, "
-            f"F1(true): {val_f1_true:.4f} "
-            f"(LR: {current_lr:.1e}" + (f", pos_idx={pos_idx}" if pos_idx is not None else "") + ")"
-        )
-        print_and_log(summary_msg, log_file)
-
-        # Snapshot at epoch 5 (rank 0 only)
-        if (epoch + 1) == MIN_SAVE_EPOCH and IS_MAIN_PROCESS:
-            snap_path = os.path.join(output_path, f"model_epoch_{MIN_SAVE_EPOCH}.pth")
-            snap_path = _unique_path(snap_path)
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': _state_dict(model),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'genotype_map': genotype_map,
-                'in_channels': 6
-            }, snap_path)
-            print_and_log(f"\nSnapshot saved at epoch {epoch + 1}: {snap_path}", log_file)
-
-        # Save on validation improvement by F1(true); tie-breakers: higher recall_true, then lower val_loss
-        improved = (val_f1_true > best_f1_true) or \
-                   (val_f1_true == best_f1_true and val_rec_true > best_rec_true) or \
-                   (val_f1_true == best_f1_true and val_rec_true == best_rec_true and val_loss < best_val_loss)
-
-        if (epoch + 1) >= MIN_SAVE_EPOCH and improved and IS_MAIN_PROCESS:
-            best_f1_true = val_f1_true
-            best_rec_true = val_rec_true
-            best_val_acc = val_acc
-            best_val_loss = val_loss
-            best_epoch = epoch + 1
-
-            # --- NEW: filename encodes epoch and F1; never overwrite previous bests ---
-            ckpt_name = f"model_e{best_epoch:03d}_f1_{best_f1_true:.4f}.pth"
-            best_path = os.path.join(output_path, ckpt_name)
-            best_path = _unique_path(best_path)
-
-            payload = {
-                'epoch': best_epoch,
-                'model_state_dict': _state_dict(model),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'genotype_map': genotype_map,
-                'in_channels': 6,
-                'best_f1_true': best_f1_true,
-                'best_rec_true': best_rec_true,
-                'best_val_acc': best_val_acc,
-                'best_val_loss': best_val_loss,
-            }
-            torch.save(payload, best_path)
-            last_best_ckpt_path = best_path
-
-            print_and_log(
-                f"\nNew BEST at epoch {best_epoch}: "
-                f"F1(true) {best_f1_true:.4f} | Rec(true) {best_rec_true*100:.2f}% | "
-                f"Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
-                f"Saved: {best_path}", log_file)
-
-            if save_val_results:
-                result_name = f"validation_results_e{best_epoch:03d}_f1_{best_f1_true:.4f}.json"
-                result_path = os.path.join(output_path, result_name)
-                result_path = _unique_path(result_path)
-                try:
-                    with open(result_path, 'w') as f:
-                        json.dump({
-                            'epoch': best_epoch,
-                            'f1_true': best_f1_true,
-                            'recall_true': best_rec_true,
-                            'val_acc': best_val_acc,
-                            'val_loss': best_val_loss,
-                            'inference_results': val_infer_lists
-                        }, f, indent=4)
-                    print_and_log(f"Saved best validation results to {result_path}", log_file)
-                except Exception as e:
-                    print_and_log(f"Error saving best validation results: {e}", log_file)
-
-        scheduler.step()
-        print_and_log("-" * 30, log_file)
-
-    final_msg = (
-        f"Training complete. Best epoch: {best_epoch} "
-        f"| F1(true) {best_f1_true:.4f} | Rec(true) {best_rec_true*100:.2f}% "
-        f"| Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
-    )
-    if last_best_ckpt_path:
-        final_msg += f"Best model: {last_best_ckpt_path}"
-    else:
-        final_msg += "No best checkpoint saved."
-    print_and_log(final_msg, log_file)
-
-
-def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_type, current_lr,
-                   ddp=False, world_size=1):
+    state = checkpoint.get('model_state_dict', checkpoint)
+    model.load_state_dict(state, strict=True)
     model.eval()
-    batch_count_eval = 0
+    return model
 
-    num_classes = len(genotype_map) if genotype_map else 0
+# ----------------------------- Metrics --------------------------------- #
 
-    # Tensors for global metrics (on device)
-    correct_eval = torch.zeros(1, device=device, dtype=torch.long)
-    total_eval   = torch.zeros(1, device=device, dtype=torch.long)
-    loss_sum     = torch.zeros(1, device=device, dtype=torch.float)
+def compute_metrics(tp: torch.Tensor, fp: torch.Tensor, fn: torch.Tensor, class_total: torch.Tensor,
+                    class_names: List[str], pos_name: Optional[str] = "true") -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    # per-class accuracy
+    class_stats = {}
+    for i, cname in enumerate(class_names):
+        total = int(class_total[i].item())
+        tp_i = int(tp[i].item())
+        acc = (tp_i / total * 100.0) if total > 0 else 0.0
+        class_stats[cname] = {"idx": i, "acc": acc, "correct": tp_i, "total": total}
 
-    # Per-class counters for metrics
-    tp = torch.zeros(num_classes, device=device, dtype=torch.long)
-    fp = torch.zeros(num_classes, device=device, dtype=torch.long)
-    fn = torch.zeros(num_classes, device=device, dtype=torch.long)
-    class_correct_counts = torch.zeros(num_classes, device=device, dtype=torch.long)
-    class_total_counts   = torch.zeros(num_classes, device=device, dtype=torch.long)
+    # choose positive index
+    if pos_name is not None and pos_name in class_names:
+        pos_idx = class_names.index(pos_name)
+    else:
+        pos_idx = 1 if len(class_names) > 1 else 0
 
-    inference_results = defaultdict(list)
-    idx_to_class = {v: k for k, v in genotype_map.items()} if genotype_map else {}
-
-    if not data_loader:
-        metrics = {
-            'precision_true': 0.0, 'recall_true': 0.0, 'f1_true': 0.0, 'pos_class_idx': None
-        }
-        return 0.0, 0.0, {}, {}, metrics
-
-    with torch.no_grad():
-        for batch in data_loader:
-            if len(batch) == 3:
-                images, labels, paths = batch
-            else:
-                images, labels = batch
-                paths = [""] * labels.size(0)
-
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            if isinstance(outputs, tuple):
-                outputs = outputs[0]
-
-            loss = criterion(outputs, labels, current_lr) if loss_type == "combined" else criterion(outputs, labels)
-            loss_sum += loss.detach()
-            batch_count_eval += 1
-
-            _, predicted = torch.max(outputs, 1)
-            correct_eval += (predicted == labels).sum()
-            total_eval += labels.size(0)
-
-            for i in range(labels.size(0)):
-                pred_idx = int(predicted[i])
-                true_idx = int(labels[i])
-
-                class_total_counts[true_idx] += 1
-                if pred_idx == true_idx:
-                    class_correct_counts[true_idx] += 1
-                    tp[true_idx] += 1
-                else:
-                    if pred_idx < num_classes:
-                        fp[pred_idx] += 1
-                    fn[true_idx] += 1
-
-                if idx_to_class and paths[i]:
-                    predicted_class_name = idx_to_class.get(pred_idx, str(pred_idx))
-                    inference_results[predicted_class_name].append(os.path.basename(paths[i]))
-
-    if ddp and world_size > 1 and dist.is_initialized():
-        dist.all_reduce(correct_eval, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_eval,   op=dist.ReduceOp.SUM)
-        dist.all_reduce(loss_sum,     op=dist.ReduceOp.SUM)
-
-        if num_classes > 0:
-            dist.all_reduce(tp, op=dist.ReduceOp.SUM)
-            dist.all_reduce(fp, op=dist.ReduceOp.SUM)
-            dist.all_reduce(fn, op=dist.ReduceOp.SUM)
-            dist.all_reduce(class_correct_counts, op=dist.ReduceOp.SUM)
-            dist.all_reduce(class_total_counts,   op=dist.ReduceOp.SUM)
-
-    denom_batches = max(1, batch_count_eval * (world_size if (ddp and world_size > 1) else 1))
-    avg_loss_eval = (loss_sum.item() / denom_batches)
-    overall_accuracy_eval = (correct_eval.item() / max(1, total_eval.item())) * 100.0
-
-    class_performance_stats = {}
-    if genotype_map:
-        for class_name, class_idx in genotype_map.items():
-            correct_c = int(class_correct_counts[class_idx].item())
-            total_c   = int(class_total_counts[class_idx].item())
-            acc_c = (correct_c / total_c * 100.0) if total_c > 0 else 0.0
-            class_performance_stats[class_name] = {
-                'acc': acc_c, 'correct': correct_c, 'total': total_c, 'idx': class_idx
-            }
-
-    # Positive ("true") class F1
-    pos_idx = None
-    if genotype_map:
-        for name, idx in genotype_map.items():
-            if str(name).lower() == "true":
-                pos_idx = idx
-                break
-    if pos_idx is None:
-        if 1 < num_classes:
-            pos_idx = 1
-        elif num_classes > 0:
-            supports = class_total_counts.clone()
-            if supports.sum() > 0:
-                pos_idx = int(torch.nonzero(supports == supports[supports > 0].min(), as_tuple=False)[0].item())
-            else:
-                pos_idx = 0
-        else:
-            pos_idx = 0
-
-    tpc = float(tp[pos_idx].item() if pos_idx < num_classes else 0.0)
-    fpc = float(fp[pos_idx].item() if pos_idx < num_classes else 0.0)
-    fnc = float(fn[pos_idx].item() if pos_idx < num_classes else 0.0)
+    tpc = float(tp[pos_idx].item())
+    fpc = float(fp[pos_idx].item())
+    fnc = float(fn[pos_idx].item())
 
     precision_true = (tpc / (tpc + fpc)) if (tpc + fpc) > 0 else 0.0
-    recall_true    = (tpc / (tpc + fnc)) if (tpc + fnc) > 0 else 0.0
-    f1_true        = (2 * precision_true * recall_true / (precision_true + recall_true)) \
-                     if (precision_true + recall_true) > 0 else 0.0
+    recall_true = (tpc / (tpc + fnc)) if (tpc + fnc) > 0 else 0.0
+    f1_true = (2 * precision_true * recall_true / (precision_true + recall_true)) if (precision_true + recall_true) > 0 else 0.0
 
     metrics = {
         'precision_true': precision_true,
@@ -571,149 +260,223 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
         'f1_true': f1_true,
         'pos_class_idx': pos_idx,
     }
+    return class_stats, metrics
 
-    return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results, metrics
+# --------------------------- Validation core --------------------------- #
 
+@torch.inference_mode()
+def validate(model: torch.nn.Module,
+             dl: DataLoader,
+             device: torch.device,
+             class_names: List[str],
+             save_lists: bool = False) -> Tuple[float, float, Dict[str, Any], Dict[str, List[str]], Dict[str, Any]]:
+    model.eval()
 
-# --- Helpers for path resolution (single, non-duplicated) ---
-def _read_paths_file(file_path):
-    paths = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith('#'):
-                continue
-            paths.append(os.path.abspath(os.path.expanduser(s)))
-    return paths
+    mean_dev = VAL_MEAN.to(device).view(-1, 1, 1)
+    std_dev = VAL_STD.to(device).view(-1, 1, 1)
 
+    num_classes = len(class_names)
+    total_loss = 0.0
+    batches = 0
+    correct = 0
+    total = 0
 
-def _resolve_data_roots(primary_path, extra_paths, paths_file):
-    candidates = []
-    if primary_path:
-        candidates.append(os.path.abspath(os.path.expanduser(primary_path)))
-    if extra_paths:
-        for p in extra_paths:
-            candidates.append(os.path.abspath(os.path.expanduser(p)))
-    if paths_file:
-        candidates.extend(_read_paths_file(paths_file))
-    seen = set()
-    deduped = []
-    for p in candidates:
-        if p not in seen:
-            seen.add(p)
-            deduped.append(p)
-    if len(deduped) == 0:
-        return primary_path
-    if len(deduped) == 1:
-        return deduped[0]
-    return deduped
+    # On-device counters
+    tp = torch.zeros(num_classes, device=device, dtype=torch.long)
+    fp = torch.zeros(num_classes, device=device, dtype=torch.long)
+    fn = torch.zeros(num_classes, device=device, dtype=torch.long)
+    class_total = torch.zeros(num_classes, device=device, dtype=torch.long)
 
+    ce = torch.nn.CrossEntropyLoss(reduction='mean')  # use CE for reporting
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a Classifier on 6-channel custom .npy dataset")
+    infer_lists: Dict[str, List[str]] = {c: [] for c in class_names}
 
-    # Make data_path OPTIONAL; we will enforce XOR with the files mode
-    parser.add_argument("data_path", nargs="?", type=str,
-                        help="Dataset root containing 'train/' and 'val/' (Mode A).")
+    with tqdm(total=len(dl), desc="Validate", unit="batch", dynamic_ncols=True, leave=True) as bar:
+        for images, labels, paths in dl:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
-    parser.add_argument("-o", "--output_path", default="./saved_models_6channel", type=str, help="Path to save model")
-    parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3],
-                        help="A list of depths for the ConvNeXt stages (e.g., 3 3 27 3)")
-    parser.add_argument("--dims", type=int, nargs='+', default=[192, 384, 768, 1536],
-                        help="A list of dimensions for the ConvNeXt stages (e.g., 192 384 768 1536)")
+            images = (images - mean_dev) / std_dev
+            logits = model(images)
+            if isinstance(logits, tuple):
+                logits = logits[0]
 
-    parser.add_argument("--epochs", type=int, default=70, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.0001, help="Initial learning rate")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for data loading")
+            loss = ce(logits, labels)
+            total_loss += float(loss.item())
+            batches += 1
 
-    # Optimizer / scheduler (unchanged)
-    parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of epochs for linear LR warmup")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
-    parser.add_argument("--save_val_results", action='store_true', help="Save validation results when best is found.")
-    parser.add_argument("--loss_type", type=str, default="weighted_ce", choices=["combined", "weighted_ce"],
-                        help="Loss function to use")
+            preds = torch.argmax(logits, dim=1)
+            correct += int((preds == labels).sum().item())
+            total += int(labels.numel())
 
-    # Mode B (files) — both must be provided together when using files mode
-    parser.add_argument("--train_data_paths_file", type=str, default=None,
-                        help="Text file listing TRAIN dataset roots (one per line).")
-    parser.add_argument("--val_data_paths_file", type=str, default=None,
-                        help="Text file listing VAL dataset roots (one per line).")
+            # per-class accounting
+            for i in range(labels.size(0)):
+                t = int(labels[i])
+                p = int(preds[i])
+                class_total[t] += 1
+                if p == t:
+                    tp[t] += 1
+                else:
+                    if p < num_classes:
+                        fp[p] += 1
+                    fn[t] += 1
+                if save_lists:
+                    infer_lists[class_names[p]].append(os.path.basename(paths[i]))
 
-    # Subsample ratio
-    parser.add_argument("--training_data_ratio", type=float, default=1.0,
-                        help="Proportion of training data to use (0–1]. Randomly subsamples the training set.")
+            bar.update(1)
 
-    # Multi-GPU switches
-    parser.add_argument("--ddp", action="store_true",
-                        help="Use DistributedDataParallel (multi-process). Launch with torchrun.")
-    parser.add_argument("--data_parallel", action="store_true",
-                        help="Use nn.DataParallel across all visible GPUs (single process). Ignored if --ddp is set.")
+    avg_loss = total_loss / max(1, batches)
+    acc = (correct / max(1, total)) * 100.0
+    class_stats, metrics = compute_metrics(tp, fp, fn, class_total, class_names, pos_name="true")
+    return avg_loss, acc, class_stats, (infer_lists if save_lists else {}), metrics
 
-    # NEW: resume from checkpoint
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Path to a checkpoint .pth to resume training (loads model/optimizer/scheduler/epoch).")
+# ------------------------------ Main ----------------------------------- #
 
-    args = parser.parse_args()
+def main():
+    ap = argparse.ArgumentParser(description="Validate a ConvNeXtCBAMClassifier on scattered .npy trees")
+    ap.add_argument('--roots', type=str, nargs='+', required=True,
+                    help='One or more root directories to recursively scan for files')
+    ap.add_argument('--file_ext', type=str, default='.npy', help='File extension to include (default: .npy)')
 
-    # ---- Enforce: exactly one of (data_path) OR (both files) ----
-    has_base = args.data_path is not None
-    has_both_files = (args.train_data_paths_file is not None) and (args.val_data_paths_file is not None)
+    ap.add_argument('--label_mode', choices=['parent', 'regex', 'csv'], required=True,
+                    help='How to get labels: immediate parent folder, regex on path, or CSV mapping')
+    ap.add_argument('--label_regex', type=str, default=None,
+                    help="Regex applied to FULL PATH; must define a named group (?P<label>...) when --label_mode=regex")
+    ap.add_argument('--labels_csv', type=str, default=None,
+                    help='CSV with columns path,label when --label_mode=csv')
 
-    if not (0 < args.training_data_ratio <= 1.0):
-        parser.error(f"--training_data_ratio must be in (0,1], got {args.training_data_ratio}")
+    ap.add_argument('--class_map_json', type=str, default=None,
+                    help='Optional JSON with {class_name: index}. Locks mapping and class order.')
 
-    if has_base and has_both_files:
-        parser.error("Provide either positional data_path (Mode A) OR both --train_data_paths_file and "
-                     "--val_data_paths_file (Mode B), not both.")
-    if not has_base and not has_both_files:
-        parser.error("You must provide exactly one input mode:\n"
-                     "  • Mode A: data_path\n"
-                     "  • Mode B: --train_data_paths_file and --val_data_paths_file")
+    ap.add_argument('--ckpt', type=str, required=True, help='Checkpoint .pth path')
+    ap.add_argument('--depths', type=int, nargs='+', default=[3, 3, 27, 3])
+    ap.add_argument('--dims', type=int, nargs='+', default=[192, 384, 768, 1536])
 
-    # Build the argument passed into train_model
-    if has_base:
-        data_path_or_pair = os.path.abspath(os.path.expanduser(args.data_path))
+    ap.add_argument('--batch_size', type=int, default=128)
+    ap.add_argument('--num_workers', type=int, default=16)
+    ap.add_argument('--mmap', action='store_true', help='Use numpy memmap mode')
+    ap.add_argument('--tile_single_channel', action='store_true', help='Tile 1-channel arrays to 6')
+    ap.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
+    ap.add_argument('--fp16', action='store_true')
+
+    ap.add_argument('--save_pred_csv', type=str, default='', help='Write per-sample predictions CSV here (optional)')
+    ap.add_argument('--save_val_json', type=str, default='', help='Write per-class predicted filenames JSON here (optional)')
+
+    args = ap.parse_args()
+
+    # Device
+    if args.device == 'auto':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    elif args.device == 'cuda':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if device.type == 'cpu':
+            print('CUDA requested but not available; using CPU')
     else:
-        train_roots = _read_paths_file(args.train_data_paths_file)
-        val_roots   = _read_paths_file(args.val_data_paths_file)
-        if not train_roots:
-            parser.error(f"--train_data_paths_file is empty or unreadable: {args.train_data_paths_file}")
-        if not val_roots:
-            parser.error(f"--val_data_paths_file is empty or unreadable: {args.val_data_paths_file}")
-        data_path_or_pair = (train_roots, val_roots)
+        device = torch.device('cpu')
 
-    # --- DDP init (takes precedence over DataParallel) ---
-    if args.ddp:
-        if not torch.cuda.is_available():
-            raise RuntimeError("DDP requires CUDA available.")
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-        dist.init_process_group(backend="nccl", init_method="env://")
-        IS_MAIN_PROCESS = (dist.get_rank() == 0)
-        if IS_MAIN_PROCESS:
-            print(f"[DDP] World size={dist.get_world_size()} | Local rank={local_rank} | Global rank={dist.get_rank()}")
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+
+    # Discover files
+    files = list_files_parallel(args.roots, ext=args.file_ext.lower(), workers=args.num_workers)
+    if len(files) == 0:
+        raise SystemExit('No files found.')
+
+    # Labels
+    if args.label_mode == 'parent':
+        files, labels = labels_from_parent(files)
+    elif args.label_mode == 'regex':
+        if not args.label_regex:
+            raise SystemExit('--label_regex is required when --label_mode=regex')
+        files, labels = labels_from_regex(files, args.label_regex)
+    else:  # csv
+        if not args.labels_csv:
+            raise SystemExit('--labels_csv is required when --label_mode=csv')
+        files, labels = labels_from_csv(args.labels_csv, args.roots)
+
+    # Class mapping
+    if args.class_map_json:
+        with open(args.class_map_json, 'r', encoding='utf-8') as f:
+            class_to_idx = {str(k): int(v) for k, v in json.load(f).items()}
+        # sanity: unseen labels?
+        unseen = sorted({l for l in labels if l not in class_to_idx})
+        if unseen:
+            raise SystemExit(f"Labels not in class_map_json: {unseen[:10]} ... (total {len(unseen)})")
     else:
-        local_rank = 0
-        IS_MAIN_PROCESS = True
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # infer mapping from sorted unique labels
+        uniq = sorted(set(labels))
+        class_to_idx = {c: i for i, c in enumerate(uniq)}
 
-    # Hand off; train_model still discovers loaders via get_data_loader(...)
-    train_model(
-        data_path=data_path_or_pair, output_path=args.output_path,
-        save_val_results=args.save_val_results,
-        num_epochs=args.epochs, learning_rate=args.lr,
-        batch_size=args.batch_size, num_workers=args.num_workers,
-        loss_type=args.loss_type,
-        warmup_epochs=args.warmup_epochs,
-        weight_decay=args.weight_decay,
-        depths=args.depths,
-        dims=args.dims,
-        training_data_ratio=args.training_data_ratio,
-        ddp=args.ddp, data_parallel=args.data_parallel, local_rank=local_rank,
-        resume=args.resume,
-    )
+    class_names = [None] * len(class_to_idx)
+    for k, v in class_to_idx.items():
+        class_names[v] = k
 
-    if args.ddp and dist.is_initialized():
-        dist.destroy_process_group()
+    # Dataset / DataLoader
+    ds = ScatteredNpyDataset(files=files, labels=labels, class_to_idx=class_to_idx,
+                             channels=6, tile_single_channel=args.tile_single_channel, mmap=args.mmap)
+    dl = DataLoader(ds,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    pin_memory=(device.type == 'cuda'),
+                    persistent_workers=(args.num_workers > 0),
+                    prefetch_factor=(4 if args.num_workers > 0 else None),
+                    shuffle=False,
+                    drop_last=False)
+
+    # Model
+    model = load_model(args.ckpt, device=device, in_channels=6,
+                       depths=args.depths, dims=args.dims, num_classes=len(class_names))
+    if args.fp16 and device.type == 'cuda':
+        model = model.half()
+
+    # Run validation
+    avg_loss, acc, class_stats, infer_lists, metrics = validate(model, dl, device, class_names, save_lists=bool(args.save_val_json))
+
+    print("\n=== Validation Summary ===")
+    print(f"Files: {len(files)} | Batches: {max(1, len(dl))}")
+    print(f"Avg loss: {avg_loss:.4f} | Acc: {acc:.2f}%")
+    print(f"Precision(true): {metrics['precision_true']*100:.2f}% | Recall(true): {metrics['recall_true']*100:.2f}% | F1(true): {metrics['f1_true']:.4f} | pos_idx={metrics['pos_class_idx']}")
+    print("Class-wise accuracy:")
+    for cname in class_names:
+        s = class_stats[cname]
+        print(f"  {cname:>12s} | idx={s['idx']:2d} | acc={s['acc']:6.2f}% | {s['correct']}/{s['total']}")
+
+    # Optional outputs
+    if args.save_val_json:
+        out_json = os.path.abspath(args.save_val_json)
+        with open(out_json, 'w', encoding='utf-8') as f:
+            json.dump({
+                'metrics': metrics,
+                'class_stats': class_stats,
+                'predicted_lists': infer_lists,
+            }, f, indent=2)
+        print(f"Wrote validation JSON: {out_json}")
+
+    if args.save_pred_csv:
+        out_csv = os.path.abspath(args.save_pred_csv)
+        with open(out_csv, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(["path", "true_label", "pred_label", "pred_idx"])
+            # Re-run lightly to dump preds without storing all in RAM
+            mean_dev = VAL_MEAN.to(device).view(-1,1,1)
+            std_dev = VAL_STD.to(device).view(-1,1,1)
+            model.eval()
+            with torch.inference_mode():
+                for images, labels, paths in tqdm(dl, desc="Dump preds", leave=False):
+                    images = (images.to(device, non_blocking=True) - mean_dev) / std_dev
+                    logits = model(images)
+                    if isinstance(logits, tuple):
+                        logits = logits[0]
+                    preds = torch.argmax(logits, dim=1).cpu().tolist()
+                    labels = labels.cpu().tolist()
+                    for pth, y, p in zip(paths, labels, preds):
+                        w.writerow([pth, class_names[y], class_names[p], p])
+        print(f"Wrote predictions CSV: {out_csv}")
+
+
+if __name__ == '__main__':
+    main()
