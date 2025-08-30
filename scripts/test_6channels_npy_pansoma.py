@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Batch inference over a directory of .npy files (recursively) with single-line flashing progress,
-using the SAME preprocessing as the validation loader (channel-wise Normalize).
+Fast batch inference over a directory of .npy files (recursively).
 
-Now with producer→consumer:
-  • GPU producer enqueues logits
-  • Multiple CPU consumers do softmax/argmax and build result dicts in parallel
+Key speedups:
+  • Normalize on device (GPU if available), not in __getitem__
+  • Optional channels_last + fp16/TF32 + torch.compile
+  • Overlap host→device copies with compute via a small prefetcher
+  • Avoid large CPU transfers: compute softmax/top1 on GPU, optionally skip per-class probs
+  • Keep NumPy/BLAS single-threaded in workers to avoid oversubscription
 
-Example:
+Examples:
     python infer_npy_dir.py \
       --input_dir /path/to/npy_root \
       --ckpt /path/to/model_best.pth \
       --output_csv preds.csv \
       --output_json preds.json \
-      --batch_size 128 --num_workers 8 --mmap --postproc_workers 8
+      --batch_size 256 --num_workers 8 --mmap \
+      --channels_last --fp16 --compile --no_probs
 """
 
 import argparse
@@ -23,7 +26,6 @@ import json
 import time
 from typing import List, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing as mp
 
 import numpy as np
 import torch
@@ -35,9 +37,7 @@ THIS_DIR = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(os.path.abspath(os.path.join(THIS_DIR, "..")))
 from mynet import ConvNeXtCBAMClassifier  # noqa: E402
 
-# --- EXACT SAME NORMALIZATION AS VAL ---
-
-# COLO829T Testing
+# --- EXACT SAME NORMALIZATION AS VAL (COLO829T Testing) ---
 VAL_MEAN = torch.tensor([
     18.417816162109375, 12.649129867553711, -0.5452527403831482,
     24.723854064941406, 4.690611362457275, 0.2813551473402196
@@ -46,7 +46,6 @@ VAL_STD = torch.tensor([
     25.028322219848633, 14.809632301330566, 0.6181337833404541,
     29.972835540771484, 7.9231791496276855, 0.7659083659074717
 ], dtype=torch.float32)
-
 
 # ----------------------------- Utilities ------------------------------------- #
 
@@ -165,12 +164,6 @@ def ensure_chw(x: np.ndarray, channels: int, tile_single_channel: bool = False) 
     return chw
 
 
-def softmax_np(logits: np.ndarray, axis: int = -1) -> np.ndarray:
-    m = logits.max(axis=axis, keepdims=True)
-    y = np.exp(logits - m)
-    return y / y.sum(axis=axis, keepdims=True)
-
-
 def print_data_info(
     files: List[str],
     in_channels: int,
@@ -219,23 +212,14 @@ class NpyDirDataset(Dataset):
         if self.channels != 6:
             raise ValueError(f"inference expects 6 channels to match training/val; got {self.channels}")
 
-        # Precompute mean/std on CPU for CHW broadcasting
-        self.mean = VAL_MEAN.view(-1, 1, 1)  # (6,1,1)
-        self.std = VAL_STD.view(-1, 1, 1)    # (6,1,1)
-
     def __len__(self) -> int:
         return len(self.files)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
         path = self.files[idx]
         arr = np.load(path, allow_pickle=False, mmap_mode=('r' if self.mmap else None))
-
         chw = ensure_chw(arr, self.channels, tile_single_channel=self.tile_single_channel)
-
-        t = torch.from_numpy(chw).float()  # CHW float32
-        # --- EXACT SAME NORMALIZATION AS VAL ---
-        t = (t - self.mean) / self.std
-
+        t = torch.from_numpy(chw).float()  # CHW float32 on CPU; normalization happens later (device-specific)
         return t, path
 
 
@@ -274,121 +258,16 @@ def build_and_load_model(
     return model, genotype_map, in_channels
 
 
-# --------------------------- Producer→Consumer Inference ---------------------- #
+# --------------------------- Inference Core ---------------------------------- #
 
-def _postproc_worker(in_q, out_q, class_names):
-    """
-    CPU worker: receives (paths: List[str], logits: np.ndarray [B, C])
-    and emits list[dict] with 'probs' included (to match write_outputs()).
-    """
-    try:
-        while True:
-            item = in_q.get()
-            if item is None:
-                break
-            paths, logits = item
-            probs = softmax_np(logits, axis=1)
-            top_idx = probs.argmax(axis=1)
-            top_prob = probs.max(axis=1)
-
-            out_batch = []
-            for i, pth in enumerate(paths):
-                pred_idx = int(top_idx[i])
-                pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
-                rec = {
-                    "path": pth,
-                    "pred_idx": pred_idx,
-                    "pred_class": pred_name,
-                    "pred_prob": float(top_prob[i]),
-                    "probs": {class_names[j]: float(probs[i, j]) for j in range(len(class_names))}
-                }
-                out_batch.append(rec)
-
-            out_q.put(out_batch)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        out_q.put(None)
+def _worker_init(_):
+    # Avoid thread oversubscription inside dataloader workers
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 
-@torch.inference_mode()
-def run_inference_pc(
-    model: torch.nn.Module,
-    dl: DataLoader,
-    device: torch.device,
-    fp16: bool,
-    class_names: List[str],
-    total_files: int,
-    *,
-    postproc_workers: int = 4,
-) -> List[Dict[str, Any]]:
-    """
-    Producer (GPU): model→logits
-    Consumers (CPU mp processes): softmax/argmax/build result dicts (with 'probs')
-    """
-    results: List[Dict[str, Any]] = []
-    use_amp = (fp16 and device.type == "cuda")
-
-    # 'spawn' plays nicest with CUDA
-    ctx = mp.get_context("spawn")
-    in_q = ctx.Queue(maxsize=max(2, postproc_workers * 2))
-    out_q = ctx.Queue(maxsize=max(2, postproc_workers * 2))
-
-    # Start workers
-    workers = []
-    for _ in range(max(1, postproc_workers)):
-        p = ctx.Process(target=_postproc_worker, args=(in_q, out_q, class_names), daemon=True)
-        p.start()
-        workers.append(p)
-
-    finished_workers = 0
-    processed = 0
-    t0 = time.time()
-
-    with tqdm(total=total_files, desc="Infer", unit="file", dynamic_ncols=True, leave=True) as bar:
-        for images, paths in dl:
-            images = images.to(device, non_blocking=True)
-            if use_amp:
-                with torch.cuda.amp.autocast():
-                    outputs = model(images)
-            else:
-                outputs = model(images)
-
-            if isinstance(outputs, tuple):
-                outputs = outputs[0]
-
-            # Move logits to CPU as numpy for workers
-            logits = outputs.detach().float().cpu().numpy()
-            in_q.put((paths, logits))
-
-            processed += len(paths)
-            bar.update(len(paths))
-            elapsed = time.time() - t0
-            speed = processed / max(1e-9, elapsed)
-            eta = (total_files - processed) / max(1e-9, speed)
-            bar.set_postfix_str(f"speed={speed:.1f} file/s ETA={_format_eta(eta)}")
-
-        # Tell workers we're done
-        for _ in workers:
-            in_q.put(None)
-
-        # Drain results until all workers send sentinel
-        while finished_workers < len(workers):
-            out = out_q.get()
-            if out is None:
-                finished_workers += 1
-            else:
-                results.extend(out)
-
-    # Join (best-effort)
-    for p in workers:
-        p.join(timeout=1.0)
-
-    return results
-
-
-# --------------------------- Inference Core (legacy) -------------------------- #
-# (Keeping your original for reference; the script now calls run_inference_pc)
 @torch.inference_mode()
 def run_inference(
     model: torch.nn.Module,
@@ -397,40 +276,103 @@ def run_inference(
     fp16: bool,
     class_names: List[str],
     total_files: int,
+    channels_last: bool = False,
+    no_probs: bool = False,
 ) -> List[Dict[str, Any]]:
-    results: List[Dict[str, Any]] = []
+    """
+    Single-line flashing progress using one tqdm bar (total = number of files).
+    Normalize on-device; compute softmax and top1 on-device; transfer minimal data.
+    """
     use_amp = (fp16 and device.type == "cuda")
 
+    # mean/std prepared on the active device for broadcast (6,1,1)
+    mean = VAL_MEAN.view(6, 1, 1).to(device)
+    std = VAL_STD.view(6, 1, 1).to(device)
+
+    # Dedicated CUDA stream for prefetching
+    stream = torch.cuda.Stream() if device.type == "cuda" else None
+
+    def _to_device(batch_cpu):
+        images_cpu, paths = batch_cpu
+        if device.type != "cuda":
+            # CPU path: normalize on CPU to keep parity
+            x = images_cpu
+            x = (x - mean.cpu()) / std.cpu()
+            return x, paths
+        # CUDA path: stage copy & normalize on a separate stream
+        with torch.cuda.stream(stream):
+            x = images_cpu.to(device, non_blocking=True)
+            if channels_last:
+                x = x.to(memory_format=torch.channels_last)
+            if use_amp:
+                x = x.half()
+            x = (x - mean) / std
+        return x, paths
+
+    # Prime first batch
+    it = iter(dl)
+    try:
+        next_x, next_paths = _to_device(next(it))
+    except StopIteration:
+        return []
+
+    if device.type == "cuda":
+        torch.cuda.current_stream().wait_stream(stream)
+
+    results: List[Dict[str, Any]] = []
     processed = 0
     t0 = time.time()
 
     with tqdm(total=total_files, desc="Infer", unit="file", dynamic_ncols=True, leave=True) as bar:
-        for images, paths in dl:
-            images = images.to(device, non_blocking=True)
-            if use_amp:
-                images = images.half()
+        while True:
+            x, paths = next_x, next_paths
+
+            # Kick off prefetch of the next batch ASAP
+            try:
+                next_x, next_paths = _to_device(next(it))
+            except StopIteration:
+                next_x, next_paths = None, None
+
+            if device.type == "cuda" and stream is not None:
+                torch.cuda.current_stream().wait_stream(stream)
 
             with (torch.cuda.amp.autocast() if use_amp else torch.no_grad()):
-                outputs = model(images)
+                outputs = model(x)
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
 
-            logits = outputs.detach().float().cpu().numpy()
-            probs = softmax_np(logits, axis=1)
-            top_idx = probs.argmax(axis=1)
-            top_prob = probs.max(axis=1)
+            probs = torch.softmax(outputs, dim=1)
+            top_prob, top_idx = probs.max(dim=1)
 
-            for i in range(len(paths)):
-                pred_idx = int(top_idx[i])
-                pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
-                prob_dict = {class_names[j]: float(probs[i, j]) for j in range(len(class_names))}
-                results.append({
-                    "path": paths[i],
-                    "pred_idx": pred_idx,
-                    "pred_class": pred_name,
-                    "pred_prob": float(top_prob[i]),
-                    "probs": prob_dict
-                })
+            if no_probs:
+                # Transfer minimal data: only top1 index + prob
+                top_prob_l = top_prob.float().cpu().tolist()
+                top_idx_l = top_idx.int().cpu().tolist()
+                for i, pth in enumerate(paths):
+                    pred_idx = int(top_idx_l[i])
+                    pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
+                    results.append({
+                        "path": pth,
+                        "pred_idx": pred_idx,
+                        "pred_class": pred_name,
+                        "pred_prob": float(top_prob_l[i]),
+                    })
+            else:
+                # Bring full probs once per batch (float16 to reduce PCIe bandwidth)
+                probs_cpu = probs.to(dtype=torch.float16).cpu().numpy()
+                top_idx_cpu = top_idx.int().cpu().numpy()
+                top_prob_cpu = top_prob.float().cpu().numpy()
+                for i, pth in enumerate(paths):
+                    pred_idx = int(top_idx_cpu[i])
+                    pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
+                    prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
+                    results.append({
+                        "path": pth,
+                        "pred_idx": pred_idx,
+                        "pred_class": pred_name,
+                        "pred_prob": float(top_prob_cpu[i]),
+                        "probs": prob_dict
+                    })
 
             processed += len(paths)
             bar.update(len(paths))
@@ -439,29 +381,42 @@ def run_inference(
             eta = (total_files - processed) / max(1e-9, speed)
             bar.set_postfix_str(f"speed={speed:.1f} file/s ETA={_format_eta(eta)}")
 
+            if next_x is None:
+                break
+
     return results
 
 
 def write_outputs(results: List[Dict[str, Any]], csv_path: str, json_path: str) -> None:
+    # JSON
     if json_path:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
         print(f"Wrote JSON predictions: {os.path.abspath(json_path)}")
 
+    # CSV
     if csv_path:
         import csv
-        all_classes = set()
-        for r in results:
-            all_classes.update(r["probs"].keys())
-        header = ["path", "pred_idx", "pred_class", "pred_prob"] + sorted(all_classes)
+        # Determine if any record has 'probs'
+        any_probs = any(("probs" in r) for r in results)
+        header = ["path", "pred_idx", "pred_class", "pred_prob"]
+        class_cols = []
+        if any_probs:
+            all_classes = set()
+            for r in results:
+                if "probs" in r:
+                    all_classes.update(r["probs"].keys())
+            class_cols = sorted(all_classes)
+            header += class_cols
 
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(header)
             for r in results:
                 row = [r["path"], r["pred_idx"], r["pred_class"], f"{r['pred_prob']:.6f}"]
-                for cname in sorted(all_classes):
-                    row.append(f"{r['probs'].get(cname, 0.0):.6f}")
+                if any_probs:
+                    for cname in class_cols:
+                        row.append(f"{r.get('probs', {}).get(cname, 0.0):.6f}")
                 w.writerow(row)
         print(f"Wrote CSV predictions:  {os.path.abspath(csv_path)}")
 
@@ -469,7 +424,7 @@ def write_outputs(results: List[Dict[str, Any]], csv_path: str, json_path: str) 
 # ----------------------------- Main ------------------------------------------ #
 
 def main():
-    parser = argparse.ArgumentParser(description="Infer over .npy files (recursively) with ConvNeXtCBAMClassifier, matching val preprocessing, with producer→consumer post-processing.")
+    parser = argparse.ArgumentParser(description="Infer over .npy files with ConvNeXtCBAMClassifier (fast path).")
     parser.add_argument("--input_dir", required=True, type=str, help="Root dir to scan for .npy files")
     parser.add_argument("--ckpt", required=True, type=str, help="Path to checkpoint .pth")
     parser.add_argument("--output_csv", default="predictions.csv", type=str, help="CSV output path (or '' to skip)")
@@ -477,13 +432,15 @@ def main():
     parser.add_argument("--batch_size", default=64, type=int)
     parser.add_argument("--num_workers", default=8, type=int)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device choice")
-    parser.add_argument("--fp16", action="store_true", help="Enable half-precision inference (CUDA only). For val parity, leave off.")
+    parser.add_argument("--fp16", action="store_true", help="Enable half-precision inference (CUDA only).")
+    parser.add_argument("--channels_last", action="store_true", help="Use NHWC (channels-last) memory format.")
+    parser.add_argument("--compile", action="store_true", help="torch.compile the model (PyTorch 2.x).")
+    parser.add_argument("--no_probs", action="store_true", help="Skip per-class probs; store only top-1.")
     parser.add_argument("--tile_single_channel", action="store_true", help="If an array is single-channel, tile it to 6 channels")
     parser.add_argument("--mmap", action="store_true", help="Load .npy via mmap_mode='r' (lower RAM peak)")
     parser.add_argument("--depths", type=int, nargs="+", default=[3, 3, 27, 3], help="ConvNeXt stage depths used in training")
     parser.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536], help="ConvNeXt dims used in training")
     parser.add_argument("--sample_info_k", type=int, default=3, help="Print header info (shape/dtype) for the first K files")
-    parser.add_argument("--postproc_workers", type=int, default=4, help="CPU processes for post-processing logits")
     args = parser.parse_args()
 
     # Resolve device
@@ -498,6 +455,7 @@ def main():
 
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
         try:
             torch.set_float32_matmul_precision("high")
         except Exception:
@@ -525,10 +483,21 @@ def main():
         class_names = [None] * len(genotype_map)
         for cname, cidx in genotype_map.items():
             if 0 <= int(cidx) < len(class_names):
-                class_names[cidx] = str(cname)
+                class_names[int(cidx)] = str(cname)
         for i in range(len(class_names)):
             if class_names[i] is None:
                 class_names[i] = str(i)
+
+    # Optional channels-last and fp16 on model
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    if args.fp16 and device.type == "cuda":
+        model = model.half()
+    if args.compile:
+        try:
+            model = torch.compile(model)
+        except Exception as e:
+            print(f"torch.compile not enabled: {e}")
 
     # Gather files (single-line progress)
     files = list_npy_files_parallel(args.input_dir, workers=args.num_workers)
@@ -537,12 +506,12 @@ def main():
 
     # Startup prints
     print("=== Inference Configuration ===")
-    print(f"Device: {device} | FP16: {bool(args.fp16 and device.type=='cuda')} (val uses FP32)")
+    print(f"Device: {device} | FP16: {bool(args.fp16 and device.type=='cuda')} | channels_last={args.channels_last} | compile={args.compile}")
     print(f"Input dir: {os.path.abspath(args.input_dir)}")
     print(f"Found files: {len(files)}")
     print(f"In-channels: {in_channels}")
     print(f"Classes ({len(class_names)}): {class_names}")
-    print(f"Batch size: {args.batch_size} | Workers: {args.num_workers} | mmap={args.mmap} | postproc_workers={args.postproc_workers}")
+    print(f"Batch size: {args.batch_size} | Workers: {args.num_workers} | mmap={args.mmap} | no_probs={args.no_probs}")
     print("=" * 30)
 
     # Data info peek
@@ -565,28 +534,29 @@ def main():
         ds,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=True,
         persistent_workers=(args.num_workers > 0),
-        prefetch_factor=(8 if args.num_workers > 0 else None),
+        prefetch_factor=(4 if args.num_workers > 0 else None),
         shuffle=False,
         drop_last=False,
-        multiprocessing_context=("forkserver" if args.num_workers > 0 else None),
+        worker_init_fn=_worker_init,
+        collate_fn=lambda batch: (
+            torch.stack([b[0] for b in batch], dim=0),  # (B,6,H,W) CPU float32
+            [b[1] for b in batch],
+        ),
     )
 
-    # Keep model in FP32 unless explicitly asked otherwise
-    if args.fp16 and device.type == "cuda":
-        model = model.half()
-
-    # Run (single-line flashing bar) with producer→consumer
+    # Run (single-line flashing bar)
     t0 = time.time()
-    results = run_inference_pc(
+    results = run_inference(
         model=model,
         dl=dl,
         device=device,
         fp16=args.fp16,
         class_names=class_names,
         total_files=len(files),
-        postproc_workers=args.postproc_workers,
+        channels_last=args.channels_last,
+        no_probs=args.no_probs,
     )
     elapsed = time.time() - t0
     speed = len(files) / max(1e-9, elapsed)
