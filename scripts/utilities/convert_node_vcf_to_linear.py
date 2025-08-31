@@ -9,34 +9,6 @@ VCF COMPLIANCE:
 - Only the standard 8 columns are written (#CHROM POS ID REF ALT QUAL FILTER INFO).
 - Original node/offset are preserved in INFO as:
     NID=<node_id>;NSO=<offset>
-
-Inputs
-------
-- in_vcf : VCF where CHROM=node_id and POS=offset (plain .vcf or .vcf.gz)
-- map_json : node map (JSON array or JSONL) with fields like:
-    {
-      "node_id": "39168232",
-      "grch38_position_start": 111235483,  # 1-based
-      "strand_in_path": "+",               # "+" or "-"
-      "length": 28,
-      "chrom": "chr4",
-      ...
-    }
-  Some entries may include only {node_id, sequence}. Those can only be converted
-  if an ALT->REF TSV lets us find the corresponding REF node that *does* have a linear anchor.
-
-- tsv (optional): ALT→REF mapping, columns like
-    CHROM POS ID TYPE REF_BASE REF_NODE ALT_STR ALT_NODE(S)
-
-Usage
------
-python convert_node_vcf_to_linear.py \
-  --in_vcf node_coords.vcf.gz \
-  --map_json node_map.json \
-  --out_linear_vcf out/linear.vcf.gz \
-  --out_nodes_vcf out/unconverted_nodes.vcf.gz \
-  --tsv alt_ref_map.tsv \
-  --sort
 """
 
 import argparse
@@ -50,7 +22,7 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 from tqdm import tqdm
 
-# --- NEW: pysam for bgzip + tabix ---
+# pysam for bgzip + tabix
 try:
     import pysam
 except Exception:
@@ -216,7 +188,7 @@ def convert_vcf(
     alt_to_ref: Dict[int, int],
     offset_is_0_based: bool,
     sort_records: bool,
-    compress_level: int,
+    compress_level: int,  # kept for CLI compatibility; not used by pysam.tabix_index
     do_index: bool,
 ) -> None:
     header_lines, total = parse_vcf_header_and_count_records(in_vcf)
@@ -337,7 +309,6 @@ def convert_vcf(
             seen_node.add(sc)
             node_contigs.append(sc)
 
-    # Prepare temp plain VCF paths, then bgzip + index
     def ensure_pysam_or_die():
         if pysam is None:
             print("ERROR: pysam is required for bgzip + tabix. Install: pip install pysam (or conda -c bioconda pysam)", file=sys.stderr)
@@ -347,14 +318,20 @@ def convert_vcf(
                               records: List[Tuple],
                               contigs: List[str],
                               meta_desc: str):
-        # final_gz_path must end with .vcf.gz
+        """
+        Write a temporary plain VCF, then:
+          - if do_index=True: use pysam.tabix_index(tmp_vcf, preset='vcf', force=True, keep_original=False)
+            which auto-compresses to .vcf.gz and builds .tbi (per pysam docs).
+          - else: only compress via pysam.tabix_compress(tmp_vcf, final_gz_path, force=True)
+        Finally, move/rename to requested final_gz_path if needed.
+        """
         if not final_gz_path.endswith(".vcf.gz"):
             final_gz_path = final_gz_path + ".vcf.gz"
         os.makedirs(os.path.dirname(final_gz_path), exist_ok=True)
         tmp_vcf = final_gz_path[:-3]  # strip '.gz' -> '.vcf'
 
+        # Write plain VCF
         with open(tmp_vcf, "w", encoding="utf-8") as out:
-            # Write header (kept lines except old contigs/#CHROM)
             for h in kept_header:
                 if h.startswith("#CHROM"):
                     continue
@@ -374,36 +351,51 @@ def convert_vcf(
                     out.write(f"{chrom}\t{pos}\t{vid}\t{ref}\t{alt}\t{qual}\t{filt}\t{info}\n")
                     wbar.update(1)
 
-        # Compress + index
         ensure_pysam_or_die()
-        if os.path.exists(final_gz_path):
+
+        if do_index:
+            # Compress + index in one shot (per pysam.tabix_index doc)
+            produced_gz = pysam.tabix_index(tmp_vcf, preset="vcf", force=True, keep_original=False)
+            produced_tbi = produced_gz + ".tbi"
+
+            # If produced name differs from desired final_gz_path, rename both
+            if os.path.abspath(produced_gz) != os.path.abspath(final_gz_path):
+                try:
+                    if os.path.exists(final_gz_path):
+                        os.remove(final_gz_path)
+                except Exception:
+                    pass
+                os.replace(produced_gz, final_gz_path)
+                if os.path.exists(produced_tbi):
+                    os.replace(produced_tbi, final_gz_path + ".tbi")
+            return final_gz_path, final_gz_path + ".tbi"
+        else:
+            # Only compress (no index). Use the broadest-compatible signature.
+            if os.path.exists(final_gz_path):
+                try:
+                    os.remove(final_gz_path)
+                except Exception:
+                    pass
             try:
-                os.remove(final_gz_path)
+                pysam.tabix_compress(tmp_vcf, final_gz_path, force=True)
+            except TypeError:
+                # Very old pysam without kwargs
+                pysam.tabix_compress(tmp_vcf, final_gz_path)
+            # Remove temporary plain VCF to match keep_original=False behavior
+            try:
+                os.remove(tmp_vcf)
             except Exception:
                 pass
-        pysam.tabix_compress(tmp_vcf, final_gz_path, force=True, bgzip="bgzip", preset=None, compresslevel=compress_level)
-        if do_index:
-            pysam.tabix_index(final_gz_path, preset="vcf", force=True)
-        try:
-            os.remove(tmp_vcf)
-        except Exception:
-            pass
-        return final_gz_path, final_gz_path + ".tbi" if do_index else None
+            return final_gz_path, None
 
     # Write linear VCF.GZ
     linear_gz, linear_tbi = write_plain_and_bgzip(
-        out_linear_vcf_gz,
-        converted,
-        lin_contigs,
-        meta_desc="CONVERTED"
+        out_linear_vcf_gz, converted, lin_contigs, meta_desc="CONVERTED"
     )
 
     # Write node-form VCF.GZ
     nodes_gz, nodes_tbi = write_plain_and_bgzip(
-        out_nodes_vcf_gz,
-        unconverted,
-        node_contigs,
-        meta_desc="UNCONVERTED"
+        out_nodes_vcf_gz, unconverted, node_contigs, meta_desc="UNCONVERTED"
     )
 
     print(f"Done.\n  Linear : {os.path.abspath(linear_gz)} (records={len(converted)})"
@@ -428,7 +420,7 @@ def main():
                         help="Node starts in JSON are 1-based (default: true).")
     ap.add_argument("--sort",               action="store_true", help="Sort outputs by CHROM and POS (linear) / by node and offset (nodes).")
     ap.add_argument("--no-index",           action="store_true", help="Do not create Tabix indexes (.tbi).")
-    ap.add_argument("--compress-level",     type=int, default=6, help="BGZF compression level (1-9, default 6).")
+    ap.add_argument("--compress-level",     type=int, default=6, help="(Kept for compatibility; pysam.tabix_index does not accept level.)")
     args = ap.parse_args()
 
     # Normalize output names to end with .vcf.gz
@@ -452,7 +444,6 @@ def main():
     print(f"node_start_is_1_based : {args.node_start_is_1_based}")
     print(f"sort                  : {args.sort}")
     print(f"index                 : {not args.no_index}")
-    print(f"compress_level        : {args.compress_level}")
     print("=" * 70)
 
     alt_to_ref = load_alt_to_ref_tsv(args.tsv) if args.tsv else {}
