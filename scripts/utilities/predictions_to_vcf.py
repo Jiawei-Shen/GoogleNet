@@ -103,15 +103,6 @@ def true_prob(rec: dict) -> Optional[float]:
 def load_variant_summary_for_node(node_dir: str) -> Dict[str, dict]:
     """
     Build an index: basename(.npy) -> row dict from node_dir/variant_summary.json
-
-    Expected dict fields in rows (if present):
-      - alt_allele_frequency
-      - coverage_at_locus
-      - ref_allele_count_at_locus
-      - alt_allele_count
-      - other_allele_count_at_locus
-      - mean_alt_allele_base_quality
-      - tensor_file or variant_key
     """
     idx: Dict[str, dict] = {}
     path = os.path.join(node_dir, "variant_summary.json")
@@ -275,7 +266,6 @@ def main():
     ap.add_argument("--refcall_prob", type=float, default=None,
                     help="Also include non-true predictions with prob>=this, labeled FILTER=RefCall")
     ap.add_argument("--no-index", action="store_true", help="Do not create a Tabix index (.tbi)")
-    ap.add_argument("--compress-level", type=int, default=6, help="BGZF compression level (1-9, default 6)")
     args = ap.parse_args()
 
     print("=== VCF Build Configuration ===")
@@ -319,7 +309,7 @@ def main():
     out_dir = os.path.dirname(out_user)
     os.makedirs(out_dir, exist_ok=True)
 
-    # We'll write a temporary plain VCF, then bgzip -> .vcf.gz, then tabix.
+    # We'll write a temporary plain VCF, then use pysam.tabix_index to auto-compress+index.
     base_no_ext = out_user
     if out_user.endswith(".vcf.gz"):
         base_no_ext = out_user[:-3]   # strip ".gz" -> ".vcf"
@@ -329,8 +319,6 @@ def main():
         base_no_ext = out_user + ".vcf"
 
     tmp_vcf_path = base_no_ext
-    final_vcf_gz = base_no_ext if base_no_ext.endswith(".vcf.gz") else base_no_ext + ".gz"
-    final_tbi = final_vcf_gz + ".tbi"
 
     # Write plain VCF
     with open(tmp_vcf_path, "w", encoding="utf-8") as out:
@@ -362,35 +350,42 @@ def main():
 
     print(f"Plain VCF written: {tmp_vcf_path} (records={len(records)}, scanned={total_in}, kept_out={kept_out})")
 
-    # BGZF compress -> .vcf.gz
+    # Compress + (optionally) index using pysam.tabix_index (auto-compress per docstring you provided)
     ensure_pysam_or_die()
-    if os.path.exists(final_vcf_gz):
-        try:
-            os.remove(final_vcf_gz)
-        except Exception:
-            pass
-    print(f"Compressing to BGZF: {final_vcf_gz} ...")
-    pysam.tabix_compress(tmp_vcf_path, final_vcf_gz, force=True, bgzip="bgzip", preset=None, compresslevel=args.compress_level)
-
-    # Index if requested
     if want_index:
-        print(f"Indexing (Tabix) → {final_tbi} ...")
-        pysam.tabix_index(final_vcf_gz, preset="vcf", force=True)
-
-    # If user asked for .vcf.gz in output, keep only compressed; otherwise leave both.
-    if out_user.endswith(".vcf.gz"):
-        if os.path.abspath(final_vcf_gz) != os.path.abspath(out_user):
-            try:
-                os.replace(final_vcf_gz, out_user)
-                final_vcf_gz = out_user
-                old_tbi = final_tbi
-                final_tbi = out_user + ".tbi"
-                if os.path.exists(old_tbi):
-                    os.replace(old_tbi, final_tbi)
-            except Exception:
-                pass
+        print(f"Compressing + indexing with pysam.tabix_index: {tmp_vcf_path} ...")
+        final_vcf_gz = pysam.tabix_index(
+            tmp_vcf_path,
+            preset="vcf",
+            force=True,
+            keep_original=False
+        )
+        final_tbi = final_vcf_gz + ".tbi"
+    else:
+        # Only compress, no index — use the broadest-compatible signature
+        final_vcf_gz = base_no_ext if base_no_ext.endswith(".vcf.gz") else base_no_ext + ".gz"
+        print(f"Compressing with pysam.tabix_compress (no index): {final_vcf_gz} ...")
+        try:
+            pysam.tabix_compress(tmp_vcf_path, final_vcf_gz, force=True)
+        except TypeError:
+            # Very old pysam (no kwargs)
+            pysam.tabix_compress(tmp_vcf_path, final_vcf_gz)
+        final_tbi = None
+        # Remove the plain VCF to mirror keep_original=False behavior
         try:
             os.remove(tmp_vcf_path)
+        except Exception:
+            pass
+
+    # If caller explicitly asked for .vcf.gz, ensure final path matches exactly
+    out_user_is_gz = out_user.endswith(".vcf.gz")
+    if out_user_is_gz and os.path.abspath(final_vcf_gz) != os.path.abspath(out_user):
+        try:
+            os.replace(final_vcf_gz, out_user)
+            if final_tbi and os.path.exists(final_tbi):
+                os.replace(final_tbi, out_user + ".tbi")
+            final_vcf_gz = out_user
+            final_tbi = out_user + ".tbi" if want_index else None
         except Exception:
             pass
 

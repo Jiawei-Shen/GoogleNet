@@ -2,17 +2,17 @@
 """
 Convert a node/offset VCF to linear-reference coordinates and write TWO outputs:
 
-  1) --out_linear_vcf : records successfully converted to linear (CHROM=chr*, POS=linear)
-  2) --out_nodes_vcf  : records that stayed in node form (CHROM=node_id, POS=offset)
+  1) --out_linear_vcf.gz : records successfully converted to linear (CHROM=chr*, POS=linear)
+  2) --out_nodes_vcf.gz  : records that stayed in node form (CHROM=node_id, POS=offset)
 
 VCF COMPLIANCE:
 - Only the standard 8 columns are written (#CHROM POS ID REF ALT QUAL FILTER INFO).
 - Original node/offset are preserved in INFO as:
-    ORIG_NODE=<node_id>;ORIG_OFFSET=<offset>
+    NID=<node_id>;NSO=<offset>
 
 Inputs
 ------
-- in_vcf : VCF where CHROM=node_id and POS=offset
+- in_vcf : VCF where CHROM=node_id and POS=offset (plain .vcf or .vcf.gz)
 - map_json : node map (JSON array or JSONL) with fields like:
     {
       "node_id": "39168232",
@@ -31,23 +31,30 @@ Inputs
 Usage
 -----
 python convert_node_vcf_to_linear.py \
-  --in_vcf node_coords.vcf \
+  --in_vcf node_coords.vcf.gz \
   --map_json node_map.json \
-  --out_linear_vcf out/linear.vcf \
-  --out_nodes_vcf out/unconverted_nodes.vcf \
+  --out_linear_vcf out/linear.vcf.gz \
+  --out_nodes_vcf out/unconverted_nodes.vcf.gz \
   --tsv alt_ref_map.tsv \
   --sort
 """
 
 import argparse
 import csv
+import gzip
 import json
 import os
 import re
 import sys
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 from tqdm import tqdm
+
+# --- NEW: pysam for bgzip + tabix ---
+try:
+    import pysam
+except Exception:
+    pysam = None
 
 
 # ------------------------ TSV (ALT->REF) mapping ------------------------ #
@@ -173,10 +180,15 @@ def load_node_map(json_path: str,
 
 # ------------------------ VCF helpers ------------------------ #
 
+def open_maybe_gzip(path: str):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, "r", encoding="utf-8")
+
 def parse_vcf_header_and_count_records(vcf_path: str) -> Tuple[List[str], int]:
     header: List[str] = []
     n = 0
-    with open(vcf_path, "r", encoding="utf-8") as f:
+    with open_maybe_gzip(vcf_path) as f:
         for line in f:
             if line.startswith("#"):
                 header.append(line.rstrip("\n"))
@@ -197,13 +209,15 @@ def append_info(info: str, kv_pairs: List[Tuple[str, str]]) -> str:
 
 def convert_vcf(
     in_vcf: str,
-    out_linear_vcf: str,
-    out_nodes_vcf: str,
+    out_linear_vcf_gz: str,
+    out_nodes_vcf_gz: str,
     anchors: Dict[int, Tuple[str, int, str, int]],
     nodes_seen_in_json: set,
     alt_to_ref: Dict[int, int],
     offset_is_0_based: bool,
     sort_records: bool,
+    compress_level: int,
+    do_index: bool,
 ) -> None:
     header_lines, total = parse_vcf_header_and_count_records(in_vcf)
 
@@ -211,10 +225,10 @@ def convert_vcf(
     kept_header = [h for h in header_lines if not h.startswith("##contig=") and not h.startswith("#CHROM")]
 
     converted: List[Tuple[str, int, str, str, str, str, str]] = []
-    unconverted: List[Tuple[str, int, str, str, str, str, str]] = []
+    unconverted: List[Tuple[Union[str,int], Union[str,int], str, str, str, str, str]] = []
     # tuples: (CHROM, POS, ID, REF, ALT, QUAL, FILTER, INFO)
 
-    with open(in_vcf, "r", encoding="utf-8") as fin, \
+    with open_maybe_gzip(in_vcf) as fin, \
          tqdm(total=total if total > 0 else None, desc="Convert", unit="rec",
               dynamic_ncols=True, leave=True) as bar:
 
@@ -223,7 +237,8 @@ def convert_vcf(
                 continue
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 8:
-                bar.update(1 if total else 0)
+                if total:
+                    bar.update(1)
                 continue
 
             chrom_node = parts[0]
@@ -240,11 +255,11 @@ def convert_vcf(
                 node_id = int(chrom_node)
                 offset  = int(pos_offset)
             except Exception:
-                # Not a node-form record; keep as unconverted but preserve original in INFO
-                info2 = append_info(info, [("ORIG_NODE", chrom_node), ("ORIG_OFFSET", pos_offset)])
-                unconverted.append((chrom_node, int(pos_offset) if str(pos_offset).isdigit() else pos_offset,
-                                    vid, ref, alt, qual, filt, info2))
-                bar.update(1 if total else 0)
+                # Not a node-form record; keep as unconverted but preserve original as NID/NSO
+                info2 = append_info(info, [("NID", str(chrom_node)), ("NSO", str(pos_offset))])
+                unconverted.append((chrom_node, pos_offset, vid, ref, alt, qual, filt, info2))
+                if total:
+                    bar.update(1)
                 continue
 
             base_node = node_id
@@ -261,13 +276,14 @@ def convert_vcf(
             if anchor is None and base_node in nodes_seen_in_json and ref_node_candidate is not None:
                 anchor = anchors.get(ref_node_candidate)
 
-            # Always preserve original coords in INFO
-            info2 = append_info(info, [("ORIG_NODE", str(node_id)), ("ORIG_OFFSET", str(offset))])
+            # Always preserve original coords in INFO as NID/NSO
+            info2 = append_info(info, [("NID", str(node_id)), ("NSO", str(offset))])
 
             if anchor is None:
                 # Could not convert — keep in node coords
                 unconverted.append((str(node_id), int(offset), vid, ref, alt, qual, filt, info2))
-                bar.update(1 if total else 0)
+                if total:
+                    bar.update(1)
                 continue
 
             chrom_lin, start0, strand, length = anchor
@@ -280,22 +296,30 @@ def convert_vcf(
                 pos_lin = start0 + (length - 1 - off0) + 1
 
             converted.append((chrom_lin, int(pos_lin), vid, ref, alt, qual, filt, info2))
-            bar.update(1 if total else 0)
+            if total:
+                bar.update(1)
 
-    # Optional sort (linear output)
-    if sort_records:
-        def chrom_key(c: str):
+    # Sort if requested or if indexing is requested (tabix requires sorted)
+    need_sort = sort_records or do_index
+    if need_sort:
+        def chrom_key_linear(c: str):
             m = re.fullmatch(r"(?:chr)?(\d+)", c, flags=re.IGNORECASE)
             if m:
                 return (0, int(m.group(1)))
-            if c.lower() in ("chrx", "x"):
-                return (1, 23)
-            if c.lower() in ("chry", "y"):
-                return (1, 24)
-            if c.lower() in ("chrm", "chrmt", "m", "mt"):
-                return (1, 25)
-            return (2, c.lower())
-        converted.sort(key=lambda r: (chrom_key(r[0]), int(r[1])))
+            cl = c.lower()
+            if cl in ("chrx", "x"): return (1, 23)
+            if cl in ("chry", "y"): return (1, 24)
+            if cl in ("chrm", "chrmt", "m", "mt"): return (1, 25)
+            return (2, cl)
+        converted.sort(key=lambda r: (chrom_key_linear(r[0]), int(r[1])))
+
+        def chrom_key_nodes(c: Union[str,int]):
+            try:
+                # numeric node IDs first
+                return (0, int(c))
+            except Exception:
+                return (1, str(c))
+        unconverted.sort(key=lambda r: (chrom_key_nodes(r[0]), int(r[1]) if str(r[1]).isdigit() else 0))
 
     # Collect contigs for each output
     lin_contigs = []
@@ -313,78 +337,122 @@ def convert_vcf(
             seen_node.add(sc)
             node_contigs.append(sc)
 
-    # Write LINEAR VCF (8 columns; ORIG_* stored in INFO)
-    os.makedirs(os.path.dirname(out_linear_vcf), exist_ok=True)
-    with open(out_linear_vcf, "w", encoding="utf-8") as out:
-        for h in kept_header:
-            if h.startswith("#CHROM"):
-                continue
-            out.write(h + "\n")
+    # Prepare temp plain VCF paths, then bgzip + index
+    def ensure_pysam_or_die():
+        if pysam is None:
+            print("ERROR: pysam is required for bgzip + tabix. Install: pip install pysam (or conda -c bioconda pysam)", file=sys.stderr)
+            sys.exit(2)
 
-        out.write('##META=<ID=CONVERTED,Description="CHROM/POS converted from node_id/offset using node map and optional ALT->REF TSV; ORIG_NODE/ORIG_OFFSET kept in INFO.">\n')
-        out.write('##INFO=<ID=ORIG_NODE,Number=1,Type=String,Description="Original node_id (CHROM in input)">\n')
-        out.write('##INFO=<ID=ORIG_OFFSET,Number=1,Type=String,Description="Original starting offset (POS in input)">\n')
-        for c in lin_contigs:
-            out.write(f"##contig=<ID={c}>\n")
+    def write_plain_and_bgzip(final_gz_path: str,
+                              records: List[Tuple],
+                              contigs: List[str],
+                              meta_desc: str):
+        # final_gz_path must end with .vcf.gz
+        if not final_gz_path.endswith(".vcf.gz"):
+            final_gz_path = final_gz_path + ".vcf.gz"
+        os.makedirs(os.path.dirname(final_gz_path), exist_ok=True)
+        tmp_vcf = final_gz_path[:-3]  # strip '.gz' -> '.vcf'
 
-        out.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+        with open(tmp_vcf, "w", encoding="utf-8") as out:
+            # Write header (kept lines except old contigs/#CHROM)
+            for h in kept_header:
+                if h.startswith("#CHROM"):
+                    continue
+                out.write(h + "\n")
 
-        with tqdm(total=len(converted), desc="Write linear", unit="rec", dynamic_ncols=True, leave=True) as wbar:
-            for chrom, pos, vid, ref, alt, qual, filt, info in converted:
-                out.write(f"{chrom}\t{pos}\t{vid}\t{ref}\t{alt}\t{qual}\t{filt}\t{info}\n")
-                wbar.update(1)
+            out.write('##fileformat=VCFv4.2\n')
+            out.write(f'##META=<ID={meta_desc},Description="Converted using node map and optional ALT->REF TSV; NID/NSO store original node and offset.">\n')
+            out.write('##INFO=<ID=NID,Number=1,Type=String,Description="Original node_id (CHROM in input)">\n')
+            out.write('##INFO=<ID=NSO,Number=1,Type=String,Description="Original starting offset (POS in input)">\n')
+            for c in contigs:
+                out.write(f"##contig=<ID={c}>\n")
+            out.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
 
-    # Write NODE-FORM VCF (still 8 columns; ORIG_* also in INFO for consistency)
-    os.makedirs(os.path.dirname(out_nodes_vcf), exist_ok=True)
-    with open(out_nodes_vcf, "w", encoding="utf-8") as out:
-        for h in kept_header:
-            if h.startswith("#CHROM"):
-                continue
-            out.write(h + "\n")
+            with tqdm(total=len(records), desc=f"Write {meta_desc}", unit="rec",
+                      dynamic_ncols=True, leave=True) as wbar:
+                for chrom, pos, vid, ref, alt, qual, filt, info in records:
+                    out.write(f"{chrom}\t{pos}\t{vid}\t{ref}\t{alt}\t{qual}\t{filt}\t{info}\n")
+                    wbar.update(1)
 
-        out.write('##META=<ID=UNCONVERTED,Description="Records that remained in node/offset coordinates; ORIG_NODE/ORIG_OFFSET kept in INFO.">\n')
-        out.write('##INFO=<ID=ORIG_NODE,Number=1,Type=String,Description="Original node_id (CHROM in input)">\n')
-        out.write('##INFO=<ID=ORIG_OFFSET,Number=1,Type=String,Description="Original starting offset (POS in input)">\n')
-        for c in node_contigs:
-            out.write(f"##contig=<ID={c}>\n")
+        # Compress + index
+        ensure_pysam_or_die()
+        if os.path.exists(final_gz_path):
+            try:
+                os.remove(final_gz_path)
+            except Exception:
+                pass
+        pysam.tabix_compress(tmp_vcf, final_gz_path, force=True, bgzip="bgzip", preset=None, compresslevel=compress_level)
+        if do_index:
+            pysam.tabix_index(final_gz_path, preset="vcf", force=True)
+        try:
+            os.remove(tmp_vcf)
+        except Exception:
+            pass
+        return final_gz_path, final_gz_path + ".tbi" if do_index else None
 
-        out.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+    # Write linear VCF.GZ
+    linear_gz, linear_tbi = write_plain_and_bgzip(
+        out_linear_vcf_gz,
+        converted,
+        lin_contigs,
+        meta_desc="CONVERTED"
+    )
 
-        with tqdm(total=len(unconverted), desc="Write nodes", unit="rec", dynamic_ncols=True, leave=True) as wbar:
-            for chrom, pos, vid, ref, alt, qual, filt, info in unconverted:
-                out.write(f"{chrom}\t{pos}\t{vid}\t{ref}\t{alt}\t{qual}\t{filt}\t{info}\n")
-                wbar.update(1)
+    # Write node-form VCF.GZ
+    nodes_gz, nodes_tbi = write_plain_and_bgzip(
+        out_nodes_vcf_gz,
+        unconverted,
+        node_contigs,
+        meta_desc="UNCONVERTED"
+    )
 
-    print(f"Done. Linear: {os.path.abspath(out_linear_vcf)} (records={len(converted)}), "
-          f"Unconverted: {os.path.abspath(out_nodes_vcf)} (records={len(unconverted)})")
+    print(f"Done.\n  Linear : {os.path.abspath(linear_gz)} (records={len(converted)})"
+          f"{'' if not linear_tbi else f'  [index: {os.path.abspath(linear_tbi)}]'}\n"
+          f"  Nodes  : {os.path.abspath(nodes_gz)} (records={len(unconverted)})"
+          f"{'' if not nodes_tbi else f'  [index: {os.path.abspath(nodes_tbi)}]'}")
 
 
 # ------------------------ CLI ------------------------ #
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert node/offset VCF to linear-reference coordinates; output linear + node VCFs (VCF-compliant).")
-    ap.add_argument("--in_vcf",        required=True, help="Input VCF (CHROM=node_id, POS=offset).")
-    ap.add_argument("--map_json",      required=True, help="Node map JSON (array) or JSONL.")
-    ap.add_argument("--map_jsonl",     action="store_true", help="Interpret --map_json as JSONL.")
-    ap.add_argument("--tsv",           default=None, help="Optional TSV mapping ALT_NODE(S) -> REF_NODE.")
-    ap.add_argument("--out_linear_vcf",required=True, help="Output VCF with linear CHROM/POS; ORIG_NODE/ORIG_OFFSET in INFO.")
-    ap.add_argument("--out_nodes_vcf", required=True, help="Output VCF that stayed in node form; ORIG_NODE/ORIG_OFFSET in INFO.")
-    ap.add_argument("--offset_is_0_based", type=lambda s: str(s).lower() in ("1","true","t","yes","y"), default=True,
-                    help="Offsets in input VCF are 0-based (default: true). Set false if 1-based.")
+    ap = argparse.ArgumentParser(description="Convert node/offset VCF to linear-reference coordinates; output linear + node VCF.GZ (tabix-indexed).")
+    ap.add_argument("--in_vcf",             required=True, help="Input VCF (.vcf or .vcf.gz) with CHROM=node_id, POS=offset.")
+    ap.add_argument("--map_json",           required=True, help="Node map JSON (array) or JSONL.")
+    ap.add_argument("--map_jsonl",          action="store_true", help="Interpret --map_json as JSONL.")
+    ap.add_argument("--tsv",                default=None, help="Optional TSV mapping ALT_NODE(S) -> REF_NODE.")
+    ap.add_argument("--out_linear_vcf",     required=True, help="Output path for linear VCF.GZ (will be bgzip compressed and indexed).")
+    ap.add_argument("--out_nodes_vcf",      required=True, help="Output path for node-form VCF.GZ (will be bgzip compressed and indexed).")
+    ap.add_argument("--offset_is_0_based",  type=lambda s: str(s).lower() in ("1","true","t","yes","y"), default=True,
+                        help="Offsets in input VCF are 0-based (default: true). Set false if 1-based.")
     ap.add_argument("--node_start_is_1_based", type=lambda s: str(s).lower() in ("1","true","t","yes","y"), default=True,
-                    help="Node starts in JSON are 1-based (default: true).")
-    ap.add_argument("--sort",          action="store_true", help="Sort the linear output by CHROM and POS.")
+                        help="Node starts in JSON are 1-based (default: true).")
+    ap.add_argument("--sort",               action="store_true", help="Sort outputs by CHROM and POS (linear) / by node and offset (nodes).")
+    ap.add_argument("--no-index",           action="store_true", help="Do not create Tabix indexes (.tbi).")
+    ap.add_argument("--compress-level",     type=int, default=6, help="BGZF compression level (1-9, default 6).")
     args = ap.parse_args()
+
+    # Normalize output names to end with .vcf.gz
+    def normalize_vcfgz(p: str) -> str:
+        if p.endswith(".vcf.gz"):
+            return p
+        if p.endswith(".vcf"):
+            return p + ".gz"
+        return p + ".vcf.gz"
+
+    out_linear_vcf_gz = normalize_vcfgz(args.out_linear_vcf)
+    out_nodes_vcf_gz  = normalize_vcfgz(args.out_nodes_vcf)
 
     print("=== Convert VCF Configuration ===")
     print(f"in_vcf                : {os.path.abspath(args.in_vcf)}")
     print(f"map_json              : {os.path.abspath(args.map_json)} (jsonl={bool(args.map_jsonl)})")
     print(f"tsv (ALT->REF mapping): {os.path.abspath(args.tsv) if args.tsv else '(none)'}")
-    print(f"out_linear_vcf        : {os.path.abspath(args.out_linear_vcf)}")
-    print(f"out_nodes_vcf         : {os.path.abspath(args.out_nodes_vcf)}")
+    print(f"out_linear_vcf.gz     : {os.path.abspath(out_linear_vcf_gz)}")
+    print(f"out_nodes_vcf.gz      : {os.path.abspath(out_nodes_vcf_gz)}")
     print(f"offset_is_0_based     : {args.offset_is_0_based}")
     print(f"node_start_is_1_based : {args.node_start_is_1_based}")
     print(f"sort                  : {args.sort}")
+    print(f"index                 : {not args.no_index}")
+    print(f"compress_level        : {args.compress_level}")
     print("=" * 70)
 
     alt_to_ref = load_alt_to_ref_tsv(args.tsv) if args.tsv else {}
@@ -400,13 +468,15 @@ def main():
 
     convert_vcf(
         in_vcf=args.in_vcf,
-        out_linear_vcf=args.out_linear_vcf,
-        out_nodes_vcf=args.out_nodes_vcf,
+        out_linear_vcf_gz=out_linear_vcf_gz,
+        out_nodes_vcf_gz=out_nodes_vcf_gz,
         anchors=anchors,
         nodes_seen_in_json=nodes_seen,
         alt_to_ref=alt_to_ref,
         offset_is_0_based=args.offset_is_0_based,
-        sort_records=args.sort
+        sort_records=args.sort,
+        compress_level=args.compress_level,
+        do_index=(not args.no_index),
     )
 
 
