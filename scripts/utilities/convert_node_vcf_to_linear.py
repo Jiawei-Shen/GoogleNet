@@ -194,7 +194,12 @@ def convert_vcf(
     header_lines, total = parse_vcf_header_and_count_records(in_vcf)
 
     # Keep meta lines except old contigs and #CHROM header; we'll write our own.
-    kept_header = [h for h in header_lines if not h.startswith("##contig=") and not h.startswith("#CHROM")]
+    kept_header = [
+        h for h in header_lines
+        if not h.startswith("##contig=")
+           and not h.startswith("#CHROM")
+           and not h.startswith("##fileformat")
+    ]
 
     converted: List[Tuple[str, int, str, str, str, str, str]] = []
     unconverted: List[Tuple[Union[str,int], Union[str,int], str, str, str, str, str]] = []
