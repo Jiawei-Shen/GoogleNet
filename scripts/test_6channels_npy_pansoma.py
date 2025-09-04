@@ -194,7 +194,7 @@ def run_inference(model, dl, device, class_names: List[str],
     with tqdm(total=total_files, desc="Infer", unit="file", dynamic_ncols=True, leave=True) as bar:
         with torch.no_grad():
             for images, paths in dl:
-                images = images.to(device)
+                images = images.to(device, non_blocking=True)
                 outputs = model(images)
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
