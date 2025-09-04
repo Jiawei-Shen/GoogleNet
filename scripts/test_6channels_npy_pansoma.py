@@ -342,37 +342,37 @@ def run_inference(
                     outputs = outputs[0]
 
             probs = torch.softmax(outputs, dim=1)
-            top_prob, top_idx = probs.max(dim=1)
+            # top_prob, top_idx = probs.max(dim=1)
 
-            if no_probs:
-                # Transfer minimal data: only top1 index + prob
-                top_prob_l = top_prob.float().cpu().tolist()
-                top_idx_l = top_idx.int().cpu().tolist()
-                for i, pth in enumerate(paths):
-                    pred_idx = int(top_idx_l[i])
-                    pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
-                    results.append({
-                        "path": pth,
-                        "pred_idx": pred_idx,
-                        "pred_class": pred_name,
-                        "pred_prob": float(top_prob_l[i]),
-                    })
-            else:
-                # Bring full probs once per batch (float16 to reduce PCIe bandwidth)
-                probs_cpu = probs.to(dtype=torch.float16).cpu().numpy()
-                top_idx_cpu = top_idx.int().cpu().numpy()
-                top_prob_cpu = top_prob.float().cpu().numpy()
-                for i, pth in enumerate(paths):
-                    pred_idx = int(top_idx_cpu[i])
-                    pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
-                    prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
-                    results.append({
-                        "path": pth,
-                        "pred_idx": pred_idx,
-                        "pred_class": pred_name,
-                        "pred_prob": float(top_prob_cpu[i]),
-                        "probs": prob_dict
-                    })
+            # if no_probs:
+            #     # Transfer minimal data: only top1 index + prob
+            #     top_prob_l = top_prob.float().cpu().tolist()
+            #     top_idx_l = top_idx.int().cpu().tolist()
+            #     for i, pth in enumerate(paths):
+            #         pred_idx = int(top_idx_l[i])
+            #         pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
+            #         results.append({
+            #             "path": pth,
+            #             "pred_idx": pred_idx,
+            #             "pred_class": pred_name,
+            #             "pred_prob": float(top_prob_l[i]),
+            #         })
+            # else:
+            #     # Bring full probs once per batch (float16 to reduce PCIe bandwidth)
+            #     probs_cpu = probs.to(dtype=torch.float16).cpu().numpy()
+            #     top_idx_cpu = top_idx.int().cpu().numpy()
+            #     top_prob_cpu = top_prob.float().cpu().numpy()
+            #     for i, pth in enumerate(paths):
+            #         pred_idx = int(top_idx_cpu[i])
+            #         pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
+            #         prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
+            #         results.append({
+            #             "path": pth,
+            #             "pred_idx": pred_idx,
+            #             "pred_class": pred_name,
+            #             "pred_prob": float(top_prob_cpu[i]),
+            #             "probs": prob_dict
+            #         })
 
             processed += len(paths)
             bar.update(len(paths))
