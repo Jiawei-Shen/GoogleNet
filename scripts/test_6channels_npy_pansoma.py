@@ -341,7 +341,7 @@ def run_inference(
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
 
-            probs = torch.softmax(outputs, dim=1)
+            # probs = torch.softmax(outputs, dim=1)
             # top_prob, top_idx = probs.max(dim=1)
 
             # if no_probs:
