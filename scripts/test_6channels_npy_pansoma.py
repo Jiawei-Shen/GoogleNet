@@ -196,7 +196,8 @@ def run_inference(model, dl, device, class_names: List[str],
             for images, paths in dl:
                 images = images.to(device, non_blocking=True)
                 outputs = model(images)
-                if isinstance(outputs, tuple): outputs = outputs[0]
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]
 
                 probs = torch.softmax(outputs, dim=1)
                 top_prob, top_idx = probs.max(dim=1)
