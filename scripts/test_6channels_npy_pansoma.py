@@ -2,21 +2,10 @@
 """
 Fast batch inference over a directory of .npy files (recursively).
 
-Key speedups:
-  • Normalize on device (GPU if available), not in __getitem__
-  • Optional channels_last + fp16/TF32 + torch.compile
-  • Overlap host→device copies with compute via a small prefetcher
-  • Avoid large CPU transfers: compute softmax/top1 on GPU, optionally skip per-class probs
-  • Keep NumPy/BLAS single-threaded in workers to avoid oversubscription
-
-Examples:
-    python infer_npy_dir.py \
-      --input_dir /path/to/npy_root \
-      --ckpt /path/to/model_best.pth \
-      --output_csv preds.csv \
-      --output_json preds.json \
-      --batch_size 256 --num_workers 8 --mmap \
-      --channels_last --fp16 --compile --no_probs
+Revisions in this version:
+  • Normalization is done in the Dataset via transforms.Normalize (CHW)
+  • Inference loop is a simple for-loop over the DataLoader (no _to_device, no CUDA stream)
+  • Keeps fp16, channels_last, optional torch.compile, mmap, etc.
 """
 
 import argparse
@@ -203,11 +192,13 @@ class NpyDirDataset(Dataset):
         channels: int,
         tile_single_channel: bool = False,
         mmap: bool = False,
+        transform=None,  # Normalize here to match latest loader style
     ):
         self.files = files
         self.channels = channels
         self.tile_single_channel = tile_single_channel
         self.mmap = mmap
+        self.transform = transform
 
         if self.channels != 6:
             raise ValueError(f"inference expects 6 channels to match training/val; got {self.channels}")
@@ -219,7 +210,9 @@ class NpyDirDataset(Dataset):
         path = self.files[idx]
         arr = np.load(path, allow_pickle=False, mmap_mode=('r' if self.mmap else None))
         chw = ensure_chw(arr, self.channels, tile_single_channel=self.tile_single_channel)
-        t = torch.from_numpy(chw).float()  # CHW float32 on CPU; normalization happens later (device-specific)
+        t = torch.from_numpy(chw).float()  # CHW float32 on CPU
+        if self.transform is not None:
+            t = self.transform(t)          # Apply normalization on CPU
         return t, path
 
 
@@ -280,99 +273,59 @@ def run_inference(
     no_probs: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Single-line flashing progress using one tqdm bar (total = number of files).
-    Normalize on-device; compute softmax and top1 on-device; transfer minimal data.
+    Simple, fast inference loop:
+      • Inputs are already normalized by Dataset transform
+      • Moves data to device inline (no _to_device helper, no CUDA stream)
+      • Tracks progress with tqdm
     """
     use_amp = (fp16 and device.type == "cuda")
-
-    # mean/std prepared on the active device for broadcast (6,1,1)
-    mean = VAL_MEAN.view(6, 1, 1).to(device)
-    std = VAL_STD.view(6, 1, 1).to(device)
-
-    # Dedicated CUDA stream for prefetching
-    stream = torch.cuda.Stream() if device.type == "cuda" else None
-
-    def _to_device(batch_cpu):
-        images_cpu, paths = batch_cpu
-        if device.type != "cuda":
-            # CPU path: normalize on CPU to keep parity
-            x = images_cpu
-            x = (x - mean.cpu()) / std.cpu()
-            return x, paths
-        # CUDA path: stage copy & normalize on a separate stream
-        with torch.cuda.stream(stream):
-            x = images_cpu.to(device, non_blocking=True)
-            if channels_last:
-                x = x.to(memory_format=torch.channels_last)
-            if use_amp:
-                x = x.half()
-            x = (x - mean) / std
-        return x, paths
-
-    # Prime first batch
-    it = iter(dl)
-    try:
-        next_x, next_paths = _to_device(next(it))
-    except StopIteration:
-        return []
-
-    if device.type == "cuda":
-        torch.cuda.current_stream().wait_stream(stream)
 
     results: List[Dict[str, Any]] = []
     processed = 0
     t0 = time.time()
 
     with tqdm(total=total_files, desc="Infer", unit="file", dynamic_ncols=True, leave=True) as bar:
-        while True:
-            x, paths = next_x, next_paths
+        for images, paths in dl:
+            images = images.to(device, non_blocking=True)
+            if channels_last:
+                images = images.to(memory_format=torch.channels_last)
+            if use_amp:
+                images = images.half()
 
-            # Kick off prefetch of the next batch ASAP
-            try:
-                next_x, next_paths = _to_device(next(it))
-            except StopIteration:
-                next_x, next_paths = None, None
+            outputs = model(images)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
 
-            if device.type == "cuda" and stream is not None:
-                torch.cuda.current_stream().wait_stream(stream)
+            probs = torch.softmax(outputs, dim=1)
+            top_prob, top_idx = probs.max(dim=1)
 
-            with (torch.cuda.amp.autocast() if use_amp else torch.no_grad()):
-                outputs = model(x)
-                if isinstance(outputs, tuple):
-                    outputs = outputs[0]
-
-            # probs = torch.softmax(outputs, dim=1)
-            # top_prob, top_idx = probs.max(dim=1)
-
-            # if no_probs:
-            #     # Transfer minimal data: only top1 index + prob
-            #     top_prob_l = top_prob.float().cpu().tolist()
-            #     top_idx_l = top_idx.int().cpu().tolist()
-            #     for i, pth in enumerate(paths):
-            #         pred_idx = int(top_idx_l[i])
-            #         pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
-            #         results.append({
-            #             "path": pth,
-            #             "pred_idx": pred_idx,
-            #             "pred_class": pred_name,
-            #             "pred_prob": float(top_prob_l[i]),
-            #         })
-            # else:
-            #     # Bring full probs once per batch (float16 to reduce PCIe bandwidth)
-            #     probs_cpu = probs.to(dtype=torch.float16).cpu().numpy()
-            #     top_idx_cpu = top_idx.int().cpu().numpy()
-            #     top_prob_cpu = top_prob.float().cpu().numpy()
-            #     for i, pth in enumerate(paths):
-            #         pred_idx = int(top_idx_cpu[i])
-            #         pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
-            #         prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
-            #         results.append({
-            #             "path": pth,
-            #             "pred_idx": pred_idx,
-            #             "pred_class": pred_name,
-            #             "pred_prob": float(top_prob_cpu[i]),
-            #             "probs": prob_dict
-            #         })
+            if no_probs:
+                top_prob_l = top_prob.float().cpu().tolist()
+                top_idx_l = top_idx.int().cpu().tolist()
+                for i, pth in enumerate(paths):
+                    pred_idx = int(top_idx_l[i])
+                    pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
+                    results.append({
+                        "path": pth,
+                        "pred_idx": pred_idx,
+                        "pred_class": pred_name,
+                        "pred_prob": float(top_prob_l[i]),
+                    })
+            else:
+                probs_cpu = probs.to(dtype=torch.float16).cpu().numpy()
+                top_idx_cpu = top_idx.int().cpu().numpy()
+                top_prob_cpu = top_prob.float().cpu().numpy()
+                for i, pth in enumerate(paths):
+                    pred_idx = int(top_idx_cpu[i])
+                    pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
+                    prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
+                    results.append({
+                        "path": pth,
+                        "pred_idx": pred_idx,
+                        "pred_class": pred_name,
+                        "pred_prob": float(top_prob_cpu[i]),
+                        "probs": prob_dict
+                    })
 
             processed += len(paths)
             bar.update(len(paths))
@@ -380,9 +333,6 @@ def run_inference(
             speed = processed / max(1e-9, elapsed)
             eta = (total_files - processed) / max(1e-9, speed)
             bar.set_postfix_str(f"speed={speed:.1f} file/s ETA={_format_eta(eta)}")
-
-            if next_x is None:
-                break
 
     return results
 
@@ -397,7 +347,6 @@ def write_outputs(results: List[Dict[str, Any]], csv_path: str, json_path: str) 
     # CSV
     if csv_path:
         import csv
-        # Determine if any record has 'probs'
         any_probs = any(("probs" in r) for r in results)
         header = ["path", "pred_idx", "pred_class", "pred_prob"]
         class_cols = []
@@ -424,7 +373,7 @@ def write_outputs(results: List[Dict[str, Any]], csv_path: str, json_path: str) 
 # ----------------------------- Main ------------------------------------------ #
 
 def main():
-    parser = argparse.ArgumentParser(description="Infer over .npy files with ConvNeXtCBAMClassifier (fast path).")
+    parser = argparse.ArgumentParser(description="Infer over .npy files with ConvNeXtCBAMClassifier (Dataset-normalized).")
     parser.add_argument("--input_dir", required=True, type=str, help="Root dir to scan for .npy files")
     parser.add_argument("--ckpt", required=True, type=str, help="Path to checkpoint .pth")
     parser.add_argument("--output_csv", default="predictions.csv", type=str, help="CSV output path (or '' to skip)")
@@ -523,28 +472,26 @@ def main():
         sample_info_k=max(0, args.sample_info_k),
     )
 
-    # Dataset & DataLoader
+    # --------- Build transform & DataLoader (normalization IN the dataset) ---------
+    from torchvision import transforms
+    norm_transform = transforms.Normalize(mean=VAL_MEAN.tolist(), std=VAL_STD.tolist())
+
     ds = NpyDirDataset(
         files=files,
         channels=in_channels,
         tile_single_channel=args.tile_single_channel,
         mmap=args.mmap,
+        transform=norm_transform,  # normalization here
     )
     dl = DataLoader(
         ds,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=(args.num_workers > 0),
-        prefetch_factor=(4 if args.num_workers > 0 else None),
         shuffle=False,
-        drop_last=False,
-        worker_init_fn=_worker_init,
-        collate_fn=lambda batch: (
-            torch.stack([b[0] for b in batch], dim=0),  # (B,6,H,W) CPU float32
-            [b[1] for b in batch],
-        ),
+        # worker_init_fn=_worker_init,  # enable if oversubscription becomes an issue
     )
+    # -----------------------------------------------------------------------------
 
     # Run (single-line flashing bar)
     t0 = time.time()
