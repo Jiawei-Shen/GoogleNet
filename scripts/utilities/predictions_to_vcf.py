@@ -3,11 +3,15 @@
 Create a node/offset VCF from predictions + per-node variant_summary.json,
 then output BGZF-compressed VCF (.vcf.gz) and a Tabix index (.tbi).
 
+Filename patterns (auto-detected):
+  • 5-part (new):    <nodeID>_<offset>_<X>_<REF>_<ALT>.npy  -> CHROM from filename
+  • 4-part (legacy): <offset>_<X>_<REF>_<ALT>.npy           -> CHROM from parent dir
+
 Custom semantics:
-  - CHROM = node_id (directory containing the .npy tile)
-  - POS   = starting offset (first token in the tile filename)
-  - REF/ALT parsed from "<offset>_<X>_<REF>_<ALT>.npy"
-  - For classification:
+  - CHROM = node_id
+  - POS   = starting offset
+  - REF/ALT parsed from filename
+  - Classification:
       * pred_class == "true" -> keep as FILTER=PASS (optionally gated by --min_true_prob)
       * otherwise, if probability >= --refcall_prob -> keep as FILTER=RefCall
       * else drop
@@ -45,8 +49,21 @@ try:
 except Exception:
     pysam = None
 
-# Parse filenames like: 11_X_A_G.npy
-NAME_RE = re.compile(
+# --- Filename patterns ---
+# 5-part: <nodeID>_<offset>_<X>_<REF>_<ALT>.npy
+NAME_RE5 = re.compile(
+    r"""^(?P<node_id>-?\d+)
+        _(?P<offset>-?\d+)
+        _(?P<chrom_hint>[^_]+)
+        _(?P<ref>[ACGTN]+)
+        _(?P<alt>[ACGTN]+)
+        \.[Nn][Pp][Yy]$
+    """,
+    re.VERBOSE,
+)
+
+# 4-part: <offset>_<X>_<REF>_<ALT>.npy
+NAME_RE4 = re.compile(
     r"""^(?P<offset>-?\d+)
         _(?P<chrom_hint>[^_]+)
         _(?P<ref>[ACGTN]+)
@@ -151,6 +168,40 @@ def ensure_pysam_or_die():
         sys.exit(2)
 
 
+def parse_filename(path: str) -> Optional[Tuple[str, int, str, str]]:
+    """
+    Parse tensor filename to (node_id, offset, ref, alt).
+    Supports:
+      - <nodeID>_<offset>_<X>_<REF>_<ALT>.npy  (node_id from filename)
+      - <offset>_<X>_<REF>_<ALT>.npy           (node_id from parent directory)
+    """
+    base = os.path.basename(path)
+
+    m5 = NAME_RE5.match(base)
+    if m5:
+        node_id = m5.group("node_id")
+        try:
+            offset = int(m5.group("offset"))
+        except Exception:
+            return None
+        ref = m5.group("ref")
+        alt = m5.group("alt")
+        return node_id, offset, ref, alt
+
+    m4 = NAME_RE4.match(base)
+    if m4:
+        node_id = os.path.basename(os.path.dirname(path.rstrip("/")))
+        try:
+            offset = int(m4.group("offset"))
+        except Exception:
+            return None
+        ref = m4.group("ref")
+        alt = m4.group("alt")
+        return node_id, offset, ref, alt
+
+    return None
+
+
 def scan_predictions(iterable: Iterator[dict],
                      min_true_prob: Optional[float],
                      refcall_prob: Optional[float]) -> Tuple[List[Tuple[str, int, str, str, dict, str]], int, int, int]:
@@ -172,25 +223,17 @@ def scan_predictions(iterable: Iterator[dict],
 
         # Extract essential fields
         path = obj.get("path") or obj.get("file") or obj.get("src") or obj.get("tensor") or obj.get("npy")
-        base = os.path.basename(path) if path else None
-        if not base:
+        if not path:
             bar.set_postfix_str(f"kept={kept_out}")
             continue
-        m = NAME_RE.match(base)
-        if not m:
+
+        parsed = parse_filename(path)
+        if not parsed:
             missing_pattern += 1
             bar.set_postfix_str(f"kept={kept_out}")
             continue
 
-        node_id = os.path.basename(os.path.dirname(path.rstrip("/")))
-        try:
-            offset = int(m.group("offset"))
-        except Exception:
-            bar.set_postfix_str(f"kept={kept_out}")
-            continue
-        ref = m.group("ref")
-        alt = m.group("alt")
-
+        node_id, offset, ref, alt = parsed
         prob = true_prob(obj)
         pred_class = str(obj.get("pred_class", "")).strip().lower()
 
@@ -215,6 +258,7 @@ def scan_predictions(iterable: Iterator[dict],
         if node_id not in by_node_cache:
             by_node_cache[node_id] = load_variant_summary_for_node(node_dir)
 
+        base = os.path.basename(path)
         info = {
             "PROB": f"{prob:.6g}" if prob is not None else None,
         }
@@ -257,7 +301,7 @@ def scan_predictions(iterable: Iterator[dict],
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Generate node/offset VCF from predictions + variant_summary.json, then bgzip+index.")
+    ap = argparse.ArgumentParser(description="Generate node/offset VCF from predictions + variant_summary.json, then bgzip+index. Supports 4- and 5-part filenames.")
     ap.add_argument("--predictions", required=True, help="predictions.json (array) or .jsonl")
     ap.add_argument("--jsonl", action="store_true", help="Interpret --predictions as JSONL")
     ap.add_argument("--output_vcf", required=True, help="Output path (.vcf or .vcf.gz). Final output will be .vcf.gz")
@@ -286,7 +330,11 @@ def main():
     )
 
     if missing_pattern:
-        tqdm.write(f"WARNING: {missing_pattern} filenames did not match '<offset>_<X>_<REF>_<ALT>.npy' and were skipped.")
+        tqdm.write(
+            "WARNING: {n} filenames did not match either "
+            "'<nodeID>_<offset>_<X>_<REF>_<ALT>.npy' or '<offset>_<X>_<REF>_<ALT>.npy'; skipped."
+            .format(n=missing_pattern)
+        )
 
     if kept_out == 0:
         print("No qualifying predictions to write. Nothing to do.", file=sys.stderr)
@@ -324,7 +372,7 @@ def main():
     with open(tmp_vcf_path, "w", encoding="utf-8") as out:
         # Header
         out.write("##fileformat=VCFv4.2\n")
-        out.write("##META=<ID=SCHEMA,Description=\"Custom: CHROM=node_id, POS=starting_offset\">\n")
+        out.write("##META=<ID=SCHEMA,Description=\"Custom: CHROM=node_id, POS=starting_offset; supports 4- and 5-part filenames\">\n")
         out.write("##INFO=<ID=PROB,Number=1,Type=Float,Description=\"Model probability for positive/'true' class\">\n")
         out.write("##INFO=<ID=AF,Number=1,Type=Float,Description=\"Alt allele frequency from variant_summary.json\">\n")
         out.write("##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Coverage at locus from variant_summary.json\">\n")
@@ -350,7 +398,7 @@ def main():
 
     print(f"Plain VCF written: {tmp_vcf_path} (records={len(records)}, scanned={total_in}, kept_out={kept_out})")
 
-    # Compress + (optionally) index using pysam.tabix_index (auto-compress per docstring you provided)
+    # Compress + (optionally) index using pysam.tabix_index (auto-compress)
     ensure_pysam_or_die()
     if want_index:
         print(f"Compressing + indexing with pysam.tabix_index: {tmp_vcf_path} ...")
@@ -362,16 +410,14 @@ def main():
         )
         final_tbi = final_vcf_gz + ".tbi"
     else:
-        # Only compress, no index — use the broadest-compatible signature
+        # Only compress, no index
         final_vcf_gz = base_no_ext if base_no_ext.endswith(".vcf.gz") else base_no_ext + ".gz"
         print(f"Compressing with pysam.tabix_compress (no index): {final_vcf_gz} ...")
         try:
             pysam.tabix_compress(tmp_vcf_path, final_vcf_gz, force=True)
         except TypeError:
-            # Very old pysam (no kwargs)
             pysam.tabix_compress(tmp_vcf_path, final_vcf_gz)
         final_tbi = None
-        # Remove the plain VCF to mirror keep_original=False behavior
         try:
             os.remove(tmp_vcf_path)
         except Exception:
