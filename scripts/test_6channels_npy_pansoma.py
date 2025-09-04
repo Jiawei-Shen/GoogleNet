@@ -155,11 +155,9 @@ class NpyDirDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
         path = self.files[idx]
-        arr = np.load(path)
-        t = torch.from_numpy(arr.copy()).float()
-        # arr = np.load(path, mmap_mode="r" if self.mmap else None)
-        # chw = ensure_chw(arr, self.channels)
-        # t = torch.from_numpy(chw).float()
+        arr = np.load(path, mmap_mode="r" if self.mmap else None)
+        chw = ensure_chw(arr, self.channels)
+        t = torch.from_numpy(chw).float()
         if self.transform:
             t = self.transform(t)
         return t, path
@@ -188,53 +186,52 @@ def build_and_load_model(ckpt_path: str, device: torch.device,
 
 # --------------------------- Inference Core --------------------------------- #
 
-# @torch.inference_mode()
+@torch.inference_mode()
 def run_inference(model, dl, device, class_names: List[str],
                   total_files: int, no_probs: bool = False):
     results = []
     processed, t0 = 0, time.time()
 
     with tqdm(total=total_files, desc="Infer", unit="file", dynamic_ncols=True, leave=True) as bar:
-        with torch.no_grad():
-            for images, paths in dl:
-                images = images.to(device)
-                outputs = model(images)
-                if isinstance(outputs, tuple):
-                    outputs = outputs[0]
+        for images, paths in dl:
+            images = images.to(device)
+            outputs = model(images)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
 
-                # probs = torch.softmax(outputs, dim=1)
-                # top_prob, top_idx = probs.max(dim=1)
-                #
-                # if no_probs:
-                #     for i, pth in enumerate(paths):
-                #         pred_idx = int(top_idx[i])
-                #         pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
-                #         results.append({
-                #             "path": pth,
-                #             "pred_idx": pred_idx,
-                #             "pred_class": pred_name,
-                #             "pred_prob": float(top_prob[i]),
-                #         })
-                # else:
-                #     probs_cpu = probs.cpu().numpy()
-                #     for i, pth in enumerate(paths):
-                #         pred_idx = int(top_idx[i])
-                #         pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
-                #         prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
-                #         results.append({
-                #             "path": pth,
-                #             "pred_idx": pred_idx,
-                #             "pred_class": pred_name,
-                #             "pred_prob": float(top_prob[i]),
-                #             "probs": prob_dict
-                #         })
+            probs = torch.softmax(outputs, dim=1)
+            top_prob, top_idx = probs.max(dim=1)
 
-                processed += len(paths)
-                bar.update(len(paths))
-                elapsed = time.time() - t0
-                speed = processed / max(1e-9, elapsed)
-                eta = (total_files - processed) / max(1e-9, speed)
-                bar.set_postfix_str(f"speed={speed:.1f} file/s ETA={_format_eta(eta)}")
+            if no_probs:
+                for i, pth in enumerate(paths):
+                    pred_idx = int(top_idx[i])
+                    pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
+                    results.append({
+                        "path": pth,
+                        "pred_idx": pred_idx,
+                        "pred_class": pred_name,
+                        "pred_prob": float(top_prob[i]),
+                    })
+            else:
+                probs_cpu = probs.cpu().numpy()
+                for i, pth in enumerate(paths):
+                    pred_idx = int(top_idx[i])
+                    pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
+                    prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
+                    results.append({
+                        "path": pth,
+                        "pred_idx": pred_idx,
+                        "pred_class": pred_name,
+                        "pred_prob": float(top_prob[i]),
+                        "probs": prob_dict
+                    })
+
+            processed += len(paths)
+            bar.update(len(paths))
+            elapsed = time.time() - t0
+            speed = processed / max(1e-9, elapsed)
+            eta = (total_files - processed) / max(1e-9, speed)
+            bar.set_postfix_str(f"speed={speed:.1f} file/s ETA={_format_eta(eta)}")
 
     return results
 
