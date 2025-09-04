@@ -200,32 +200,32 @@ def run_inference(model, dl, device, class_names: List[str],
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
 
-                probs = torch.softmax(outputs, dim=1)
-                top_prob, top_idx = probs.max(dim=1)
-
-                if no_probs:
-                    for i, pth in enumerate(paths):
-                        pred_idx = int(top_idx[i])
-                        pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
-                        results.append({
-                            "path": pth,
-                            "pred_idx": pred_idx,
-                            "pred_class": pred_name,
-                            "pred_prob": float(top_prob[i]),
-                        })
-                else:
-                    probs_cpu = probs.cpu().numpy()
-                    for i, pth in enumerate(paths):
-                        pred_idx = int(top_idx[i])
-                        pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
-                        prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
-                        results.append({
-                            "path": pth,
-                            "pred_idx": pred_idx,
-                            "pred_class": pred_name,
-                            "pred_prob": float(top_prob[i]),
-                            "probs": prob_dict
-                        })
+                # probs = torch.softmax(outputs, dim=1)
+                # top_prob, top_idx = probs.max(dim=1)
+                #
+                # if no_probs:
+                #     for i, pth in enumerate(paths):
+                #         pred_idx = int(top_idx[i])
+                #         pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
+                #         results.append({
+                #             "path": pth,
+                #             "pred_idx": pred_idx,
+                #             "pred_class": pred_name,
+                #             "pred_prob": float(top_prob[i]),
+                #         })
+                # else:
+                #     probs_cpu = probs.cpu().numpy()
+                #     for i, pth in enumerate(paths):
+                #         pred_idx = int(top_idx[i])
+                #         pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
+                #         prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
+                #         results.append({
+                #             "path": pth,
+                #             "pred_idx": pred_idx,
+                #             "pred_class": pred_name,
+                #             "pred_prob": float(top_prob[i]),
+                #             "probs": prob_dict
+                #         })
 
                 processed += len(paths)
                 bar.update(len(paths))
