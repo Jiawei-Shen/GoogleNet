@@ -155,9 +155,11 @@ class NpyDirDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
         path = self.files[idx]
-        arr = np.load(path, mmap_mode="r" if self.mmap else None)
-        chw = ensure_chw(arr, self.channels)
-        t = torch.from_numpy(chw).float()
+        arr = np.load(path)
+        t = torch.from_numpy(arr.copy()).float()
+        # arr = np.load(path, mmap_mode="r" if self.mmap else None)
+        # chw = ensure_chw(arr, self.channels)
+        # t = torch.from_numpy(chw).float()
         if self.transform:
             t = self.transform(t)
         return t, path
