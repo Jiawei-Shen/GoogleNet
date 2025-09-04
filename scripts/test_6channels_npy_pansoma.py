@@ -185,51 +185,52 @@ def build_and_load_model(ckpt_path: str, device: torch.device,
 
 # --------------------------- Inference Core --------------------------------- #
 
-@torch.inference_mode()
+# @torch.inference_mode()
 def run_inference(model, dl, device, class_names: List[str],
                   total_files: int, no_probs: bool = False):
     results = []
     processed, t0 = 0, time.time()
 
     with tqdm(total=total_files, desc="Infer", unit="file", dynamic_ncols=True, leave=True) as bar:
-        for images, paths in dl:
-            images = images.to(device, non_blocking=True)
-            outputs = model(images)
-            if isinstance(outputs, tuple): outputs = outputs[0]
+        with torch.no_grad():
+            for images, paths in dl:
+                images = images.to(device, non_blocking=True)
+                outputs = model(images)
+                if isinstance(outputs, tuple): outputs = outputs[0]
 
-            probs = torch.softmax(outputs, dim=1)
-            top_prob, top_idx = probs.max(dim=1)
+                probs = torch.softmax(outputs, dim=1)
+                top_prob, top_idx = probs.max(dim=1)
 
-            if no_probs:
-                for i, pth in enumerate(paths):
-                    pred_idx = int(top_idx[i])
-                    pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
-                    results.append({
-                        "path": pth,
-                        "pred_idx": pred_idx,
-                        "pred_class": pred_name,
-                        "pred_prob": float(top_prob[i]),
-                    })
-            else:
-                probs_cpu = probs.cpu().numpy()
-                for i, pth in enumerate(paths):
-                    pred_idx = int(top_idx[i])
-                    pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
-                    prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
-                    results.append({
-                        "path": pth,
-                        "pred_idx": pred_idx,
-                        "pred_class": pred_name,
-                        "pred_prob": float(top_prob[i]),
-                        "probs": prob_dict
-                    })
+                if no_probs:
+                    for i, pth in enumerate(paths):
+                        pred_idx = int(top_idx[i])
+                        pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
+                        results.append({
+                            "path": pth,
+                            "pred_idx": pred_idx,
+                            "pred_class": pred_name,
+                            "pred_prob": float(top_prob[i]),
+                        })
+                else:
+                    probs_cpu = probs.cpu().numpy()
+                    for i, pth in enumerate(paths):
+                        pred_idx = int(top_idx[i])
+                        pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
+                        prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
+                        results.append({
+                            "path": pth,
+                            "pred_idx": pred_idx,
+                            "pred_class": pred_name,
+                            "pred_prob": float(top_prob[i]),
+                            "probs": prob_dict
+                        })
 
-            processed += len(paths)
-            bar.update(len(paths))
-            elapsed = time.time() - t0
-            speed = processed / max(1e-9, elapsed)
-            eta = (total_files - processed) / max(1e-9, speed)
-            bar.set_postfix_str(f"speed={speed:.1f} file/s ETA={_format_eta(eta)}")
+                processed += len(paths)
+                bar.update(len(paths))
+                elapsed = time.time() - t0
+                speed = processed / max(1e-9, elapsed)
+                eta = (total_files - processed) / max(1e-9, speed)
+                bar.set_postfix_str(f"speed={speed:.1f} file/s ETA={_format_eta(eta)}")
 
     return results
 
@@ -320,6 +321,7 @@ def main():
     print_data_info(files, in_channels, args.mmap, args.sample_info_k)
 
     # Dataset & Loader
+    print(f"Building Data Loader...")
     from torchvision import transforms
     norm_transform = transforms.Normalize(mean=VAL_MEAN.tolist(), std=VAL_STD.tolist())
     ds = NpyDirDataset(files, in_channels, mmap=args.mmap, transform=norm_transform)
