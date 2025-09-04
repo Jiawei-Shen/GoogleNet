@@ -96,7 +96,6 @@ class NpyDirDataset(Dataset):
         path = self.files[idx]
         arr = np.load(path, mmap_mode="r" if self.mmap else None)
         chw = ensure_chw(arr, self.channels)
-        # No CPU normalize here; default is GPU-side normalization
         return torch.from_numpy(chw).float(), path
 
 # --------------------------- Model Loading ---------------------------------- #
@@ -119,25 +118,12 @@ def build_and_load_model(ckpt_path: str, device: torch.device,
 def run_inference(model, dl, device, class_names: List[str],
                   total_files: int, no_probs: bool,
                   gpu_norm: bool, mean: torch.Tensor, std: torch.Tensor,
-                  amp_mode: str, out_csv, out_json):
-    f_csv = None
-    writer = None
-    json_f = None
-    first_json = True
+                  amp_mode: str):
+    """Return a list[dict] of results; NO writing inside."""
+    results = []
     any_probs = (not no_probs)
 
-    # Prepare writers (streaming)
-    if out_csv:
-        f_csv = open(out_csv, "w", newline="")
-        header = ["path", "pred_idx", "pred_class", "pred_prob"]
-        if any_probs: header += class_names
-        writer = csv.writer(f_csv)
-        writer.writerow(header)
-    if out_json:
-        json_f = open(out_json, "w")
-        json_f.write("[\n")
-
-    # Pre-create GPU mean/std if needed
+    # Prepare GPU mean/std if needed
     mean_d = std_d = None
     if gpu_norm:
         mean_d = mean.to(device, non_blocking=True).view(1, -1, 1, 1)
@@ -152,15 +138,15 @@ def run_inference(model, dl, device, class_names: List[str],
     processed, t0 = 0, time.time()
     with tqdm(total=total_files, desc="Infer", unit="file", dynamic_ncols=True, leave=True) as bar:
         for images, paths in dl:
-            images = images.to(device, non_blocking=True)
-
-            # Normalize (GPU default; CPU fallback)
+            # Normalize then move OR move then normalize (to avoid device mismatch)
             if gpu_norm:
+                images = images.to(device, non_blocking=True)
                 images = (images - mean_d) / std_d
             else:
-                images.sub_(VAL_MEAN.view(-1, 1, 1)).div_(VAL_STD.view(-1, 1, 1))
+                images.sub_(VAL_MEAN.view(-1, 1, 1)).div_(VAL_STD.view(-1, 1, 1))  # CPU-side
+                images = images.to(device, non_blocking=True)
 
-            # AMP (optional)
+            # Forward (optional AMP)
             if scaler_dtype is not None:
                 with torch.autocast(device_type="cuda", dtype=scaler_dtype):
                     outputs = model(images)
@@ -168,33 +154,23 @@ def run_inference(model, dl, device, class_names: List[str],
                 outputs = model(images)
             if isinstance(outputs, tuple): outputs = outputs[0]
 
-            if no_probs:
-                top_logit, top_idx = outputs.max(dim=1)
-            else:
+            if any_probs:
                 probs = torch.softmax(outputs, dim=1)
                 top_prob, top_idx = probs.max(dim=1)
+                probs_cpu = probs.cpu().numpy()
+                top_prob_cpu = top_prob.cpu().numpy()
+            else:
+                top_idx = outputs.argmax(dim=1)
 
-            # Stream outputs
+            # Collect results in memory
             for i, pth in enumerate(paths):
                 pred_idx = int(top_idx[i])
                 pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
-                if writer:
-                    if any_probs:
-                        row = [pth, pred_idx, pred_name, f"{float(top_prob[i]):.6f}"]
-                        row += [f"{float(probs[i, j]):.6f}" for j in range(len(class_names))]
-                    else:
-                        row = [pth, pred_idx, pred_name, ""]
-                    writer.writerow(row)
-                if json_f:
-                    rec = {"path": pth, "pred_idx": pred_idx, "pred_class": pred_name}
-                    if any_probs:
-                        rec["pred_prob"] = float(top_prob[i])
-                        rec["probs"] = {class_names[j]: float(probs[i, j]) for j in range(len(class_names))}
-                    if first_json:
-                        json_f.write(json.dumps(rec))
-                        first_json = False
-                    else:
-                        json_f.write(",\n" + json.dumps(rec))
+                rec = {"path": pth, "pred_idx": pred_idx, "pred_class": pred_name}
+                if any_probs:
+                    rec["pred_prob"] = float(top_prob_cpu[i])
+                    rec["probs"] = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
+                results.append(rec)
 
             processed += len(paths)
             elapsed = time.time() - t0; speed = processed / max(1e-9, elapsed)
@@ -202,15 +178,38 @@ def run_inference(model, dl, device, class_names: List[str],
             bar.update(len(paths))
             bar.set_postfix_str(f"speed={speed:.1f} file/s ETA={_format_eta(eta)}")
 
-    if json_f:
-        json_f.write("\n]\n")
-        json_f.close()
-    if f_csv:
-        f_csv.close()
+    return results
+
+def write_outputs(results: List[dict], class_names: List[str],
+                  csv_path: str | None, json_path: str | None, no_probs: bool):
+    if not results:
+        return
+    # JSON (one shot)
+    if json_path:
+        with open(json_path, "w") as jf:
+            json.dump(results, jf, indent=2)
+        print(f"Wrote JSON predictions: {json_path}")
+
+    # CSV (one shot)
+    if csv_path:
+        any_probs = (not no_probs) and any(("probs" in r) for r in results)
+        header = ["path", "pred_idx", "pred_class", "pred_prob"]
+        if any_probs:
+            header += class_names
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for r in results:
+                row = [r["path"], r["pred_idx"], r["pred_class"]]
+                row.append(f"{r.get('pred_prob', 0.0):.6f}" if "pred_prob" in r else "")
+                if any_probs:
+                    row.extend([f"{r['probs'].get(c, 0.0):.6f}" for c in class_names])
+                w.writerow(row)
+        print(f"Wrote CSV predictions: {csv_path}")
 
 # ----------------------------- Main ----------------------------------------- #
 def main():
-    p = argparse.ArgumentParser(description="Fast inference over .npy files (GPU-norm default).")
+    p = argparse.ArgumentParser(description="Fast inference over .npy files (collect first, write after).")
     p.add_argument("--input_dir", required=True)
     p.add_argument("--ckpt", required=True)
     p.add_argument("--output_csv", default="predictions.csv")
@@ -225,14 +224,11 @@ def main():
     p.add_argument("--depths", type=int, nargs="+", default=[3, 3, 27, 3])
     p.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536])
     p.add_argument("--sample_info_k", type=int, default=3)
-    # GPU norm is DEFAULT (use --no-gpu-norm to disable)
     try:
-        # Python 3.9+
         from argparse import BooleanOptionalAction
         p.add_argument("--gpu_norm", action=BooleanOptionalAction, default=True,
                        help="Normalize on GPU (default: True). Use --no-gpu-norm to disable.")
     except Exception:
-        # Fallback if BooleanOptionalAction not available
         p.add_argument("--gpu_norm", action="store_true", default=True,
                        help="Normalize on GPU (default: True).")
     p.add_argument("--amp", choices=["off", "bf16", "fp16"], default="off", help="Mixed precision mode (CUDA only)")
@@ -249,7 +245,6 @@ def main():
         try: torch.set_float32_matmul_precision("high")
         except Exception: pass
 
-    # If GPU norm requested but CUDA not available, fall back gracefully
     if device.type != "cuda" and args.gpu_norm:
         print("NOTE: CUDA not available; falling back to CPU-side normalization.")
         args.gpu_norm = False
@@ -273,8 +268,7 @@ def main():
     else:
         class_names = [None] * len(genotype_map)
         for cname, cidx in genotype_map.items():
-            if 0 <= cidx < len(class_names):
-                class_names[cidx] = str(cname)
+            if 0 <= cidx < len(class_names): class_names[cidx] = str(cname)
         class_names = [c if c else str(i) for i, c in enumerate(class_names)]
 
     # Files
@@ -294,15 +288,19 @@ def main():
         shuffle=False
     )
 
-    # Run
+    # Run (collect) -> Write (after)
     t0 = time.time()
-    run_inference(
+    results = run_inference(
         model, dl, device, class_names, len(files), args.no_probs,
-        gpu_norm=args.gpu_norm, mean=VAL_MEAN, std=VAL_STD,
-        amp_mode=args.amp, out_csv=args.output_csv or None, out_json=args.output_json or None
+        gpu_norm=args.gpu_norm, mean=VAL_MEAN, std=VAL_STD, amp_mode=args.amp
     )
     elapsed = time.time() - t0
     print(f"\nFinished {len(files)} files in {elapsed:.2f}s ({len(files)/elapsed:.2f} file/s)")
+
+    write_outputs(results, class_names,
+                  csv_path=(args.output_csv or None),
+                  json_path=(args.output_json or None),
+                  no_probs=args.no_probs)
 
 if __name__ == "__main__":
     main()
