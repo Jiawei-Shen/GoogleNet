@@ -243,7 +243,7 @@ def run_inference(model, dl, device, class_names: List[str],
                         pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
                         results.append({
                             "path": pth,
-                            "pred_idx": pred_idx,
+                            # "pred_idx": pred_idx,
                             "pred_class": pred_name,
                             "pred_prob": float(top_prob[i]),
                         })
@@ -255,7 +255,7 @@ def run_inference(model, dl, device, class_names: List[str],
                         prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
                         results.append({
                             "path": pth,
-                            "pred_idx": pred_idx,
+                            # "pred_idx": pred_idx,
                             "pred_class": pred_name,
                             "pred_prob": float(top_prob[i]),
                             "probs": prob_dict
