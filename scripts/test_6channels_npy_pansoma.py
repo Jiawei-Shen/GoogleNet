@@ -350,9 +350,8 @@ def main():
     files: List[str]
     if args.file_list:
         files = read_file_list(args.file_list)
-        if not files:
-            raise SystemExit(f"No valid .npy paths found in {args.file_list}")
         print(f"Loaded {len(files)} paths from --file_list")
+        print(f"{files[:5]}")
     else:
         if not args.input_dir:
             raise SystemExit("Either --file_list or --input_dir must be provided.")
