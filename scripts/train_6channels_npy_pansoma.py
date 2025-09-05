@@ -1,572 +1,348 @@
 #!/usr/bin/env python3
+"""
+Fast batch inference over a directory of .npy files (recursively).
+
+This simplified version:
+  • Normalization is done in the Dataset (transforms.Normalize, CHW)
+  • Inference loop is a simple for-loop over the DataLoader
+  • Removed fp16 and channels_last options
+  • Keeps mmap loading, torch.compile, and clean outputs
+"""
+
 import argparse
-import torch
-import torch.optim as optim
-import torch.nn as nn
-import sys
 import os
-from tqdm import tqdm
-from collections import defaultdict
-import torch.nn.functional as F
-from torch.utils.data import Subset, DataLoader
+import sys
 import json
+import time
+from typing import List, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- MODIFIED: Import new schedulers ---
-from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from mynet import ConvNeXtCBAMClassifier
-from dataset_pansoma_npy_6ch import get_data_loader
+# Import your model the same way as in training
+THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+sys.path.append(os.path.abspath(os.path.join(THIS_DIR, "..")))
+from mynet import ConvNeXtCBAMClassifier  # noqa: E402
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# --- EXACT SAME NORMALIZATION AS VAL (COLO829T Testing) ---
+VAL_MEAN = torch.tensor([
+    18.417816162109375, 12.649129867553711, -0.5452527403831482,
+    24.723854064941406, 4.690611362457275, 0.2813551473402196
+], dtype=torch.float32)
+VAL_STD = torch.tensor([
+    25.028322219848633, 14.809632301330566, 0.6181337833404541,
+    29.972835540771484, 7.9231791496276855, 0.7659083659074717
+], dtype=torch.float32)
 
+# ----------------------------- Utilities ------------------------------------- #
 
-class MultiClassFocalLoss(nn.Module):
-    """
-    Focal Loss for multi-class classification.
-    """
-    def __init__(self, gamma=2.0, weight=None, reduction='mean'):
-        super(MultiClassFocalLoss, self).__init__()
-        self.gamma = gamma
-        self.weight = weight
-        self.reduction = reduction
-
-    def forward(self, logits, targets):
-        log_probs = F.log_softmax(logits, dim=1)
-        log_pt = log_probs.gather(1, targets.view(-1, 1)).squeeze(1)
-        pt = torch.exp(log_pt)
-
-        if self.weight is not None:
-            at = self.weight.gather(0, targets)
-            log_pt = log_pt * at
-
-        focal_loss = -1 * (1 - pt)**self.gamma * log_pt
-
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        return focal_loss
-
-
-class CombinedFocalWeightedCELoss(nn.Module):
-    def __init__(self, initial_lr, pos_weight=None, gamma=2.0):
-        super().__init__()
-        self.initial_lr = initial_lr
-        self.focal_loss = MultiClassFocalLoss(gamma=gamma, weight=pos_weight)
-        self.wce_loss = nn.CrossEntropyLoss(weight=pos_weight)
-
-    def forward(self, logits, targets, current_lr):
-        focal_weight = 1.0 - (current_lr / self.initial_lr)
-        wce_weight = 1.0 - focal_weight
-        loss_focal = self.focal_loss(logits, targets)
-        loss_wce = self.wce_loss(logits, targets)
-        return focal_weight * loss_focal + wce_weight * loss_wce
+def _scan_tree(start_dir: str) -> List[str]:
+    """Iteratively scan one subtree with os.scandir (fast)."""
+    stack = [start_dir]
+    out: List[str] = []
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        else:
+                            if e.name.lower().endswith(".npy"):
+                                out.append(e.path)
+                    except OSError:
+                        continue
+        except (PermissionError, FileNotFoundError):
+            continue
+    return out
 
 
-def init_weights(m):
-    if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
-        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
+def _format_eta(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:d}h{m:02d}m{s:02d}s"
+    elif m > 0:
+        return f"{m:d}m{s:02d}s"
+    else:
+        return f"{s:d}s"
 
 
-def print_and_log(message, log_path):
-    print(message)
-    with open(log_path, 'a', encoding='utf-8') as f:
-        f.write(message + '\n')
-
-
-def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
-                batch_size=32, num_workers=4, loss_type='weighted_ce',
-                warmup_epochs=10, weight_decay=0.05, depths=None, dims=None,
-                training_data_ratio=1.0):
-    os.makedirs(output_path, exist_ok=True)
-    log_file = os.path.join(output_path, "training_log_6ch.txt")
-    if os.path.exists(log_file):
-        os.remove(log_file)
-
-    MIN_SAVE_EPOCH = 5  # save first checkpoint after 5 epochs
-
-    if not (0 < training_data_ratio <= 1.0):
-        raise ValueError(f"--training_data_ratio must be in (0,1], got {training_data_ratio}")
-
-    print_and_log(f"Using device: {device}", log_file)
-    print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
-    print_and_log(f"Using Cosine Annealing scheduler with a {warmup_epochs}-epoch linear warmup.", log_file)
-    print_and_log(
-        f"Checkpointing: snapshot at epoch {MIN_SAVE_EPOCH}, then save only when validation improves (best so far).",
-        log_file)
-    print_and_log(f"Using {num_workers} workers for data loading.", log_file)
-    if save_val_results:
-        print_and_log("Will save validation results when a new best is found.", log_file)
-
-    # Build loaders
-    train_loader, genotype_map = get_data_loader(
-        data_dir=data_path, dataset_type="train", batch_size=batch_size,
-        num_workers=num_workers, shuffle=True
-    )
-
-    # Randomly subsample training data if requested
-    if training_data_ratio < 1.0:
-        full_ds = train_loader.dataset
-        n = len(full_ds)
-        k = max(1, int(round(n * training_data_ratio)))
-        idx = torch.randperm(n)[:k].tolist()
-        subset = Subset(full_ds, idx)
-        train_loader = DataLoader(subset, batch_size=batch_size, shuffle=True,
-                                  num_workers=num_workers, pin_memory=True)
-        print_and_log(f"Training subset: using {k}/{n} samples (~{training_data_ratio:.2f} of data).", log_file)
+def list_npy_files_parallel(root: str, workers: int) -> List[str]:
+    """Parallel file discovery with tqdm bar."""
+    root = os.path.abspath(os.path.expanduser(root))
+    top_dirs, files = [], []
 
     try:
-        val_loader, _ = get_data_loader(
-            data_dir=data_path, dataset_type="val", batch_size=batch_size,
-            num_workers=num_workers, shuffle=False, return_paths=True
-        )
-    except Exception as e:
-        print_and_log(f"\nFATAL: Could not create validation data loader with 'return_paths=True'.", log_file)
-        print_and_log("Please ensure your 'dataset_pansoma_npy_6ch.py' can handle this flag.", log_file)
-        print_and_log(f"Error details: {e}", log_file)
-        return
-
-    if not genotype_map:
-        print_and_log("Error: genotype_map is empty. Check dataloader.", log_file)
-        return
-    num_classes = len(genotype_map)
-    if num_classes == 0:
-        print_and_log("Error: Number of classes is 0. Check dataloader.", log_file)
-        return
-    print_and_log(f"Number of classes: {num_classes}", log_file)
-    sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
-
-    model = ConvNeXtCBAMClassifier(in_channels=6, class_num=num_classes,
-                                   depths=depths, dims=dims).to(device)
-
-    model.apply(init_weights)
-    false_count = 48736
-    true_count = 268
-    pos_weight_value = min(88.0, false_count / true_count)
-    class_weights = torch.tensor([1.0, pos_weight_value]).to(device)
-
-    if loss_type == "combined":
-        criterion = CombinedFocalWeightedCELoss(initial_lr=learning_rate, pos_weight=class_weights)
-        print_and_log(f"Using Combined Focal Loss and Weighted CE Loss.", log_file)
-    elif loss_type == "weighted_ce":
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-        print_and_log(f"Using Weighted CE Loss.", log_file)
-    else:
-        raise ValueError(f"Unsupported loss_type: {loss_type}")
-
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    print_and_log(f"Using AdamW optimizer with weight decay: {weight_decay}", log_file)
-
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
-    main_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=0)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
-
-    best_val_acc = float("-inf")
-    best_val_loss = float("inf")
-    best_epoch = 0
-
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-        correct_train = 0
-        total_train = 0
-
-        current_lr = optimizer.param_groups[0]['lr']
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} LR: {current_lr:.1e}", leave=True)
-
-        batch_count = 0
-        for images, labels in progress_bar:
-            images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(images)
-
-            if loss_type == "combined":
-                if isinstance(outputs, tuple) and len(outputs) == 3:
-                    main_output, aux1, aux2 = outputs
-                    loss1 = criterion(main_output, labels, current_lr)
-                    loss2 = criterion(aux1, labels, current_lr)
-                    loss3 = criterion(aux2, labels, current_lr)
-                    loss = loss1 + 0.3 * loss2 + 0.3 * loss3
-                    outputs_for_acc = main_output
-                elif isinstance(outputs, torch.Tensor):
-                    loss = criterion(outputs, labels, current_lr)
-                    outputs_for_acc = outputs
-                else:
-                    progress_bar.close()
-                    raise TypeError(f"Model output type not recognized: {type(outputs)}")
-            else:
-                if isinstance(outputs, tuple) and len(outputs) == 3:
-                    main_output, aux1, aux2 = outputs
-                    loss1 = criterion(main_output, labels)
-                    loss2 = criterion(aux1, labels)
-                    loss3 = criterion(aux2, labels)
-                    loss = loss1 + 0.3 * loss2 + 0.3 * loss3
-                    outputs_for_acc = main_output
-                elif isinstance(outputs, torch.Tensor):
-                    loss = criterion(outputs, labels)
-                    outputs_for_acc = outputs
-                else:
-                    progress_bar.close()
-                    raise TypeError(f"Model output type not recognized: {type(outputs)}")
-
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-            batch_count += 1
-            _, predicted = torch.max(outputs_for_acc, 1)
-            correct_train += (predicted == labels).sum().item()
-            total_train += labels.size(0)
-
-            if total_train > 0 and batch_count > 0:
-                avg_loss_train = running_loss / batch_count
-                avg_acc_train = (correct_train / total_train) * 100
-                progress_bar.set_postfix(loss=f"{avg_loss_train:.4f}", acc=f"{avg_acc_train:.2f}%")
-
-        epoch_train_loss = (running_loss / batch_count) if batch_count > 0 else 0.0
-        epoch_train_acc = (correct_train / total_train) * 100 if total_train > 0 else 0.0
-
-        val_loss, val_acc, class_performance_stats_val, val_inference_results, val_metrics = evaluate_model(
-            model, val_loader, criterion, genotype_map, log_file, loss_type, current_lr
-        )
-
-        if class_performance_stats_val:
-            print_and_log("\nClass-wise Validation Accuracy:", log_file)
-            for class_name in sorted_class_names_from_map:
-                stats = class_performance_stats_val.get(class_name, {})
-                print_and_log(
-                    f"  {class_name} (Index {stats.get('idx', 'N/A')}): {stats.get('acc', 0):.2f}% ({stats.get('correct', 0)}/{stats.get('total', 0)})",
-                    log_file)
-
-        summary_msg = (
-            f"Epoch {epoch + 1}/{num_epochs} Summary - "
-            f"Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.2f}%, "
-            f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}% | "
-            f"Prec: {val_metrics['precision_macro'] * 100:.2f}%, "
-            f"Rec: {val_metrics['recall_macro'] * 100:.2f}%, "
-            f"F1: {val_metrics['f1_macro'] * 100:.2f}% "
-            f"(LR: {current_lr:.1e})"
-        )
-
-        print_and_log(summary_msg, log_file)
-
-        # Snapshot at epoch 5
-        if (epoch + 1) == MIN_SAVE_EPOCH:
-            snap_path = os.path.join(output_path, f"model_epoch_{MIN_SAVE_EPOCH}.pth")
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'genotype_map': genotype_map,
-                'in_channels': 6
-            }, snap_path)
-            print_and_log(f"\nSnapshot saved at epoch {epoch + 1}: {snap_path}", log_file)
-
-        # Save on validation improvement (primary: higher acc; tie-breaker: lower loss), after epoch 5
-        improved = (val_acc > best_val_acc) or (val_acc == best_val_acc and val_loss < best_val_loss)
-        if (epoch + 1) >= MIN_SAVE_EPOCH and improved:
-            best_val_acc = val_acc
-            best_val_loss = val_loss
-            best_epoch = epoch + 1
-
-            best_path = os.path.join(output_path, "model_best.pth")
-            torch.save({
-                'epoch': best_epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'genotype_map': genotype_map,
-                'in_channels': 6,
-                'best_val_acc': best_val_acc,
-                'best_val_loss': best_val_loss,
-            }, best_path)
-            print_and_log(f"\nNew BEST at epoch {best_epoch}: Val Acc {best_val_acc:.2f}%, Val Loss {best_val_loss:.4f}. Saved: {best_path}", log_file)
-
-            if save_val_results:
-                result_path = os.path.join(output_path, "validation_results_best.json")
+        with os.scandir(root) as it:
+            for e in it:
                 try:
-                    with open(result_path, 'w') as f:
-                        json.dump({
-                            'epoch': best_epoch,
-                            'val_acc': best_val_acc,
-                            'val_loss': best_val_loss,
-                            'inference_results': val_inference_results
-                        }, f, indent=4)
-                    print_and_log(f"Saved best validation results to {result_path}", log_file)
-                except Exception as e:
-                    print_and_log(f"Error saving best validation results: {e}", log_file)
-
-        scheduler.step()
-        print_and_log("-" * 30, log_file)
-
-    print_and_log(
-        f"Training complete. Best epoch: {best_epoch} with Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
-        f"Best model: {os.path.join(output_path, 'model_best.pth')}",
-        log_file
-    )
-
-
-
-def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_type, current_lr):
-    model.eval()
-    running_loss_eval = 0.0
-    correct_eval = 0
-    total_eval = 0
-    class_correct_counts = defaultdict(int)
-    class_total_counts = defaultdict(int)
-    batch_count_eval = 0
-
-    # NEW: for precision/recall/F1
-    tp = defaultdict(int)
-    fp = defaultdict(int)
-    fn = defaultdict(int)
-
-    inference_results = defaultdict(list)
-    idx_to_class = {v: k for k, v in genotype_map.items()}
-
-    if not data_loader or len(data_loader) == 0:
-        # Return zeros + empty metrics
-        metrics = {
-            'precision_macro': 0.0, 'recall_macro': 0.0, 'f1_macro': 0.0,
-            'precision_weighted': 0.0, 'recall_weighted': 0.0, 'f1_weighted': 0.0
-        }
-        return 0.0, 0.0, {}, {}, metrics
-
-    with torch.no_grad():
-        for images, labels, paths in data_loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            if isinstance(outputs, tuple):
-                outputs = outputs[0]
-
-            # Compute loss
-            if loss_type == "combined":
-                loss = criterion(outputs, labels, current_lr)
-            else:
-                loss = criterion(outputs, labels)
-
-            running_loss_eval += loss.item()
-            batch_count_eval += 1
-
-            _, predicted = torch.max(outputs, 1)
-            correct_eval += (predicted == labels).sum().item()
-            total_eval += labels.size(0)
-
-            # Accumulate per-class stats
-            for i, pred_idx_tensor in enumerate(predicted):
-                pred_idx = int(pred_idx_tensor.item())
-                true_idx = int(labels[i].item())
-                path = paths[i]
-
-                # accuracy & class-wise accuracy
-                class_total_counts[true_idx] += 1
-                if pred_idx == true_idx:
-                    class_correct_counts[true_idx] += 1
-                    tp[true_idx] += 1
-                else:
-                    fp[pred_idx] += 1
-                    fn[true_idx] += 1
-
-                predicted_class_name = idx_to_class[pred_idx]
-                inference_results[predicted_class_name].append(os.path.basename(path))
-
-    avg_loss_eval = (running_loss_eval / batch_count_eval) if batch_count_eval > 0 else 0.0
-    overall_accuracy_eval = (correct_eval / total_eval) * 100 if total_eval > 0 else 0.0
-
-    # Build class-wise stats dict (unchanged behavior)
-    class_performance_stats = {}
-    if genotype_map:
-        for class_name, class_idx in genotype_map.items():
-            correct_c = class_correct_counts[class_idx]
-            total_c = class_total_counts[class_idx]
-            acc_c = (correct_c / total_c) * 100 if total_c > 0 else 0.0
-            class_performance_stats[class_name] = {
-                'acc': acc_c, 'correct': correct_c, 'total': total_c, 'idx': class_idx
-            }
-    else:
-        print_and_log("Warning: genotype_map is missing in evaluate_model.", log_file)
-
-    # ---- NEW: precision/recall/F1 (macro & weighted) ----
-    class_indices = list(genotype_map.values()) if genotype_map else list(set(list(tp.keys()) + list(fp.keys()) + list(fn.keys())))
-    precisions, recalls, f1s = [], [], []
-    supports = []
-
-    for c in class_indices:
-        tpc = tp[c]
-        fpc = fp[c]
-        fnc = fn[c]
-        denom_p = tpc + fpc
-        denom_r = tpc + fnc
-
-        pc = (tpc / denom_p) if denom_p > 0 else 0.0
-        rc = (tpc / denom_r) if denom_r > 0 else 0.0
-        fc = (2 * pc * rc / (pc + rc)) if (pc + rc) > 0 else 0.0
-
-        precisions.append(pc)
-        recalls.append(rc)
-        f1s.append(fc)
-        supports.append(tpc + fnc)  # ground-truth count for class
-
-    # macro
-    if len(class_indices) > 0:
-        precision_macro = sum(precisions) / len(precisions)
-        recall_macro = sum(recalls) / len(recalls)
-        f1_macro = sum(f1s) / len(f1s)
-    else:
-        precision_macro = recall_macro = f1_macro = 0.0
-
-    # weighted (by support)
-    total_support = sum(supports)
-    if total_support > 0:
-        precision_weighted = sum(p * s for p, s in zip(precisions, supports)) / total_support
-        recall_weighted = sum(r * s for r, s in zip(recalls, supports)) / total_support
-        f1_weighted = sum(f * s for f, s in zip(f1s, supports)) / total_support
-    else:
-        precision_weighted = recall_weighted = f1_weighted = 0.0
-
-    metrics = {
-        'precision_macro': precision_macro,
-        'recall_macro': recall_macro,
-        'f1_macro': f1_macro,
-        'precision_weighted': precision_weighted,
-        'recall_weighted': recall_weighted,
-        'f1_weighted': f1_weighted,
-    }
-
-    # Return with metrics as 5th element
-    return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results, metrics
-
-
-# --- MODIFIED: helpers for path resolution ---
-def _read_paths_file(file_path):
-    paths = []
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith('#'):
+                    if e.is_dir(follow_symlinks=False):
+                        top_dirs.append(e.path)
+                    elif e.name.lower().endswith(".npy"):
+                        files.append(e.path)
+                except OSError:
                     continue
-                paths.append(os.path.abspath(os.path.expanduser(s)))
-    except Exception:
-        pass
-    return paths
+    except FileNotFoundError:
+        return []
+
+    if workers <= 1 or not top_dirs:
+        for d in top_dirs:
+            files.extend(_scan_tree(d))
+        return sorted(files)
+
+    start = time.time()
+    with ThreadPoolExecutor(max_workers=workers) as ex, \
+         tqdm(total=len(top_dirs), desc="Scan", unit="dir", leave=False, dynamic_ncols=True) as bar:
+        futures = [ex.submit(_scan_tree, d) for d in top_dirs]
+        for fut in as_completed(futures):
+            files.extend(fut.result())
+            bar.update(1)
+            done = bar.n
+            elapsed = time.time() - start
+            speed = done / max(1e-9, elapsed)
+            eta = (len(top_dirs) - done) / max(1e-9, speed)
+            bar.set_postfix_str(f"speed={speed:.1f} dir/s ETA={_format_eta(eta)}")
+
+    return sorted(files)
 
 
-def _resolve_data_roots(primary_path, extra_paths, paths_file):
-    candidates = []
-    if primary_path:
-        candidates.append(os.path.abspath(os.path.expanduser(primary_path)))
-    if extra_paths:
-        for p in extra_paths:
-            candidates.append(os.path.abspath(os.path.expanduser(p)))
-    if paths_file:
-        candidates.extend(_read_paths_file(paths_file))
-    seen = set()
-    deduped = []
-    for p in candidates:
-        if p not in seen:
-            seen.add(p)
-            deduped.append(p)
-    if len(deduped) == 0:
-        return primary_path
-    if len(deduped) == 1:
-        return deduped[0]
-    return deduped
+def ensure_chw(x: np.ndarray, channels: int) -> np.ndarray:
+    """Ensure numpy array is (C,H,W) float32."""
+    if x.ndim == 3:
+        if x.shape[0] == channels:
+            chw = x
+        elif x.shape[-1] == channels:
+            chw = np.transpose(x, (2, 0, 1))
+        else:
+            raise ValueError(f"Unexpected shape {x.shape}, expected {channels} channels")
+    elif x.ndim == 2 and channels == 1:
+        chw = x[None, ...]
+    else:
+        raise ValueError(f"Unsupported shape {x.shape} for channels={channels}")
+    return chw.astype(np.float32, copy=False)
 
 
-# Helper to read a list of roots from a txt file (one path per line)
-def _read_paths_file(file_path):
-    paths = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith('#'):
-                continue
-            paths.append(os.path.abspath(os.path.expanduser(s)))
-    return paths
+def print_data_info(files: List[str], in_channels: int, mmap: bool, k: int) -> None:
+    print("\n=== Data Information ===")
+    print(f"Total .npy files: {len(files)} | in_channels={in_channels} | mmap={mmap}")
+    for i, p in enumerate(files[:k]):
+        try:
+            arr = np.load(p, mmap_mode="r" if mmap else None)
+            print(f"  [{i+1}] {p} | shape={arr.shape}, dtype={arr.dtype}")
+        except Exception as e:
+            print(f"  [{i+1}] {p} | <error: {e}>")
+    print("=" * 26)
+
+
+# ---------------------------- Dataset ---------------------------------------- #
+
+class NpyDirDataset(Dataset):
+    def __init__(self, files: List[str], channels: int, mmap: bool = False, transform=None):
+        self.files = files
+        self.channels = channels
+        self.mmap = mmap
+        self.transform = transform
+        if self.channels != 6:
+            raise ValueError(f"Expected 6 channels, got {channels}")
+
+    def __len__(self): return len(self.files)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
+        path = self.files[idx]
+        arr = np.load(path)
+        t = torch.from_numpy(arr.copy()).float()
+        # arr = np.load(path, mmap_mode="r" if self.mmap else None)
+        # chw = ensure_chw(arr, self.channels)
+        # t = torch.from_numpy(chw).float()
+        if self.transform:
+            t = self.transform(t)
+        return t, path
+
+
+# --------------------------- Model Loading ---------------------------------- #
+
+def build_and_load_model(ckpt_path: str, device: torch.device,
+                         depths: List[int], dims: List[int]):
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+
+    genotype_map = checkpoint.get("genotype_map", {})
+    in_channels = int(checkpoint.get("in_channels", 6))
+
+    model = ConvNeXtCBAMClassifier(
+        in_channels=in_channels, class_num=len(genotype_map) or 2,
+        depths=depths, dims=dims).to(device)
+
+    state = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+    return model, genotype_map, in_channels
+
+
+# --------------------------- Inference Core --------------------------------- #
+
+# @torch.inference_mode()
+def run_inference(model, dl, device, class_names: List[str],
+                  total_files: int, no_probs: bool = False):
+    results = []
+    processed, t0 = 0, time.time()
+
+    with tqdm(total=total_files, desc="Infer", unit="file", dynamic_ncols=True, leave=True) as bar:
+        with torch.no_grad():
+            for images, paths in dl:
+                images = images.to(device)
+                outputs = model(images)
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]
+
+                probs = torch.softmax(outputs, dim=1)
+                top_prob, top_idx = probs.max(dim=1)
+
+                if no_probs:
+                    for i, pth in enumerate(paths):
+                        pred_idx = int(top_idx[i])
+                        pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
+                        results.append({
+                            "path": pth,
+                            "pred_idx": pred_idx,
+                            "pred_class": pred_name,
+                            "pred_prob": float(top_prob[i]),
+                        })
+                else:
+                    probs_cpu = probs.cpu().numpy()
+                    for i, pth in enumerate(paths):
+                        pred_idx = int(top_idx[i])
+                        pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
+                        prob_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
+                        results.append({
+                            "path": pth,
+                            "pred_idx": pred_idx,
+                            "pred_class": pred_name,
+                            "pred_prob": float(top_prob[i]),
+                            "probs": prob_dict
+                        })
+
+                processed += len(paths)
+                bar.update(len(paths))
+                elapsed = time.time() - t0
+                speed = processed / max(1e-9, elapsed)
+                eta = (total_files - processed) / max(1e-9, speed)
+                bar.set_postfix_str(f"speed={speed:.1f} file/s ETA={_format_eta(eta)}")
+
+    return results
+
+
+def write_outputs(results, csv_path: str, json_path: str):
+    if json_path:
+        with open(json_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"Wrote JSON predictions: {json_path}")
+
+    if csv_path:
+        import csv
+        any_probs = any("probs" in r for r in results)
+        header = ["path", "pred_idx", "pred_class", "pred_prob"]
+        class_cols = []
+        if any_probs:
+            all_classes = set()
+            for r in results:
+                if "probs" in r:
+                    all_classes.update(r["probs"].keys())
+            class_cols = sorted(all_classes)
+            header += class_cols
+
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for r in results:
+                row = [r["path"], r["pred_idx"], r["pred_class"], f"{r['pred_prob']:.6f}"]
+                if any_probs:
+                    row.extend([f"{r['probs'].get(c, 0.0):.6f}" for c in class_cols])
+                w.writerow(row)
+        print(f"Wrote CSV predictions: {csv_path}")
+
+
+# ----------------------------- Main ----------------------------------------- #
+
+def main():
+    p = argparse.ArgumentParser(description="Infer over .npy files (Dataset-normalized, simplified).")
+    p.add_argument("--input_dir", required=True)
+    p.add_argument("--ckpt", required=True)
+    p.add_argument("--output_csv", default="predictions.csv")
+    p.add_argument("--output_json", default="predictions.json")
+    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    p.add_argument("--compile", action="store_true")
+    p.add_argument("--no_probs", action="store_true")
+    p.add_argument("--mmap", action="store_true")
+    p.add_argument("--depths", type=int, nargs="+", default=[3, 3, 27, 3])
+    p.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536])
+    p.add_argument("--sample_info_k", type=int, default=3)
+    args = p.parse_args()
+
+    # Device
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    # Build model
+    print(f"Loading Model from {args.ckpt}")
+    model, genotype_map, in_channels = build_and_load_model(args.ckpt, device, args.depths, args.dims)
+    if in_channels != 6:
+        raise ValueError(f"Expected 6-channel input, got {in_channels}")
+
+    if args.compile:
+        try: model = torch.compile(model)
+        except Exception as e: print(f"torch.compile not enabled: {e}")
+
+    # Class names
+    if len(genotype_map) == 0:
+        num_classes = next((m.out_features for _, m in model.named_modules() if isinstance(m, torch.nn.Linear)), 2)
+        class_names = [str(i) for i in range(num_classes)]
+    else:
+        class_names = [None] * len(genotype_map)
+        for cname, cidx in genotype_map.items():
+            if 0 <= cidx < len(class_names):
+                class_names[cidx] = str(cname)
+        class_names = [c if c else str(i) for i, c in enumerate(class_names)]
+
+    # Files
+    files = list_npy_files_parallel(args.input_dir, workers=args.num_workers)
+    if not files: raise SystemExit(f"No .npy files found in {args.input_dir}")
+
+    print_data_info(files, in_channels, args.mmap, args.sample_info_k)
+
+    # Dataset & Loader
+    print(f"Building Data Loader...")
+    from torchvision import transforms
+    norm_transform = transforms.Normalize(mean=VAL_MEAN.tolist(), std=VAL_STD.tolist())
+    ds = NpyDirDataset(files, in_channels, mmap=args.mmap, transform=norm_transform)
+    dl = DataLoader(ds, batch_size=args.batch_size, num_workers=args.num_workers,
+                    pin_memory=True, shuffle=False)
+
+    # Run
+    t0 = time.time()
+    results = run_inference(model, dl, device, class_names, len(files), args.no_probs)
+    elapsed = time.time() - t0
+    print(f"\nFinished {len(files)} files in {elapsed:.2f}s ({len(files)/elapsed:.2f} file/s)")
+
+    # Save
+    write_outputs(results,
+                  csv_path=args.output_csv if args.output_csv else None,
+                  json_path=args.output_json if args.output_json else None)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a Classifier on 6-channel custom .npy dataset")
-
-    # Make data_path OPTIONAL; we will enforce XOR with the files mode
-    parser.add_argument("data_path", nargs="?", type=str,
-                        help="Dataset root containing 'train/' and 'val/' (Mode A).")
-
-    parser.add_argument("-o", "--output_path", default="./saved_models_6channel", type=str, help="Path to save model")
-    parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3],
-                        help="A list of depths for the ConvNeXt stages (e.g., 3 3 27 3)")
-    parser.add_argument("--dims", type=int, nargs='+', default=[192, 384, 768, 1536],
-                        help="A list of dimensions for the ConvNeXt stages (e.g., 192 384 768 1536)")
-
-    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.0001, help="Initial learning rate")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for data loading")
-    # parser.add_argument("--milestone", type=int, default=10, help="Save model every N epochs")
-
-    # Optimizer / scheduler (unchanged)
-    parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of epochs for linear LR warmup")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
-    parser.add_argument("--save_val_results", action='store_true', help="Save validation results at each milestone.")
-    parser.add_argument("--loss_type", type=str, default="weighted_ce", choices=["combined", "weighted_ce"],
-                        help="Loss function to use")
-
-    # NEW: Mode B (files) — both must be provided together when using files mode
-    parser.add_argument("--train_data_paths_file", type=str, default=None,
-                        help="Text file listing TRAIN dataset roots (one per line).")
-    parser.add_argument("--val_data_paths_file", type=str, default=None,
-                        help="Text file listing VAL dataset roots (one per line).")
-    parser.add_argument("--training_data_ratio", type=float, default=1.0,
-                        help="Proportion of training data to use (0–1]. Randomly subsamples the training set.")
-
-    args = parser.parse_args()
-
-    # ---- Enforce: exactly one of (data_path) OR (both files) ----
-    has_base = args.data_path is not None
-    has_both_files = (args.train_data_paths_file is not None) and (args.val_data_paths_file is not None)
-
-    if not (0 < args.training_data_ratio <= 1.0):
-        parser.error(f"--training_data_ratio must be in (0,1], got {args.training_data_ratio}")
-
-    if has_base and has_both_files:
-        parser.error("Provide either positional data_path (Mode A) OR both --train_data_paths_file and "
-                     "--val_data_paths_file (Mode B), not both.")
-    if not has_base and not has_both_files:
-        parser.error("You must provide exactly one input mode:\n"
-                     "  • Mode A: data_path\n"
-                     "  • Mode B: --train_data_paths_file and --val_data_paths_file")
-
-    # Build the argument passed into train_model:
-    #  - Mode A: a single string root (backward compatible)
-    #  - Mode B: a pair (train_roots, val_roots) for the revised get_data_loader
-    if has_base:
-        data_path_or_pair = os.path.abspath(os.path.expanduser(args.data_path))
-    else:
-        train_roots = _read_paths_file(args.train_data_paths_file)
-        val_roots   = _read_paths_file(args.val_data_paths_file)
-        if not train_roots:
-            parser.error(f"--train_data_paths_file is empty or unreadable: {args.train_data_paths_file}")
-        if not val_roots:
-            parser.error(f"--val_data_paths_file is empty or unreadable: {args.val_data_paths_file}")
-        # Pair: get_data_loader(dataset_type="train"/"val") will pick the right side and
-        # include BOTH 'train' and 'val' subfolders from each root (per your revised dataloader)
-        data_path_or_pair = (train_roots, val_roots)
-
-    # Hand off; train_model still discovers loaders via get_data_loader(...)
-    train_model(
-        data_path=data_path_or_pair, output_path=args.output_path,
-        save_val_results=args.save_val_results,
-        num_epochs=args.epochs, learning_rate=args.lr,
-        batch_size=args.batch_size, num_workers=args.num_workers,
-        loss_type=args.loss_type,
-        warmup_epochs=args.warmup_epochs,
-        weight_decay=args.weight_decay,
-        depths=args.depths,
-        dims=args.dims,
-        training_data_ratio=args.training_data_ratio,
-    )
-
+    main()
