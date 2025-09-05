@@ -252,6 +252,7 @@ def run_inference(model, dl, device, class_names: List[str],
                             "probs": prob_dict
                         })
 
+                print(results[-5:])
                 processed += len(paths)
                 bar.update(len(paths))
                 elapsed = time.time() - t0
@@ -351,7 +352,6 @@ def main():
     if args.file_list:
         files = read_file_list(args.file_list)
         print(f"Loaded {len(files)} paths from --file_list")
-        print(f"{files[:5]}")
     else:
         if not args.input_dir:
             raise SystemExit("Either --file_list or --input_dir must be provided.")
