@@ -252,7 +252,6 @@ def run_inference(model, dl, device, class_names: List[str],
                             "probs": prob_dict
                         })
 
-                print(results[-5:])
                 processed += len(paths)
                 bar.update(len(paths))
                 elapsed = time.time() - t0
