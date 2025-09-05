@@ -151,12 +151,13 @@ class NpyDirDataset(Dataset):
         if self.channels != 6:
             raise ValueError(f"Expected 6 channels, got {channels}")
 
-    def __len__(self): return len(self.files)
+    def __len__(self):
+        return len(self.files)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
         path = self.files[idx]
         arr = np.load(path)
-        t = torch.from_numpy(arr.copy()).float()
+        t = torch.from_numpy(arr).float()
         # arr = np.load(path, mmap_mode="r" if self.mmap else None)
         # chw = ensure_chw(arr, self.channels)
         # t = torch.from_numpy(chw).float()
