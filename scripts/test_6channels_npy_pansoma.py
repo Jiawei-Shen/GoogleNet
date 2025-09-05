@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Fast batch inference over a directory of .npy files (recursively).
+Fast batch inference over a directory of .npy files (recursively), with file list caching.
 
-This simplified version:
-  • Normalization is done in the Dataset (transforms.Normalize, CHW)
-  • Inference loop is a simple for-loop over the DataLoader
-  • Removed fp16 and channels_last options
-  • Keeps mmap loading, torch.compile, and clean outputs
+New features:
+  • --file_list: load .npy paths from a text file (one per line) to skip re-scan.
+  • --save_file_list: after scanning, save discovered paths to a text file (one per line).
+  • --scan_workers: control directory scanning threads (separate from DataLoader workers).
 """
 
 import argparse
@@ -14,7 +13,7 @@ import os
 import sys
 import json
 import time
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -53,7 +52,7 @@ def _scan_tree(start_dir: str) -> List[str]:
                             stack.append(e.path)
                         else:
                             if e.name.lower().endswith(".npy"):
-                                out.append(e.path)
+                                out.append(os.path.abspath(e.path))
                     except OSError:
                         continue
         except (PermissionError, FileNotFoundError):
@@ -85,7 +84,7 @@ def list_npy_files_parallel(root: str, workers: int) -> List[str]:
                     if e.is_dir(follow_symlinks=False):
                         top_dirs.append(e.path)
                     elif e.name.lower().endswith(".npy"):
-                        files.append(e.path)
+                        files.append(os.path.abspath(e.path))
                 except OSError:
                     continue
     except FileNotFoundError:
@@ -94,7 +93,7 @@ def list_npy_files_parallel(root: str, workers: int) -> List[str]:
     if workers <= 1 or not top_dirs:
         for d in top_dirs:
             files.extend(_scan_tree(d))
-        return sorted(files)
+        return sorted(set(files))
 
     start = time.time()
     with ThreadPoolExecutor(max_workers=workers) as ex, \
@@ -109,7 +108,42 @@ def list_npy_files_parallel(root: str, workers: int) -> List[str]:
             eta = (len(top_dirs) - done) / max(1e-9, speed)
             bar.set_postfix_str(f"speed={speed:.1f} dir/s ETA={_format_eta(eta)}")
 
-    return sorted(files)
+    return sorted(set(files))
+
+
+def read_file_list(txt_path: str) -> List[str]:
+    """Read a text file with one path per line; keep only existing .npy files."""
+    txt_path = os.path.abspath(os.path.expanduser(txt_path))
+    if not os.path.isfile(txt_path):
+        raise FileNotFoundError(f"--file_list not found: {txt_path}")
+    out: List[str] = []
+    with open(txt_path, "r") as f:
+        for line in f:
+            p = line.strip()
+            if not p:
+                continue
+            # Allow relative or absolute; normalize to absolute
+            ap = os.path.abspath(os.path.expanduser(p))
+            if ap.lower().endswith(".npy") and os.path.isfile(ap):
+                out.append(ap)
+    # De-duplicate while preserving order
+    seen = set()
+    uniq = []
+    for p in out:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+    return uniq
+
+
+def save_file_list(paths: List[str], txt_path: str) -> None:
+    """Write one absolute path per line."""
+    txt_path = os.path.abspath(os.path.expanduser(txt_path))
+    os.makedirs(os.path.dirname(txt_path) or ".", exist_ok=True)
+    with open(txt_path, "w") as f:
+        for p in paths:
+            f.write(p + "\n")
+    print(f"Saved {len(paths)} paths to {txt_path}")
 
 
 def ensure_chw(x: np.ndarray, channels: int) -> np.ndarray:
@@ -156,11 +190,9 @@ class NpyDirDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
         path = self.files[idx]
-        arr = np.load(path)
+        # honor mmap flag
+        arr = np.load(path, mmap_mode="r" if self.mmap else None)
         t = torch.from_numpy(arr).float()
-        # arr = np.load(path, mmap_mode="r" if self.mmap else None)
-        # chw = ensure_chw(arr, self.channels)
-        # t = torch.from_numpy(chw).float()
         if self.transform:
             t = self.transform(t)
         return t, path
@@ -189,7 +221,6 @@ def build_and_load_model(ckpt_path: str, device: torch.device,
 
 # --------------------------- Inference Core --------------------------------- #
 
-# @torch.inference_mode()
 def run_inference(model, dl, device, class_names: List[str],
                   total_files: int, no_probs: bool = False):
     results = []
@@ -274,12 +305,15 @@ def write_outputs(results, csv_path: str, json_path: str):
 
 def main():
     p = argparse.ArgumentParser(description="Infer over .npy files (Dataset-normalized, simplified).")
-    p.add_argument("--input_dir", required=True)
+    p.add_argument("--input_dir", required=False, help="Directory to scan for .npy files (recursive).")
+    p.add_argument("--file_list", required=False, help="Text file with one .npy path per line (skips scanning).")
+    p.add_argument("--save_file_list", required=False, help="Write discovered .npy paths to this text file.")
     p.add_argument("--ckpt", required=True)
     p.add_argument("--output_csv", default="predictions.csv")
     p.add_argument("--output_json", default="predictions.json")
     p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=8, help="DataLoader workers.")
+    p.add_argument("--scan_workers", type=int, default=None, help="Directory scanning workers (default: num_workers).")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--no_probs", action="store_true")
@@ -305,8 +339,10 @@ def main():
         raise ValueError(f"Expected 6-channel input, got {in_channels}")
 
     if args.compile:
-        try: model = torch.compile(model)
-        except Exception as e: print(f"torch.compile not enabled: {e}")
+        try:
+            model = torch.compile(model)
+        except Exception as e:
+            print(f"torch.compile not enabled: {e}")
 
     # Class names
     if len(genotype_map) == 0:
@@ -319,9 +355,22 @@ def main():
                 class_names[cidx] = str(cname)
         class_names = [c if c else str(i) for i, c in enumerate(class_names)]
 
-    # Files
-    files = list_npy_files_parallel(args.input_dir, workers=args.num_workers)
-    if not files: raise SystemExit(f"No .npy files found in {args.input_dir}")
+    # Resolve file list vs directory scan
+    files: List[str]
+    if args.file_list:
+        files = read_file_list(args.file_list)
+        if not files:
+            raise SystemExit(f"No valid .npy paths found in {args.file_list}")
+        print(f"Loaded {len(files)} paths from --file_list")
+    else:
+        if not args.input_dir:
+            raise SystemExit("Either --file_list or --input_dir must be provided.")
+        scan_workers = args.scan_workers if args.scan_workers is not None else args.num_workers
+        files = list_npy_files_parallel(args.input_dir, workers=scan_workers)
+        if not files:
+            raise SystemExit(f"No .npy files found in {args.input_dir}")
+        if args.save_file_list:
+            save_file_list(files, args.save_file_list)
 
     print_data_info(files, in_channels, args.mmap, args.sample_info_k)
 
