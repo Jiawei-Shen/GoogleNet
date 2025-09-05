@@ -112,28 +112,19 @@ def list_npy_files_parallel(root: str, workers: int) -> List[str]:
 
 
 def read_file_list(txt_path: str) -> List[str]:
-    """Read a text file with one path per line; keep only existing .npy files."""
-    txt_path = os.path.abspath(os.path.expanduser(txt_path))
-    if not os.path.isfile(txt_path):
-        raise FileNotFoundError(f"--file_list not found: {txt_path}")
-    out: List[str] = []
-    with open(txt_path, "r") as f:
-        for line in f:
-            p = line.strip()
-            if not p:
-                continue
-            # Allow relative or absolute; normalize to absolute
-            ap = os.path.abspath(os.path.expanduser(p))
-            if ap.lower().endswith(".npy") and os.path.isfile(ap):
-                out.append(ap)
-    # De-duplicate while preserving order
-    seen = set()
-    uniq = []
-    for p in out:
-        if p not in seen:
-            uniq.append(p)
-            seen.add(p)
-    return uniq
+    """
+    FAST: read one path per line, no checks, no normalization, no dedupe.
+    Keeps lines exactly as provided (after stripping whitespace).
+    """
+    with open(txt_path, "rb") as f:               # binary read is a tad faster
+        lines = f.read().splitlines()             # avoid per-line Python iteration
+    # Decode only if needed (most files are ASCII/UTF-8).
+    try:
+        return [ln.decode("utf-8").strip() for ln in lines if ln.strip()]
+    except UnicodeDecodeError:
+        # Fallback: keep bytes and rely on filesystem accepting them
+        return [ln.strip() for ln in lines if ln.strip()]
+
 
 
 def save_file_list(paths: List[str], txt_path: str) -> None:
