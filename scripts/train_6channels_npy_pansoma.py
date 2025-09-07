@@ -80,7 +80,7 @@ def print_and_log(message, log_path):
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
                 batch_size=32, num_workers=4, loss_type='weighted_ce',
                 warmup_epochs=10, weight_decay=0.05, depths=None, dims=None,
-                training_data_ratio=1.0):
+                training_data_ratio=1.0, pos_weight=88.0):  # <--- NEW: pos_weight with default 88.0
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if os.path.exists(log_file):
@@ -143,9 +143,8 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                                    depths=depths, dims=dims).to(device)
 
     model.apply(init_weights)
-    false_count = 48736
-    true_count = 268
-    pos_weight_value = min(88.0, false_count / true_count)
+    # --- REVISED: simple pos_weight (default 88.0), no min/false/true counts ---
+    pos_weight_value = float(pos_weight)
     class_weights = torch.tensor([1.0, pos_weight_value]).to(device)
 
     if loss_type == "combined":
@@ -523,6 +522,10 @@ if __name__ == "__main__":
     parser.add_argument("--training_data_ratio", type=float, default=1.0,
                         help="Proportion of training data to use (0–1]. Randomly subsamples the training set.")
 
+    # NEW: single positive-class weight knob (default 88)
+    parser.add_argument("--pos_weight", type=float, default=88.0,
+                        help="Positive class weight applied to class index 1. Default: 88.0")
+
     args = parser.parse_args()
 
     # ---- Enforce: exactly one of (data_path) OR (both files) ----
@@ -568,5 +571,5 @@ if __name__ == "__main__":
         depths=args.depths,
         dims=args.dims,
         training_data_ratio=args.training_data_ratio,
+        pos_weight=args.pos_weight,  # <--- pass through
     )
-

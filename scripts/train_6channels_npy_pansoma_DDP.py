@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 import json
 
-# --- MODIFIED: Import new schedulers ---
+# --- Schedulers ---
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -42,7 +42,7 @@ class MultiClassFocalLoss(nn.Module):
             at = self.weight.gather(0, targets)
             log_pt = log_pt * at
 
-        focal_loss = -1 * (1 - pt)**self.gamma * log_pt
+        focal_loss = -1 * (1 - pt) ** self.gamma * log_pt
 
         if self.reduction == 'mean':
             return focal_loss.mean()
@@ -109,7 +109,9 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 batch_size=32, num_workers=4, loss_type='weighted_ce',
                 warmup_epochs=10, weight_decay=0.05, depths=None, dims=None,
                 training_data_ratio=1.0, ddp=False, data_parallel=False, local_rank=0,
-                resume=None):
+                resume=None,
+                # NEW: single knob for class weight (positive class), default 88
+                pos_weight=88.0):
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if os.path.exists(log_file) and IS_MAIN_PROCESS:
@@ -206,10 +208,16 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         train_sampler = None  # for uniform API below
 
     model.apply(init_weights)
-    false_count = 48736
-    true_count = 268
-    pos_weight_value = min(88.0, false_count / true_count)
-    class_weights = torch.tensor([1.0, pos_weight_value], device=device)
+
+    # --- Class weights (simple, user-controlled) ---
+    pos_weight_value = float(pos_weight)  # positive class weight knob
+    class_weights = torch.ones(num_classes, device=device, dtype=torch.float32)
+    if num_classes >= 2:
+        class_weights[1] = pos_weight_value  # assume class index 1 is the "positive/true" class
+    else:
+        class_weights[0] = 1.0  # edge case
+
+    print_and_log(f"Class weights: {class_weights.tolist()} (from --pos_weight={pos_weight_value})", log_file)
 
     if loss_type == "combined":
         criterion = CombinedFocalWeightedCELoss(initial_lr=learning_rate, pos_weight=class_weights)
@@ -345,9 +353,9 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
         # True-class metrics
         val_prec_true = val_metrics.get('precision_true', 0.0)
-        val_rec_true  = val_metrics.get('recall_true', 0.0)
-        val_f1_true   = val_metrics.get('f1_true', 0.0)
-        pos_idx       = val_metrics.get('pos_class_idx', None)
+        val_rec_true = val_metrics.get('recall_true', 0.0)
+        val_f1_true = val_metrics.get('f1_true', 0.0)
+        pos_idx = val_metrics.get('pos_class_idx', None)
 
         summary_msg = (
             f"Epoch {epoch + 1}/{num_epochs} Summary - "
@@ -386,7 +394,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             best_val_loss = val_loss
             best_epoch = epoch + 1
 
-            # --- NEW: filename encodes epoch and F1; never overwrite previous bests ---
+            # filename encodes epoch and F1; never overwrite previous bests
             ckpt_name = f"model_e{best_epoch:03d}_f1_{best_f1_true:.4f}.pth"
             best_path = os.path.join(output_path, ckpt_name)
             best_path = _unique_path(best_path)
@@ -454,15 +462,15 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
 
     # Tensors for global metrics (on device)
     correct_eval = torch.zeros(1, device=device, dtype=torch.long)
-    total_eval   = torch.zeros(1, device=device, dtype=torch.long)
-    loss_sum     = torch.zeros(1, device=device, dtype=torch.float)
+    total_eval = torch.zeros(1, device=device, dtype=torch.long)
+    loss_sum = torch.zeros(1, device=device, dtype=torch.float)
 
     # Per-class counters for metrics
     tp = torch.zeros(num_classes, device=device, dtype=torch.long)
     fp = torch.zeros(num_classes, device=device, dtype=torch.long)
     fn = torch.zeros(num_classes, device=device, dtype=torch.long)
     class_correct_counts = torch.zeros(num_classes, device=device, dtype=torch.long)
-    class_total_counts   = torch.zeros(num_classes, device=device, dtype=torch.long)
+    class_total_counts = torch.zeros(num_classes, device=device, dtype=torch.long)
 
     inference_results = defaultdict(list)
     idx_to_class = {v: k for k, v in genotype_map.items()} if genotype_map else {}
@@ -513,15 +521,15 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
 
     if ddp and world_size > 1 and dist.is_initialized():
         dist.all_reduce(correct_eval, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_eval,   op=dist.ReduceOp.SUM)
-        dist.all_reduce(loss_sum,     op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_eval, op=dist.ReduceOp.SUM)
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
 
         if num_classes > 0:
             dist.all_reduce(tp, op=dist.ReduceOp.SUM)
             dist.all_reduce(fp, op=dist.ReduceOp.SUM)
             dist.all_reduce(fn, op=dist.ReduceOp.SUM)
             dist.all_reduce(class_correct_counts, op=dist.ReduceOp.SUM)
-            dist.all_reduce(class_total_counts,   op=dist.ReduceOp.SUM)
+            dist.all_reduce(class_total_counts, op=dist.ReduceOp.SUM)
 
     denom_batches = max(1, batch_count_eval * (world_size if (ddp and world_size > 1) else 1))
     avg_loss_eval = (loss_sum.item() / denom_batches)
@@ -531,7 +539,7 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
     if genotype_map:
         for class_name, class_idx in genotype_map.items():
             correct_c = int(class_correct_counts[class_idx].item())
-            total_c   = int(class_total_counts[class_idx].item())
+            total_c = int(class_total_counts[class_idx].item())
             acc_c = (correct_c / total_c * 100.0) if total_c > 0 else 0.0
             class_performance_stats[class_name] = {
                 'acc': acc_c, 'correct': correct_c, 'total': total_c, 'idx': class_idx
@@ -561,9 +569,9 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
     fnc = float(fn[pos_idx].item() if pos_idx < num_classes else 0.0)
 
     precision_true = (tpc / (tpc + fpc)) if (tpc + fpc) > 0 else 0.0
-    recall_true    = (tpc / (tpc + fnc)) if (tpc + fnc) > 0 else 0.0
-    f1_true        = (2 * precision_true * recall_true / (precision_true + recall_true)) \
-                     if (precision_true + recall_true) > 0 else 0.0
+    recall_true = (tpc / (tpc + fnc)) if (tpc + fnc) > 0 else 0.0
+    f1_true = (2 * precision_true * recall_true / (precision_true + recall_true)) \
+        if (precision_true + recall_true) > 0 else 0.0
 
     metrics = {
         'precision_true': precision_true,
@@ -627,7 +635,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for data loading")
 
-    # Optimizer / scheduler (unchanged)
+    # Optimizer / scheduler
     parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of epochs for linear LR warmup")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
     parser.add_argument("--save_val_results", action='store_true', help="Save validation results when best is found.")
@@ -650,9 +658,13 @@ if __name__ == "__main__":
     parser.add_argument("--data_parallel", action="store_true",
                         help="Use nn.DataParallel across all visible GPUs (single process). Ignored if --ddp is set.")
 
-    # NEW: resume from checkpoint
+    # Resume
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to a checkpoint .pth to resume training (loads model/optimizer/scheduler/epoch).")
+
+    # --- NEW: single positive-class weight knob (default 88) ---
+    parser.add_argument("--pos_weight", type=float, default=88.0,
+                        help="Positive class weight applied to class index 1. Default: 88.0")
 
     args = parser.parse_args()
 
@@ -676,7 +688,7 @@ if __name__ == "__main__":
         data_path_or_pair = os.path.abspath(os.path.expanduser(args.data_path))
     else:
         train_roots = _read_paths_file(args.train_data_paths_file)
-        val_roots   = _read_paths_file(args.val_data_paths_file)
+        val_roots = _read_paths_file(args.val_data_paths_file)
         if not train_roots:
             parser.error(f"--train_data_paths_file is empty or unreadable: {args.train_data_paths_file}")
         if not val_roots:
@@ -713,6 +725,8 @@ if __name__ == "__main__":
         training_data_ratio=args.training_data_ratio,
         ddp=args.ddp, data_parallel=args.data_parallel, local_rank=local_rank,
         resume=args.resume,
+        # NEW: single knob
+        pos_weight=args.pos_weight,
     )
 
     if args.ddp and dist.is_initialized():
