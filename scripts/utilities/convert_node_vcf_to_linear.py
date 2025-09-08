@@ -8,7 +8,8 @@ Convert a node/offset VCF to linear-reference coordinates and write TWO outputs:
 Additionally prints:
   - Variant counts by class (reference / ref-alt / alt-alt)
   - DISTINCT NODE COUNTS by class (reference / ref-alt / alt-alt) observed in the VCF
-  - TSV coverage of ref-alt nodes: how many ref-alt nodes seen in the VCF are/aren't in TSV REF column
+  - TSV coverage of ref-alt nodes **against the TSV ALT column**:
+      how many ref-alt nodes seen in the VCF are/aren't present in the TSV ALT column
 
 Classification rule for nodes (JSON-driven):
   - reference: JSON record contains 'genomead_af' (case-insensitive, nested allowed)
@@ -44,9 +45,9 @@ except Exception:
 def load_alt_to_ref_tsv(tsv_path: Optional[str]) -> Tuple[Dict[int, int], Set[int], Set[int]]:
     """
     Returns:
-      alt_to_ref : dict mapping ALT node -> REF node
-      tsv_ref_nodes : set of REF node ids present in TSV (even if no ALT listed)
-      tsv_alt_nodes : set of ALT node ids present in TSV
+      alt_to_ref     : dict mapping ALT node -> REF node
+      tsv_ref_nodes  : set of REF node ids present in TSV (even if no ALT listed)
+      tsv_alt_nodes  : set of ALT node ids present in TSV
     """
     if not tsv_path:
         return {}, set(), set()
@@ -70,13 +71,14 @@ def load_alt_to_ref_tsv(tsv_path: Optional[str]) -> Tuple[Dict[int, int], Set[in
             raise ValueError("TSV must have REF_NODE and ALT_NODE(S) columns (case-insensitive).")
 
         for row in reader:
-            # collect REF node even if no ALT listed
+            # collect REF node
             try:
                 ref_node = int(str(row[ref_node_key]).strip())
                 tsv_ref_nodes.add(ref_node)
             except Exception:
                 continue
 
+            # collect ALT nodes and ALT->REF mapping
             alts_raw = str(row[alt_nodes_key]).strip()
             for token in re.findall(r"\d+", alts_raw):
                 try:
@@ -450,13 +452,13 @@ def convert_vcf(
     print(f"ref-alt nodes   : {len(nodes_refalt_seen)}")
     print(f"alt-alt nodes   : {len(nodes_altalt_seen)}")
 
-    # TSV coverage of ref-alt nodes (observed in VCF)
-    refalt_missing_in_tsv = {n for n in nodes_refalt_seen if n not in tsv_ref_nodes}
+    # TSV coverage of ref-alt nodes (observed in VCF) — check TSV **ALT** column
+    refalt_missing_in_tsv = {n for n in nodes_refalt_seen if n not in tsv_alt_nodes}
     refalt_present_in_tsv = nodes_refalt_seen - refalt_missing_in_tsv
-    print("\n=== TSV coverage of ref-alt nodes (observed in VCF) ===")
+    print("\n=== TSV coverage of ref-alt nodes (VS TSV ALT column) ===")
     print(f"ref-alt nodes seen in VCF             : {len(nodes_refalt_seen)}")
-    print(f"found in TSV REF column               : {len(refalt_present_in_tsv)}")
-    print(f"NOT found in TSV REF column           : {len(refalt_missing_in_tsv)}")
+    print(f"found in TSV ALT column               : {len(refalt_present_in_tsv)}")
+    print(f"NOT found in TSV ALT column           : {len(refalt_missing_in_tsv)}")
 
     # (Optional) TSV presence of VCF nodes in general
     tsv_ref_seen = len({n for n in (nodes_ref_seen | nodes_refalt_seen | nodes_altalt_seen) if n in tsv_ref_nodes})
@@ -492,7 +494,7 @@ def main():
     ap.add_argument("--in_vcf",             required=True, help="Input VCF (.vcf or .vcf.gz) with CHROM=node_id, POS=offset.")
     ap.add_argument("--map_json",           required=True, help="Node map JSON (array) or JSONL.")
     ap.add_argument("--map_jsonl",          action="store_true", help="Interpret --map_json as JSONL.")
-    ap.add_argument("--tsv",                default=None, help="Optional TSV mapping ALT_NODE(S) -> REF_NODE; also used to test membership in REF column.")
+    ap.add_argument("--tsv",                default=None, help="Optional TSV mapping ALT_NODE(S) -> REF_NODE; coverage checks use TSV ALT column.")
     ap.add_argument("--out_linear_vcf",     required=True, help="Output path for linear VCF.GZ (will be bgzip compressed and indexed).")
     ap.add_argument("--out_nodes_vcf",      required=True, help="Output path for node-form VCF.GZ (will be bgzip compressed and indexed).")
     ap.add_argument("--offset_is_0_based",  type=lambda s: str(s).lower() in ("1","true","t","yes","y"), default=True,
