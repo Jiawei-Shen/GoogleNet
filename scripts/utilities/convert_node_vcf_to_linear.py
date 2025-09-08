@@ -3,12 +3,21 @@
 Convert a node/offset VCF to linear-reference coordinates and write TWO outputs:
 
   1) --out_linear_vcf.gz : records successfully converted to linear (CHROM=chr*, POS=linear)
-  2) --out_nodes_vcf.gz  : records that stayed in node form (CHROM=node_id, POS=offset)
+  2) --out_nodes_vcf.gz  : records that stayed in node form (CHROM=node_id, POS=offset+1 for VCF)
+
+Additionally prints:
+  - Variant counts by class (reference / ref-alt / alt-alt)
+  - DISTINCT NODE COUNTS by class (reference / ref-alt / alt-alt) observed in the VCF
+
+Classification rule for nodes:
+  - reference: JSON record contains 'genomead_af' (case-insensitive, nested allowed)
+  - ref-alt  : JSON record exists but lacks 'genomead_af'
+  - alt-alt  : node id not present in the JSON
 
 VCF COMPLIANCE:
-- Only the standard 8 columns are written (#CHROM POS ID REF ALT QUAL FILTER INFO).
-- Original node/offset are preserved in INFO as:
-    NID=<node_id>;NSO=<offset>
+- Only standard 8 columns are written.
+- Original node/offset are preserved in INFO as: NID=<node_id>;NSO=<offset>
+- For node-form output, POS is written as (offset + 1) to satisfy VCF/tabix (1-based).
 """
 
 import argparse
@@ -18,7 +27,7 @@ import json
 import os
 import re
 import sys
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union, Set
 
 from tqdm import tqdm
 
@@ -105,14 +114,30 @@ def iter_node_map_records(json_path: str, jsonl: bool) -> Iterable[dict]:
         else:
             raise ValueError("Unsupported JSON structure for node map.")
 
+def _has_key_case_insensitive(obj: dict, key_name: str) -> bool:
+    """True if key_name (case-insensitive) appears anywhere in obj (recursively)."""
+    kn = key_name.lower()
+    for k, v in obj.items():
+        if str(k).lower() == kn:
+            return True
+        if isinstance(v, dict) and _has_key_case_insensitive(v, key_name):
+            return True
+        if isinstance(v, (list, tuple)):
+            for elt in v:
+                if isinstance(elt, dict) and _has_key_case_insensitive(elt, key_name):
+                    return True
+    return False
+
 def load_node_map(json_path: str,
                   jsonl: bool,
                   node_start_is_1_based: bool = True) -> Tuple[
                       Dict[int, Tuple[str, int, str, int]],  # anchors: node -> (chrom, start0, strand, length)
-                      set
+                      Set[int],                              # nodes_seen in JSON
+                      Set[int],                              # nodes_with_genomead_af (reference nodes by rule)
                   ]:
     anchors: Dict[int, Tuple[str, int, str, int]] = {}
-    nodes_seen: set = set()
+    nodes_seen: Set[int] = set()
+    nodes_with_genomead_af: Set[int] = set()
 
     for rec in iter_node_map_records(json_path, jsonl):
         nid = _first_present(rec, ["node_id", "node", "id", "nid"])
@@ -120,6 +145,9 @@ def load_node_map(json_path: str,
         if node_id is None:
             continue
         nodes_seen.add(node_id)
+
+        if _has_key_case_insensitive(rec, "genomead_af"):
+            nodes_with_genomead_af.add(node_id)
 
         chrom = _first_present(rec, ["chrom", "chr", "chromosome", "contig"])
         start1 = _first_present(rec, ["grch38_position_start", "start_1based", "pos1"])
@@ -147,7 +175,7 @@ def load_node_map(json_path: str,
         if chrom is not None and s0 is not None and length is not None:
             anchors[node_id] = (str(chrom), int(s0), strand if strand in ("+", "-") else "+", int(length))
 
-    return anchors, nodes_seen
+    return anchors, nodes_seen, nodes_with_genomead_af
 
 
 # ------------------------ VCF helpers ------------------------ #
@@ -184,16 +212,16 @@ def convert_vcf(
     out_linear_vcf_gz: str,
     out_nodes_vcf_gz: str,
     anchors: Dict[int, Tuple[str, int, str, int]],
-    nodes_seen_in_json: set,
+    nodes_seen_in_json: Set[int],
+    ref_nodes_with_af: Set[int],
     alt_to_ref: Dict[int, int],
     offset_is_0_based: bool,
     sort_records: bool,
-    compress_level: int,  # kept for CLI compatibility; not used by pysam.tabix_index
+    compress_level: int,
     do_index: bool,
 ) -> None:
     header_lines, total = parse_vcf_header_and_count_records(in_vcf)
 
-    # Keep meta lines except old contigs and #CHROM header; we'll write our own.
     kept_header = [
         h for h in header_lines
         if not h.startswith("##contig=")
@@ -203,7 +231,13 @@ def convert_vcf(
 
     converted: List[Tuple[str, int, str, str, str, str, str]] = []
     unconverted: List[Tuple[Union[str,int], Union[str,int], str, str, str, str, str]] = []
-    # tuples: (CHROM, POS, ID, REF, ALT, QUAL, FILTER, INFO)
+
+    # Variant counters
+    cnt_ref = cnt_refalt = cnt_altalt = cnt_nonnum = 0
+    # DISTINCT node sets observed in VCF
+    nodes_ref_seen: Set[int] = set()
+    nodes_refalt_seen: Set[int] = set()
+    nodes_altalt_seen: Set[int] = set()
 
     with open_maybe_gzip(in_vcf) as fin, \
          tqdm(total=total if total > 0 else None, desc="Convert", unit="rec",
@@ -231,13 +265,29 @@ def convert_vcf(
             try:
                 node_id = int(chrom_node)
                 offset  = int(pos_offset)
+                is_numeric = True
             except Exception:
-                # Not a node-form record; keep as unconverted but preserve original as NID/NSO
+                is_numeric = False
+
+            # Classify for counts + distinct node sets
+            if not is_numeric:
+                cnt_nonnum += 1
                 info2 = append_info(info, [("NID", str(chrom_node)), ("NSO", str(pos_offset))])
                 unconverted.append((chrom_node, pos_offset, vid, ref, alt, qual, filt, info2))
                 if total:
                     bar.update(1)
                 continue
+            else:
+                if node_id in nodes_seen_in_json:
+                    if node_id in ref_nodes_with_af:
+                        cnt_ref += 1
+                        nodes_ref_seen.add(node_id)
+                    else:
+                        cnt_refalt += 1
+                        nodes_refalt_seen.add(node_id)
+                else:
+                    cnt_altalt += 1
+                    nodes_altalt_seen.add(node_id)
 
             base_node = node_id
 
@@ -248,24 +298,21 @@ def convert_vcf(
                 anchor = anchors.get(ref_node_candidate)
             if anchor is None:
                 anchor = anchors.get(base_node)
-
-            # If still no anchor but node appears in JSON (sequence-only), try its REF from TSV
             if anchor is None and base_node in nodes_seen_in_json and ref_node_candidate is not None:
                 anchor = anchors.get(ref_node_candidate)
 
-            # Always preserve original coords in INFO as NID/NSO
+            # Preserve original node/offset in INFO
             info2 = append_info(info, [("NID", str(node_id)), ("NSO", str(offset))])
 
             if anchor is None:
-                # Could not convert — keep in node coords
-                unconverted.append((str(node_id), int(offset), vid, ref, alt, qual, filt, info2))
+                # Keep in node coords; write POS as offset+1 (VCF is 1-based)
+                pos_for_nodes_vcf = (offset if not offset_is_0_based else offset + 1)
+                unconverted.append((str(node_id), int(pos_for_nodes_vcf), vid, ref, alt, qual, filt, info2))
                 if total:
                     bar.update(1)
                 continue
 
             chrom_lin, start0, strand, length = anchor
-
-            # Compute linear 1-based POS (strand-aware)
             off0 = offset if offset_is_0_based else (offset - 1)
             if strand == "+":
                 pos_lin = start0 + off0 + 1
@@ -276,7 +323,7 @@ def convert_vcf(
             if total:
                 bar.update(1)
 
-    # Sort if requested or if indexing is requested (tabix requires sorted)
+    # Sorting (needed for tabix)
     need_sort = sort_records or do_index
     if need_sort:
         def chrom_key_linear(c: str):
@@ -292,22 +339,19 @@ def convert_vcf(
 
         def chrom_key_nodes(c: Union[str,int]):
             try:
-                # numeric node IDs first
                 return (0, int(c))
             except Exception:
                 return (1, str(c))
         unconverted.sort(key=lambda r: (chrom_key_nodes(r[0]), int(r[1]) if str(r[1]).isdigit() else 0))
 
-    # Collect contigs for each output
-    lin_contigs = []
-    seen_lin = set()
+    # Collect contigs
+    lin_contigs, seen_lin = [], set()
     for c, *_ in converted:
         if c not in seen_lin:
             seen_lin.add(c)
             lin_contigs.append(c)
 
-    node_contigs = []
-    seen_node = set()
+    node_contigs, seen_node = [], set()
     for c, *_ in unconverted:
         sc = str(c)
         if sc not in seen_node:
@@ -323,19 +367,11 @@ def convert_vcf(
                               records: List[Tuple],
                               contigs: List[str],
                               meta_desc: str):
-        """
-        Write a temporary plain VCF, then:
-          - if do_index=True: use pysam.tabix_index(tmp_vcf, preset='vcf', force=True, keep_original=False)
-            which auto-compresses to .vcf.gz and builds .tbi (per pysam docs).
-          - else: only compress via pysam.tabix_compress(tmp_vcf, final_gz_path, force=True)
-        Finally, move/rename to requested final_gz_path if needed.
-        """
         if not final_gz_path.endswith(".vcf.gz"):
             final_gz_path = final_gz_path + ".vcf.gz"
         os.makedirs(os.path.dirname(final_gz_path), exist_ok=True)
-        tmp_vcf = final_gz_path[:-3]  # strip '.gz' -> '.vcf'
+        tmp_vcf = final_gz_path[:-3]
 
-        # Write plain VCF
         with open(tmp_vcf, "w", encoding="utf-8") as out:
             for h in kept_header:
                 if h.startswith("#CHROM"):
@@ -357,13 +393,9 @@ def convert_vcf(
                     wbar.update(1)
 
         ensure_pysam_or_die()
-
         if do_index:
-            # Compress + index in one shot (per pysam.tabix_index doc)
             produced_gz = pysam.tabix_index(tmp_vcf, preset="vcf", force=True, keep_original=False)
             produced_tbi = produced_gz + ".tbi"
-
-            # If produced name differs from desired final_gz_path, rename both
             if os.path.abspath(produced_gz) != os.path.abspath(final_gz_path):
                 try:
                     if os.path.exists(final_gz_path):
@@ -375,7 +407,6 @@ def convert_vcf(
                     os.replace(produced_tbi, final_gz_path + ".tbi")
             return final_gz_path, final_gz_path + ".tbi"
         else:
-            # Only compress (no index). Use the broadest-compatible signature.
             if os.path.exists(final_gz_path):
                 try:
                     os.remove(final_gz_path)
@@ -384,9 +415,7 @@ def convert_vcf(
             try:
                 pysam.tabix_compress(tmp_vcf, final_gz_path, force=True)
             except TypeError:
-                # Very old pysam without kwargs
                 pysam.tabix_compress(tmp_vcf, final_gz_path)
-            # Remove temporary plain VCF to match keep_original=False behavior
             try:
                 os.remove(tmp_vcf)
             except Exception:
@@ -403,7 +432,25 @@ def convert_vcf(
         out_nodes_vcf_gz, unconverted, node_contigs, meta_desc="UNCONVERTED"
     )
 
-    print(f"Done.\n  Linear : {os.path.abspath(linear_gz)} (records={len(converted)})"
+    # PRINT distinct node counts (from VCF)
+    print("=== Distinct node counts (observed in VCF) ===")
+    print(f"reference nodes : {len(nodes_ref_seen)}")
+    print(f"ref-alt nodes   : {len(nodes_refalt_seen)}")
+    print(f"alt-alt nodes   : {len(nodes_altalt_seen)}")
+
+    # PRINT variant counts
+    total_classified = cnt_ref + cnt_refalt + cnt_altalt
+    grand_total = total_classified + cnt_nonnum
+    print("\n=== Variant class counts (by input node id) ===")
+    print(f"reference : {cnt_ref}")
+    print(f"ref-alt   : {cnt_refalt}")
+    print(f"alt-alt   : {cnt_altalt}")
+    print(f"----------------------------------")
+    print(f"TOTAL (node CHROM only): {total_classified}")
+    if cnt_nonnum:
+        print(f"Non-numeric CHROM (ignored in classes): {cnt_nonnum}  (grand total lines = {grand_total})")
+
+    print(f"\nDone.\n  Linear : {os.path.abspath(linear_gz)} (records={len(converted)})"
           f"{'' if not linear_tbi else f'  [index: {os.path.abspath(linear_tbi)}]'}\n"
           f"  Nodes  : {os.path.abspath(nodes_gz)} (records={len(unconverted)})"
           f"{'' if not nodes_tbi else f'  [index: {os.path.abspath(nodes_tbi)}]'}")
@@ -412,7 +459,7 @@ def convert_vcf(
 # ------------------------ CLI ------------------------ #
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert node/offset VCF to linear-reference coordinates; output linear + node VCF.GZ (tabix-indexed).")
+    ap = argparse.ArgumentParser(description="Convert node/offset VCF to linear-reference coordinates; output linear + node VCF.GZ (tabix-indexed) and print class & node counts.")
     ap.add_argument("--in_vcf",             required=True, help="Input VCF (.vcf or .vcf.gz) with CHROM=node_id, POS=offset.")
     ap.add_argument("--map_json",           required=True, help="Node map JSON (array) or JSONL.")
     ap.add_argument("--map_jsonl",          action="store_true", help="Interpret --map_json as JSONL.")
@@ -428,7 +475,6 @@ def main():
     ap.add_argument("--compress-level",     type=int, default=6, help="(Kept for compatibility; pysam.tabix_index does not accept level.)")
     args = ap.parse_args()
 
-    # Normalize output names to end with .vcf.gz
     def normalize_vcfgz(p: str) -> str:
         if p.endswith(".vcf.gz"):
             return p
@@ -455,12 +501,16 @@ def main():
     if alt_to_ref:
         print(f"ALT->REF mappings loaded: {len(alt_to_ref)}")
 
-    anchors, nodes_seen = load_node_map(
+    anchors, nodes_seen, ref_nodes_with_af = load_node_map(
         args.map_json,
         jsonl=args.map_jsonl,
         node_start_is_1_based=args.node_start_is_1_based
     )
-    print(f"Node map: anchors={len(anchors)} (with chrom+start+strand+length), nodes_seen={len(nodes_seen)}")
+    # Optional JSON-level node summary (distinct nodes present in JSON)
+    n_ref_nodes_json  = len(ref_nodes_with_af)
+    n_refalt_nodes_json = len(nodes_seen - ref_nodes_with_af)
+    print(f"Node map: anchors={len(anchors)} (with chrom+start+strand+length), nodes_seen={len(nodes_seen)} "
+          f"(reference nodes={n_ref_nodes_json}, ref-alt nodes={n_refalt_nodes_json})")
 
     convert_vcf(
         in_vcf=args.in_vcf,
@@ -468,6 +518,7 @@ def main():
         out_nodes_vcf_gz=out_nodes_vcf_gz,
         anchors=anchors,
         nodes_seen_in_json=nodes_seen,
+        ref_nodes_with_af=ref_nodes_with_af,
         alt_to_ref=alt_to_ref,
         offset_is_0_based=args.offset_is_0_based,
         sort_records=args.sort,
