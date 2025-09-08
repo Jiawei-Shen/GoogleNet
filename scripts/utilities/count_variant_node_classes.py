@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """
-Count variants by node class: reference nodes, ref-alt nodes, and alt-alt nodes.
+Count variants by node class (reference / ref-alt / alt-alt) from a node/offset VCF.
 
-Definitions (based on your JSON):
-- Reference node: JSON record has population AF (or other extra metadata),
-  OR in general has more than just node id + reference sequence.
-- Ref-alt node: JSON record only includes "node id" and a reference/sequence field.
-- Alt-alt node: node id not present in the JSON at all.
+Classification rule (per user spec):
+  - reference node: JSON record HAS `genomead_af` (case-insensitive; nested allowed)
+  - ref-alt node : JSON record exists but DOES NOT have `genomead_af`
+  - alt-alt node : node_id not present in JSON at all
 
-Input:
-  - Node/metadata JSON (array/dict OR JSONL).
-  - VCF where CHROM is a numeric node_id (node/offset format). Non-numeric CHROM lines are ignored.
+Inputs:
+  --in_vcf    : VCF with CHROM = numeric node_id (non-numeric CHROM lines are ignored but tallied)
+  --map_json  : Node JSON (array-of-objects OR dict-of-objects), or JSONL with --map_jsonl
+  --map_jsonl : Interpret --map_json as JSON Lines (one dict per line)
+  --out_tsv   : (optional) write counts as a TSV
 
-Output:
-  - Prints counts and percentages for each class.
-  - Optional TSV with counts.
-
-Usage:
+Usage example:
   python count_variant_node_classes.py \
-      --in_vcf node_coords.vcf.gz \
+      --in_vcf nodes.vcf.gz \
       --map_json nodes.json \
-      [--map_jsonl] \
-      [--out_tsv counts.tsv]
+      --out_tsv node_counts.tsv
 """
 
 import argparse
@@ -30,16 +26,10 @@ import json
 import sys
 from typing import Dict, Iterable, Iterator, Optional, Tuple
 
-# ---- JSON helpers ----
+
+# ---------------- JSON helpers ----------------
 
 ID_KEYS = {"node_id", "node", "id", "nid"}
-REFSEQ_KEYS = {"reference", "ref", "ref_seq", "refseq", "sequence", "seq"}
-
-# AF-like keys we’ll recognize explicitly; extend as needed.
-AF_KEYS = {
-    "af", "population_af", "pop_af", "allele_frequency", "global_af",
-    "gnomad_af", "af_popmax", "af_1000g", "af_gnomad", "af_graph"
-}
 
 def _get_first(d: dict, keys: Iterable[str]):
     for k in keys:
@@ -56,35 +46,23 @@ def _node_id_from_obj(obj: dict) -> Optional[int]:
     except Exception:
         return None
 
-def _has_af_like(obj: dict) -> bool:
+def _has_key_recursive(obj: dict, wanted_keys_lower: set) -> bool:
+    """Return True if any of the wanted keys (lowercased) appear anywhere in (possibly nested) dict."""
     for k, v in obj.items():
-        lk = str(k).lower()
-        if lk in AF_KEYS:
-            # Any non-empty / numeric value counts
-            if v is None:
-                continue
-            try:
-                float(v)
-                return True
-            except Exception:
-                # If it's not directly numeric but present, still treat as AF-like
-                return True
+        if str(k).lower() in wanted_keys_lower:
+            return True
+        if isinstance(v, dict) and _has_key_recursive(v, wanted_keys_lower):
+            return True
+        # If lists may contain dicts, scan them too
+        if isinstance(v, (list, tuple)):
+            for elt in v:
+                if isinstance(elt, dict) and _has_key_recursive(elt, wanted_keys_lower):
+                    return True
     return False
 
-def _is_ref_alt_minimal(obj: dict) -> bool:
-    """
-    True if the record is essentially {id + reference/seq} and nothing else.
-    """
-    keys = set(obj.keys())
-    # must have at least one id-key and one ref-seq key, and nothing beyond those
-    has_id = any(k in keys for k in ID_KEYS)
-    has_ref = any(k in keys for k in REFSEQ_KEYS)
-    extra = keys - (ID_KEYS | REFSEQ_KEYS)
-    return has_id and has_ref and len(extra) == 0
-
 def iter_json_records(path: str, jsonl: bool) -> Iterator[dict]:
+    """Yield dict records from JSON (list/dict) or JSONL (one dict per line)."""
     if jsonl:
-        # JSON Lines: one JSON object per line
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 s = line.strip()
@@ -97,7 +75,6 @@ def iter_json_records(path: str, jsonl: bool) -> Iterator[dict]:
                 if isinstance(obj, dict):
                     yield obj
     else:
-        # JSON: allow dict-of-dicts or list-of-dicts
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
@@ -109,37 +86,28 @@ def iter_json_records(path: str, jsonl: bool) -> Iterator[dict]:
                 if isinstance(v, dict):
                     yield v
         else:
-            raise ValueError("Unsupported JSON structure (expect list/dict of dicts or JSONL).")
+            raise ValueError("Unsupported JSON structure: expected list/dict of dicts, or use --map_jsonl")
 
 def build_node_class_map(json_path: str, jsonl: bool) -> Dict[int, str]:
     """
-    Returns a mapping: node_id -> class {'reference', 'ref-alt'}.
-    Nodes absent from this map are implicitly 'alt-alt'.
+    Returns node_id -> {'reference','ref-alt'}
+    Nodes not present in the map are 'alt-alt'.
     """
     cls_map: Dict[int, str] = {}
+    wanted = {"genomead_af"}  # case-insensitive match
 
     for obj in iter_json_records(json_path, jsonl):
         nid = _node_id_from_obj(obj)
         if nid is None:
             continue
-
-        # Priority: explicit AF-like -> 'reference'
-        if _has_af_like(obj):
+        if _has_key_recursive(obj, wanted):
             cls_map[nid] = "reference"
-            continue
-
-        # Minimal (id + reference only) -> 'ref-alt'
-        if _is_ref_alt_minimal(obj):
-            # Only set if not already marked as 'reference'
-            cls_map.setdefault(nid, "ref-alt")
-            continue
-
-        # Otherwise, has "some other information" -> 'reference'
-        cls_map[nid] = "reference"
-
+        else:
+            cls_map[nid] = "ref-alt"
     return cls_map
 
-# ---- VCF helpers ----
+
+# ---------------- VCF helpers ----------------
 
 def open_text_auto(path: str):
     if path.endswith(".gz"):
@@ -148,8 +116,8 @@ def open_text_auto(path: str):
 
 def count_variants_by_class(vcf_path: str, node_class: Dict[int, str]) -> Tuple[int, int, int, int]:
     """
-    Returns tuple: (n_reference, n_ref_alt, n_alt_alt, n_non_numeric_chrom)
-    Non-numeric CHROM lines (e.g., linear contigs) are counted separately and excluded from classes.
+    Returns: (n_reference, n_ref_alt, n_alt_alt, n_non_numeric_chrom)
+    Only lines with numeric CHROM (node ids) are classified; others are tallied separately.
     """
     n_ref = n_refalt = n_altalt = n_nonnum = 0
     with open_text_auto(vcf_path) as f:
@@ -178,11 +146,14 @@ def count_variants_by_class(vcf_path: str, node_class: Dict[int, str]) -> Tuple[
 def pct(n: int, d: int) -> str:
     return f"{(100.0 * n / d):.2f}%" if d else "0.00%"
 
+
+# ---------------- CLI ----------------
+
 def main():
-    ap = argparse.ArgumentParser(description="Count VCF records by node class (reference, ref-alt, alt-alt) using a node JSON.")
-    ap.add_argument("--in_vcf", required=True, help="Input VCF (.vcf or .vcf.gz) where CHROM is a numeric node_id.")
-    ap.add_argument("--map_json", required=True, help="Node map JSON (list/dict) or JSONL of node records.")
-    ap.add_argument("--map_jsonl", action="store_true", help="Interpret --map_json as JSONL.")
+    ap = argparse.ArgumentParser(description="Count variants on reference / ref-alt / alt-alt nodes (uses 'genomead_af' to identify reference nodes).")
+    ap.add_argument("--in_vcf", required=True, help="Input VCF (.vcf or .vcf.gz) with CHROM=node_id.")
+    ap.add_argument("--map_json", required=True, help="Node metadata JSON (array/dict) or JSONL (use --map_jsonl).")
+    ap.add_argument("--map_jsonl", action="store_true", help="Interpret --map_json as JSONL (one JSON object per line).")
     ap.add_argument("--out_tsv", default=None, help="Optional: write counts to this TSV.")
     args = ap.parse_args()
 
@@ -193,20 +164,20 @@ def main():
     node_class = build_node_class_map(args.map_json, args.map_jsonl)
     n_ref_nodes  = sum(1 for c in node_class.values() if c == "reference")
     n_ralt_nodes = sum(1 for c in node_class.values() if c == "ref-alt")
-    print(f"Node classes from JSON -> reference:{n_ref_nodes}  ref-alt:{n_ralt_nodes}  (others default to alt-alt)")
+    print(f"Node classes from JSON -> reference:{n_ref_nodes}  ref-alt:{n_ralt_nodes}  (others => alt-alt)")
 
     n_ref, n_refalt, n_altalt, n_nonnum = count_variants_by_class(args.in_vcf, node_class)
     total = n_ref + n_refalt + n_altalt
     grand = total + n_nonnum
 
-    print("\n=== Variant counts (by VCF record) ===")
+    print("\n=== Variant counts (node-CHROM only) ===")
     print(f"reference : {n_ref:10d}  ({pct(n_ref, total)})")
     print(f"ref-alt   : {n_refalt:10d}  ({pct(n_refalt, total)})")
     print(f"alt-alt   : {n_altalt:10d}  ({pct(n_altalt, total)})")
     print(f"----------------------------------------")
-    print(f"TOTAL (node-CHROM only): {total:10d}")
+    print(f"TOTAL     : {total:10d}")
     if n_nonnum:
-        print(f"Non-numeric CHROM (ignored): {n_nonnum}  (grand total lines incl. linear = {grand})")
+        print(f"Non-numeric CHROM (ignored in classes): {n_nonnum}  (grand total lines = {grand})")
 
     if args.out_tsv:
         try:
