@@ -3,23 +3,21 @@
 Convert a node/offset VCF to linear-reference coordinates and write TWO outputs:
 
   1) --out_linear_vcf.gz : records successfully converted to linear (CHROM=chr*, POS=linear)
-  2) --out_nodes_vcf.gz  : records that stayed in node form (CHROM=node_id, POS=offset+1)
+  2) --out_nodes_vcf.gz  : records that stayed in node form (CHROM=node_id, POS=offset+1 for VCF)
 
-Also PRINTS:
-  - Distinct node counts observed in the VCF by class (reference / ref-alt / alt-alt)
-  - Variant counts by class
-  - TSV sanity stats (how many TSV ALT/REF nodes appear in the VCF)
+Additionally prints:
+  - Variant counts by class (reference / ref-alt / alt-alt)
+  - DISTINCT NODE COUNTS by class (reference / ref-alt / alt-alt) observed in the VCF
 
-CLASSIFICATION PRECEDENCE (for node_id observed in the VCF):
-  1) If node_id ∈ TSV_ALT            -> ref-alt
-  2) Else if node_id ∈ TSV_REF
-         OR node_id has genomead_af  -> reference
-  3) Else if node_id ∈ JSON (no AF)  -> ref-alt
-  4) Else                            -> alt-alt
+Classification rule for nodes:
+  - reference: JSON record contains 'genomead_af' (case-insensitive, nested allowed)
+  - ref-alt  : JSON record exists but lacks 'genomead_af'
+  - alt-alt  : node id not present in the JSON
 
 VCF COMPLIANCE:
 - Only standard 8 columns are written.
-- Node-form output uses POS = offset+1 (1-based); original node/offset preserved in INFO as NID/NSO.
+- Original node/offset are preserved in INFO as: NID=<node_id>;NSO=<offset>
+- For node-form output, POS is written as (offset + 1) to satisfy VCF/tabix (1-based).
 """
 
 import argparse
@@ -33,6 +31,7 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union, Set
 
 from tqdm import tqdm
 
+# pysam for bgzip + tabix
 try:
     import pysam
 except Exception:
@@ -41,20 +40,10 @@ except Exception:
 
 # ------------------------ TSV (ALT->REF) mapping ------------------------ #
 
-def load_alt_to_ref_tsv(tsv_path: Optional[str]) -> Tuple[Dict[int, int], Set[int], Set[int]]:
-    """
-    Returns:
-      mapping: alt_node -> ref_node
-      tsv_alt_nodes: set of alt nodes in TSV
-      tsv_ref_nodes: set of ref nodes in TSV
-    """
+def load_alt_to_ref_tsv(tsv_path: Optional[str]) -> Dict[int, int]:
     if not tsv_path:
-        return {}, set(), set()
-
+        return {}
     mapping: Dict[int, int] = {}
-    tsv_alt_nodes: Set[int] = set()
-    tsv_ref_nodes: Set[int] = set()
-
     with open(tsv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t")
         hdr = [c.strip() for c in (reader.fieldnames or [])]
@@ -72,7 +61,6 @@ def load_alt_to_ref_tsv(tsv_path: Optional[str]) -> Tuple[Dict[int, int], Set[in
         for row in reader:
             try:
                 ref_node = int(str(row[ref_node_key]).strip())
-                tsv_ref_nodes.add(ref_node)
             except Exception:
                 continue
             alts_raw = str(row[alt_nodes_key]).strip()
@@ -82,9 +70,7 @@ def load_alt_to_ref_tsv(tsv_path: Optional[str]) -> Tuple[Dict[int, int], Set[in
                 except Exception:
                     continue
                 mapping[alt_node] = ref_node
-                tsv_alt_nodes.add(alt_node)
-
-    return mapping, tsv_alt_nodes, tsv_ref_nodes
+    return mapping
 
 
 # ------------------------ Node map (JSON/JSONL) ------------------------ #
@@ -129,6 +115,7 @@ def iter_node_map_records(json_path: str, jsonl: bool) -> Iterable[dict]:
             raise ValueError("Unsupported JSON structure for node map.")
 
 def _has_key_case_insensitive(obj: dict, key_name: str) -> bool:
+    """True if key_name (case-insensitive) appears anywhere in obj (recursively)."""
     kn = key_name.lower()
     for k, v in obj.items():
         if str(k).lower() == kn:
@@ -144,9 +131,9 @@ def _has_key_case_insensitive(obj: dict, key_name: str) -> bool:
 def load_node_map(json_path: str,
                   jsonl: bool,
                   node_start_is_1_based: bool = True) -> Tuple[
-                      Dict[int, Tuple[str, int, str, int]],  # anchors
-                      Set[int],                              # nodes_seen
-                      Set[int],                              # nodes_with_genomead_af
+                      Dict[int, Tuple[str, int, str, int]],  # anchors: node -> (chrom, start0, strand, length)
+                      Set[int],                              # nodes_seen in JSON
+                      Set[int],                              # nodes_with_genomead_af (reference nodes by rule)
                   ]:
     anchors: Dict[int, Tuple[str, int, str, int]] = {}
     nodes_seen: Set[int] = set()
@@ -168,6 +155,7 @@ def load_node_map(json_path: str,
         strand = str(_first_present(rec, ["strand_in_path", "strand"], "+") or "+")
         length = _to_int(_first_present(rec, ["length", "len", "node_length"]))
 
+        # decide start0
         if start0 is not None:
             s0 = _to_int(start0)
         elif start1 is not None:
@@ -177,7 +165,10 @@ def load_node_map(json_path: str,
             generic = _first_present(rec, ["start", "pos", "start_pos"])
             if generic is not None:
                 sg = _to_int(generic)
-                s0 = (sg - 1) if (sg is not None and node_start_is_1_based) else sg
+                if sg is not None:
+                    s0 = (sg - 1) if node_start_is_1_based else sg
+                else:
+                    s0 = None
             else:
                 s0 = None
 
@@ -224,8 +215,6 @@ def convert_vcf(
     nodes_seen_in_json: Set[int],
     ref_nodes_with_af: Set[int],
     alt_to_ref: Dict[int, int],
-    tsv_alt_nodes: Set[int],
-    tsv_ref_nodes: Set[int],
     offset_is_0_based: bool,
     sort_records: bool,
     compress_level: int,
@@ -249,19 +238,6 @@ def convert_vcf(
     nodes_ref_seen: Set[int] = set()
     nodes_refalt_seen: Set[int] = set()
     nodes_altalt_seen: Set[int] = set()
-    # TSV appearance sanity checks (nodes from TSV that actually show up in VCF)
-    tsv_alt_seen: Set[int] = set()
-    tsv_ref_seen: Set[int] = set()
-
-    def classify_node(nid: int) -> str:
-        # precedence: TSV ALT -> TSV REF/JSON AF -> JSON present (no AF) -> else
-        if nid in tsv_alt_nodes:
-            return "ref-alt"
-        if (nid in tsv_ref_nodes) or (nid in ref_nodes_with_af):
-            return "reference"
-        if nid in nodes_seen_in_json:
-            return "ref-alt"  # present in JSON but no AF
-        return "alt-alt"
 
     with open_maybe_gzip(in_vcf) as fin, \
          tqdm(total=total if total > 0 else None, desc="Convert", unit="rec",
@@ -285,6 +261,7 @@ def convert_vcf(
             filt = parts[6] if len(parts) > 6 else "PASS"
             info = parts[7] if len(parts) > 7 else "."
 
+            # Parse numeric node/offset
             try:
                 node_id = int(chrom_node)
                 offset  = int(pos_offset)
@@ -292,6 +269,7 @@ def convert_vcf(
             except Exception:
                 is_numeric = False
 
+            # Classify for counts + distinct node sets
             if not is_numeric:
                 cnt_nonnum += 1
                 info2 = append_info(info, [("NID", str(chrom_node)), ("NSO", str(pos_offset))])
@@ -299,34 +277,35 @@ def convert_vcf(
                 if total:
                     bar.update(1)
                 continue
-
-            # book-keeping for TSV presence (regardless of final class)
-            if node_id in tsv_alt_nodes:
-                tsv_alt_seen.add(node_id)
-            if node_id in tsv_ref_nodes:
-                tsv_ref_seen.add(node_id)
-
-            node_class = classify_node(node_id)
-            if node_class == "reference":
-                cnt_ref += 1
-                nodes_ref_seen.add(node_id)
-            elif node_class == "ref-alt":
-                cnt_refalt += 1
-                nodes_refalt_seen.add(node_id)
             else:
-                cnt_altalt += 1
-                nodes_altalt_seen.add(node_id)
+                if node_id in nodes_seen_in_json:
+                    if node_id in ref_nodes_with_af:
+                        cnt_ref += 1
+                        nodes_ref_seen.add(node_id)
+                    else:
+                        cnt_refalt += 1
+                        nodes_refalt_seen.add(node_id)
+                else:
+                    cnt_altalt += 1
+                    nodes_altalt_seen.add(node_id)
 
-            # choose anchor: prefer direct node, else TSV-mapped ref
-            ref_node_candidate = alt_to_ref.get(node_id)
-            anchor = anchors.get(node_id)
-            if anchor is None and ref_node_candidate is not None:
+            base_node = node_id
+
+            # Map ALT node to its REF node if present
+            ref_node_candidate = alt_to_ref.get(base_node)
+            anchor = None
+            if ref_node_candidate is not None:
+                anchor = anchors.get(ref_node_candidate)
+            if anchor is None:
+                anchor = anchors.get(base_node)
+            if anchor is None and base_node in nodes_seen_in_json and ref_node_candidate is not None:
                 anchor = anchors.get(ref_node_candidate)
 
+            # Preserve original node/offset in INFO
             info2 = append_info(info, [("NID", str(node_id)), ("NSO", str(offset))])
 
             if anchor is None:
-                # keep node coords; POS must be 1-based
+                # Keep in node coords; write POS as offset+1 (VCF is 1-based)
                 pos_for_nodes_vcf = (offset if not offset_is_0_based else offset + 1)
                 unconverted.append((str(node_id), int(pos_for_nodes_vcf), vid, ref, alt, qual, filt, info2))
                 if total:
@@ -344,7 +323,7 @@ def convert_vcf(
             if total:
                 bar.update(1)
 
-    # sorting when needed (tabix)
+    # Sorting (needed for tabix)
     need_sort = sort_records or do_index
     if need_sort:
         def chrom_key_linear(c: str):
@@ -365,12 +344,13 @@ def convert_vcf(
                 return (1, str(c))
         unconverted.sort(key=lambda r: (chrom_key_nodes(r[0]), int(r[1]) if str(r[1]).isdigit() else 0))
 
-    # contigs
+    # Collect contigs
     lin_contigs, seen_lin = [], set()
     for c, *_ in converted:
         if c not in seen_lin:
             seen_lin.add(c)
             lin_contigs.append(c)
+
     node_contigs, seen_node = [], set()
     for c, *_ in unconverted:
         sc = str(c)
@@ -397,8 +377,9 @@ def convert_vcf(
                 if h.startswith("#CHROM"):
                     continue
                 out.write(h + "\n")
+
             out.write('##fileformat=VCFv4.2\n')
-            out.write(f'##META=<ID={meta_desc},Description="Converted using node map and TSV ALT->REF; NID/NSO store original node and offset.">\n')
+            out.write(f'##META=<ID={meta_desc},Description="Converted using node map and optional ALT->REF TSV; NID/NSO store original node and offset.">\n')
             out.write('##INFO=<ID=NID,Number=1,Type=String,Description="Original node_id (CHROM in input)">\n')
             out.write('##INFO=<ID=NSO,Number=1,Type=String,Description="Original starting offset (POS in input)">\n')
             for c in contigs:
@@ -441,22 +422,21 @@ def convert_vcf(
                 pass
             return final_gz_path, None
 
-    # write outputs
-    linear_gz, linear_tbi = write_plain_and_bgzip(out_linear_vcf_gz, converted, lin_contigs, meta_desc="CONVERTED")
-    nodes_gz, nodes_tbi   = write_plain_and_bgzip(out_nodes_vcf_gz,  unconverted, node_contigs, meta_desc="UNCONVERTED")
+    # Write linear VCF.GZ
+    linear_gz, linear_tbi = write_plain_and_bgzip(
+        out_linear_vcf_gz, converted, lin_contigs, meta_desc="CONVERTED"
+    )
 
-    # PRINT distinct node counts (observed in VCF)
+    # Write node-form VCF.GZ
+    nodes_gz, nodes_tbi = write_plain_and_bgzip(
+        out_nodes_vcf_gz, unconverted, node_contigs, meta_desc="UNCONVERTED"
+    )
+
+    # PRINT distinct node counts (from VCF)
     print("=== Distinct node counts (observed in VCF) ===")
     print(f"reference nodes : {len(nodes_ref_seen)}")
     print(f"ref-alt nodes   : {len(nodes_refalt_seen)}")
     print(f"alt-alt nodes   : {len(nodes_altalt_seen)}")
-
-    # PRINT TSV sanity
-    print("\n=== TSV node presence in VCF (sanity) ===")
-    print(f"TSV ALT nodes total        : {len(tsv_alt_nodes)}")
-    print(f"TSV ALT nodes seen in VCF  : {len(tsv_alt_seen)}")
-    print(f"TSV REF nodes total        : {len(tsv_ref_nodes)}")
-    print(f"TSV REF nodes seen in VCF  : {len(tsv_ref_seen)}")
 
     # PRINT variant counts
     total_classified = cnt_ref + cnt_refalt + cnt_altalt
@@ -479,11 +459,11 @@ def convert_vcf(
 # ------------------------ CLI ------------------------ #
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert node/offset VCF to linear-reference coordinates; output linear + node VCF.GZ, and print class & node counts with TSV precedence.")
+    ap = argparse.ArgumentParser(description="Convert node/offset VCF to linear-reference coordinates; output linear + node VCF.GZ (tabix-indexed) and print class & node counts.")
     ap.add_argument("--in_vcf",             required=True, help="Input VCF (.vcf or .vcf.gz) with CHROM=node_id, POS=offset.")
     ap.add_argument("--map_json",           required=True, help="Node map JSON (array) or JSONL.")
     ap.add_argument("--map_jsonl",          action="store_true", help="Interpret --map_json as JSONL.")
-    ap.add_argument("--tsv",                default=None, help="TSV ALT->REF mapping (required if you want TSV precedence).")
+    ap.add_argument("--tsv",                default=None, help="Optional TSV mapping ALT_NODE(S) -> REF_NODE.")
     ap.add_argument("--out_linear_vcf",     required=True, help="Output path for linear VCF.GZ (will be bgzip compressed and indexed).")
     ap.add_argument("--out_nodes_vcf",      required=True, help="Output path for node-form VCF.GZ (will be bgzip compressed and indexed).")
     ap.add_argument("--offset_is_0_based",  type=lambda s: str(s).lower() in ("1","true","t","yes","y"), default=True,
@@ -517,20 +497,20 @@ def main():
     print(f"index                 : {not args.no_index}")
     print("=" * 70)
 
-    alt_to_ref, tsv_alt_nodes, tsv_ref_nodes = load_alt_to_ref_tsv(args.tsv) if args.tsv else ({}, set(), set())
-    if args.tsv:
-        print(f"ALT->REF mappings loaded: {len(alt_to_ref)}  "
-              f"(unique TSV ALT nodes={len(tsv_alt_nodes)}, unique TSV REF nodes={len(tsv_ref_nodes)})")
+    alt_to_ref = load_alt_to_ref_tsv(args.tsv) if args.tsv else {}
+    if alt_to_ref:
+        print(f"ALT->REF mappings loaded: {len(alt_to_ref)}")
 
     anchors, nodes_seen, ref_nodes_with_af = load_node_map(
         args.map_json,
         jsonl=args.map_jsonl,
         node_start_is_1_based=args.node_start_is_1_based
     )
+    # Optional JSON-level node summary (distinct nodes present in JSON)
     n_ref_nodes_json  = len(ref_nodes_with_af)
     n_refalt_nodes_json = len(nodes_seen - ref_nodes_with_af)
     print(f"Node map: anchors={len(anchors)} (with chrom+start+strand+length), nodes_seen={len(nodes_seen)} "
-          f"(reference nodes by JSON={n_ref_nodes_json}, ref-alt nodes by JSON={n_refalt_nodes_json})")
+          f"(reference nodes={n_ref_nodes_json}, ref-alt nodes={n_refalt_nodes_json})")
 
     convert_vcf(
         in_vcf=args.in_vcf,
@@ -540,8 +520,6 @@ def main():
         nodes_seen_in_json=nodes_seen,
         ref_nodes_with_af=ref_nodes_with_af,
         alt_to_ref=alt_to_ref,
-        tsv_alt_nodes=tsv_alt_nodes,
-        tsv_ref_nodes=tsv_ref_nodes,
         offset_is_0_based=args.offset_is_0_based,
         sort_records=args.sort,
         compress_level=args.compress_level,
