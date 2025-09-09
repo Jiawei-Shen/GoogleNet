@@ -271,7 +271,8 @@ def write_outputs(results, csv_path: str, json_path: str):
     if csv_path:
         import csv
         any_probs = any("probs" in r for r in results)
-        header = ["path", "pred_idx", "pred_class", "pred_prob"]
+        # header = ["path", "pred_idx", "pred_class", "pred_prob"]
+        header = ["path", "pred_class", "pred_prob"]
         class_cols = []
         if any_probs:
             all_classes = set()
@@ -285,7 +286,7 @@ def write_outputs(results, csv_path: str, json_path: str):
             w = csv.writer(f)
             w.writerow(header)
             for r in results:
-                row = [r["path"], r["pred_idx"], r["pred_class"], f"{r['pred_prob']:.6f}"]
+                row = [r["path"], r["pred_class"], f"{r['pred_prob']:.6f}"]
                 if any_probs:
                     row.extend([f"{r['probs'].get(c, 0.0):.6f}" for c in class_cols])
                 w.writerow(row)
