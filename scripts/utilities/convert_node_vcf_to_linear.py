@@ -57,6 +57,10 @@ def load_alt_to_ref_tsv(tsv_path: Optional[str]) -> Tuple[Dict[int, int], Set[in
     tsv_alt_nodes: Set[int] = set()
 
     with open(tsv_path, "r", encoding="utf-8") as f:
+        try:
+            csv.field_size_limit(sys.maxsize)
+        except OverflowError:
+            csv.field_size_limit(2**31 - 1)
         reader = csv.DictReader(f, delimiter="\t")
         hdr = [c.strip() for c in (reader.fieldnames or [])]
         ref_node_key = None
