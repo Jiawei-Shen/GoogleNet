@@ -230,6 +230,7 @@ def scan_predictions(iterable: Iterator[dict],
         parsed = parse_filename(path)
         if not parsed:
             missing_pattern += 1
+            print(path)
             bar.set_postfix_str(f"kept={kept_out}")
             continue
 
