@@ -49,14 +49,16 @@ try:
 except Exception:
     pysam = None
 
-# --- Filename patterns ---
+# Accept DNA letters (any case) OR the special '*' allele (spanning deletion)
+_BASE_OR_STAR = r"(?:[ACGTNacgtn]+|\*)"
+
 # 5-part: <nodeID>_<offset>_<X>_<REF>_<ALT>.npy
 NAME_RE5 = re.compile(
-    r"""^(?P<node_id>-?\d+)
+    rf"""^(?P<node_id>-?\d+)
         _(?P<offset>-?\d+)
         _(?P<chrom_hint>[^_]+)
-        _(?P<ref>[ACGTN]+)
-        _(?P<alt>[ACGTN]+)
+        _(?P<ref>{_BASE_OR_STAR})
+        _(?P<alt>{_BASE_OR_STAR})
         \.[Nn][Pp][Yy]$
     """,
     re.VERBOSE,
@@ -64,15 +66,14 @@ NAME_RE5 = re.compile(
 
 # 4-part: <offset>_<X>_<REF>_<ALT>.npy
 NAME_RE4 = re.compile(
-    r"""^(?P<offset>-?\d+)
+    rf"""^(?P<offset>-?\d+)
         _(?P<chrom_hint>[^_]+)
-        _(?P<ref>[ACGTN]+)
-        _(?P<alt>[ACGTN]+)
+        _(?P<ref>{_BASE_OR_STAR})
+        _(?P<alt>{_BASE_OR_STAR})
         \.[Nn][Pp][Yy]$
     """,
     re.VERBOSE,
 )
-
 
 def read_json_array(path: str) -> List[dict]:
     with open(path, "r", encoding="utf-8") as f:
@@ -230,7 +231,6 @@ def scan_predictions(iterable: Iterator[dict],
         parsed = parse_filename(path)
         if not parsed:
             missing_pattern += 1
-            print(path)
             bar.set_postfix_str(f"kept={kept_out}")
             continue
 
