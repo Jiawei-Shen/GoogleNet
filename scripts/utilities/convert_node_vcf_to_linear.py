@@ -397,17 +397,24 @@ def convert_vcf(
         tmp_vcf = final_gz_path[:-3]
 
         with open(tmp_vcf, "w", encoding="utf-8") as out:
+            # MUST be first per spec
+            out.write('##fileformat=VCFv4.2\n')
+
+            # Then any kept header lines (skip duplicates)
             for h in kept_header:
-                if h.startswith("#CHROM"):
+                if h.startswith("#CHROM") or h.lower().startswith("##fileformat"):
                     continue
                 out.write(h + "\n")
 
-            out.write('##fileformat=VCFv4.2\n')
-            out.write(f'##META=<ID={meta_desc},Description="Converted using node map and optional ALT->REF TSV; NID/NSO store original node and offset.">\n')
+            # Then your custom META/INFO/contigs
+            out.write(
+                f'##META=<ID={meta_desc},Description="Converted using node map and optional ALT->REF TSV; NID/NSO store original node and offset.">\n')
             out.write('##INFO=<ID=NID,Number=1,Type=String,Description="Original node_id (CHROM in input)">\n')
             out.write('##INFO=<ID=NSO,Number=1,Type=String,Description="Original starting offset (POS in input)">\n')
             for c in contigs:
                 out.write(f"##contig=<ID={c}>\n")
+
+            # Finally the column header
             out.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
 
             with tqdm(total=len(records), desc=f"Write {meta_desc}", unit="rec",
