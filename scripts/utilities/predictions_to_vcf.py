@@ -23,15 +23,6 @@ INFO fields written (when available from inputs):
   AD     : "ref,alt" counts (ref_allele_count_at_locus, alt_allele_count)
   OTHER  : other_allele_count_at_locus
   BQ     : mean_alt_allele_base_quality
-
-Examples:
-  python predictions_to_node_vcf.py \
-    --predictions predictions.jsonl --jsonl \
-    --output_vcf out/combined.vcf.gz --sort --refcall_prob 0.1
-
-Notes:
-- If indexing (default), output must be sorted; if you didn't pass --sort,
-  the script will sort for you automatically.
 """
 
 import argparse
@@ -75,13 +66,23 @@ NAME_RE4 = re.compile(
     re.VERBOSE,
 )
 
+def _strip_node_prefix(bn: str) -> str:
+    """
+    If basename looks like "<nodeID>_<rest>", drop the leading "<nodeID>_".
+    """
+    i = bn.find("_")
+    if i > 0:
+        maybe = bn[:i]
+        if maybe.lstrip("-").isdigit():
+            return bn[i+1:]
+    return bn
+
 def read_json_array(path: str) -> List[dict]:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
         raise ValueError("Predictions JSON must be a list when not using --jsonl.")
     return [x for x in data if isinstance(x, dict)]
-
 
 def iter_jsonl(path: str) -> Iterator[dict]:
     with open(path, "r", encoding="utf-8") as f:
@@ -95,7 +96,6 @@ def iter_jsonl(path: str) -> Iterator[dict]:
                     yield obj
             except Exception:
                 continue
-
 
 def true_prob(rec: dict) -> Optional[float]:
     """
@@ -117,10 +117,10 @@ def true_prob(rec: dict) -> Optional[float]:
     except Exception:
         return None
 
-
 def load_variant_summary_for_node(node_dir: str) -> Dict[str, dict]:
     """
     Build an index: basename(.npy) -> row dict from node_dir/variant_summary.json
+    Stores both 4-part and 5-part keys to match predictions reliably.
     """
     idx: Dict[str, dict] = {}
     path = os.path.join(node_dir, "variant_summary.json")
@@ -132,11 +132,13 @@ def load_variant_summary_for_node(node_dir: str) -> Dict[str, dict]:
     except Exception:
         return idx
 
-    rows = []
+    rows: List[dict] = []
     if isinstance(summary, dict) and isinstance(summary.get("variants_passing_af_filter"), list):
         rows = [r for r in summary["variants_passing_af_filter"] if isinstance(r, dict)]
     elif isinstance(summary, list):
         rows = [r for r in summary if isinstance(r, dict)]
+
+    node_id_guess = os.path.basename(node_dir.rstrip("/"))
 
     for r in rows:
         tf = r.get("tensor_file") or r.get("variant_key")
@@ -144,9 +146,12 @@ def load_variant_summary_for_node(node_dir: str) -> Dict[str, dict]:
             bn = os.path.basename(tf)
             if not bn.lower().endswith(".npy"):
                 bn = bn + ".npy"
+            # 4-part key
             idx[bn] = r
+            # 5-part key "<nodeID>_<4part>"
+            if node_id_guess and node_id_guess.lstrip("-").isdigit():
+                idx[f"{node_id_guess}_{bn}"] = r
     return idx
-
 
 def escape_info(v) -> str:
     return (
@@ -157,7 +162,6 @@ def escape_info(v) -> str:
         .replace("=", "%3D")
     )
 
-
 def ensure_pysam_or_die():
     if pysam is None:
         msg = (
@@ -167,7 +171,6 @@ def ensure_pysam_or_die():
         )
         print(msg, file=sys.stderr)
         sys.exit(2)
-
 
 def parse_filename(path: str) -> Optional[Tuple[str, int, str, str]]:
     """
@@ -202,10 +205,11 @@ def parse_filename(path: str) -> Optional[Tuple[str, int, str, str]]:
 
     return None
 
-
-def scan_predictions(iterable: Iterator[dict],
-                     min_true_prob: Optional[float],
-                     refcall_prob: Optional[float]) -> Tuple[List[Tuple[str, int, str, str, dict, str]], int, int, int]:
+def scan_predictions(
+    iterable: Iterator[dict],
+    min_true_prob: Optional[float],
+    refcall_prob: Optional[float],
+) -> Tuple[List[Tuple[str, int, str, str, dict, str]], int, int, int]:
     """
     Returns:
       records: list of (node_id, offset, ref, alt, info_dict, filter_label)
@@ -264,7 +268,13 @@ def scan_predictions(iterable: Iterator[dict],
             "PROB": f"{prob:.6g}" if prob is not None else None,
         }
 
+        # Try exact base (5-part), then the stripped 4-part key.
         row = by_node_cache[node_id].get(base)
+        if row is None:
+            base4 = _strip_node_prefix(base)
+            if base4 != base:
+                row = by_node_cache[node_id].get(base4)
+
         if row:
             af = row.get("alt_allele_frequency")
             cov = row.get("coverage_at_locus")
@@ -274,9 +284,18 @@ def scan_predictions(iterable: Iterator[dict],
             bq  = row.get("mean_alt_allele_base_quality")
 
             if af is not None:
-                info["AF"] = f"{float(af):.6g}"
+                try:
+                    info["AF"] = f"{float(af):.6g}"
+                except Exception:
+                    info["AF"] = escape_info(af)
             if cov is not None:
-                info["DP"] = str(int(cov)) if isinstance(cov, (int, float)) else escape_info(cov)
+                if isinstance(cov, (int, float)):
+                    try:
+                        info["DP"] = str(int(cov))
+                    except Exception:
+                        info["DP"] = escape_info(cov)
+                else:
+                    info["DP"] = escape_info(cov)
             if rc is not None and ac is not None:
                 try:
                     info["AD"] = f"{int(rc)},{int(ac)}"
@@ -299,7 +318,6 @@ def scan_predictions(iterable: Iterator[dict],
     bar.close()
 
     return records, total_in, kept_out, missing_pattern
-
 
 def main():
     ap = argparse.ArgumentParser(description="Generate node/offset VCF from predictions + variant_summary.json, then bgzip+index. Supports 4- and 5-part filenames.")
@@ -380,7 +398,7 @@ def main():
         out.write("##INFO=<ID=AD,Number=R,Type=Integer,Description=\"Allele depths: ref,alt (from variant_summary.json)\">\n")
         out.write("##INFO=<ID=OTHER,Number=1,Type=Integer,Description=\"Other allele count at locus\">\n")
         out.write("##INFO=<ID=BQ,Number=1,Type=Float,Description=\"Mean alt allele base quality\">\n")
-        out.write("##FILTER=<ID=RefCall,Description=\"Non-true prediction retained because prob >= --refcall_prob\">\n")
+        out.write("##FILTER=<ID=RefCall,Description=\"Non-true prediction retained because prob >= --refcall_prob\">\n".replace("\n", ">\n"))  # ensure closing '>'
 
         # Declare contigs (node IDs)
         seen = set()
@@ -439,7 +457,6 @@ def main():
     print(f"VCF (BGZF) written: {final_vcf_gz}")
     if want_index:
         print(f"VCF index (.tbi) written: {final_tbi}")
-
 
 if __name__ == "__main__":
     main()
