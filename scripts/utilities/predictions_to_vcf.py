@@ -398,7 +398,7 @@ def main():
         out.write("##INFO=<ID=AD,Number=R,Type=Integer,Description=\"Allele depths: ref,alt (from variant_summary.json)\">\n")
         out.write("##INFO=<ID=OTHER,Number=1,Type=Integer,Description=\"Other allele count at locus\">\n")
         out.write("##INFO=<ID=BQ,Number=1,Type=Float,Description=\"Mean alt allele base quality\">\n")
-        out.write("##FILTER=<ID=RefCall,Description=\"Non-true prediction retained because prob >= --refcall_prob\">\n".replace("\n", ">\n"))  # ensure closing '>'
+        out.write('##FILTER=<ID=RefCall,Description="Non-true prediction retained because prob >= --refcall_prob">\n')
 
         # Declare contigs (node IDs)
         seen = set()
