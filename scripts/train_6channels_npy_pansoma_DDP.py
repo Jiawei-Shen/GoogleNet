@@ -8,7 +8,7 @@ import os
 from tqdm import tqdm
 from collections import defaultdict
 import torch.nn.functional as F
-from torch.utils.data import Subset, DataLoader
+from torch.utils.data import Subset, DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
@@ -77,7 +77,7 @@ def print_and_log(message, log_path):
     if not IS_MAIN_PROCESS:
         return
     print(message)
-    with open(log_path, 'a', encoding='utf-8') as f:
+    with open(log_file, 'a', encoding='utf-8') as f:
         f.write(message + '\n')
 
 
@@ -105,6 +105,83 @@ def _unique_path(path: str) -> str:
     return cand
 
 
+# ---------- NEW: utilities to build concatenated datasets/loaders ----------
+def _build_loader_from_roots(roots, split, batch_size, num_workers, shuffle, return_paths=False):
+    """
+    Use get_data_loader for each root, grab the .dataset, check genotype_map consistency,
+    then return a DataLoader over ConcatDataset.
+    """
+    datasets = []
+    genotype_map = None
+    for r in roots:
+        ld, gm = get_data_loader(
+            data_dir=r, dataset_type=split, batch_size=batch_size,
+            num_workers=num_workers, shuffle=shuffle if split == "train" else False,
+            return_paths=return_paths
+        )
+        if len(ld) == 0 and len(ld.dataset) == 0:
+            continue
+        if genotype_map is None:
+            genotype_map = gm
+        else:
+            # require exact same mapping for safety
+            if gm != genotype_map:
+                raise ValueError(f"Inconsistent genotype_map between roots; root={r}")
+        datasets.append(ld.dataset)
+
+    if not datasets:
+        raise ValueError(f"No datasets found for split='{split}' in provided roots.")
+
+    concat = ConcatDataset(datasets)
+    loader = DataLoader(
+        concat, batch_size=batch_size, shuffle=shuffle,
+        num_workers=num_workers, pin_memory=True
+    )
+    return loader, genotype_map
+
+
+def _build_mode_c_loaders(data_paths, batch_size, num_workers):
+    """
+    Mode C: multiple roots. Train = union of (train + val) from every root.
+             Val   = union of (val) from every root (with return_paths=True).
+    """
+    roots = [os.path.abspath(os.path.expanduser(p)) for p in data_paths]
+
+    # build train from (train + val)
+    train_parts = []
+    genotype_map = None
+
+    # split=train
+    tr_loader, gm_tr = _build_loader_from_roots(
+        roots, "train", batch_size, num_workers, shuffle=True, return_paths=False
+    )
+    train_parts.append(tr_loader.dataset)
+    genotype_map = gm_tr
+
+    # split=val (added to train, too)
+    val_for_train_loader, gm_val_for_train = _build_loader_from_roots(
+        roots, "val", batch_size, num_workers, shuffle=True, return_paths=False
+    )
+    if gm_val_for_train != genotype_map:
+        raise ValueError("Inconsistent genotype_map between 'train' and 'val' across roots.")
+    train_parts.append(val_for_train_loader.dataset)
+
+    train_concat = ConcatDataset(train_parts)
+    train_loader = DataLoader(
+        train_concat, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True
+    )
+
+    # build val from val only, with return_paths=True
+    val_loader, gm_val = _build_loader_from_roots(
+        roots, "val", batch_size, num_workers, shuffle=False, return_paths=True
+    )
+    if gm_val != genotype_map:
+        raise ValueError("Inconsistent genotype_map between train-combined and validation across roots.")
+
+    return train_loader, val_loader, genotype_map
+
+
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
                 batch_size=32, num_workers=4, loss_type='weighted_ce',
                 warmup_epochs=10, weight_decay=0.05, depths=None, dims=None,
@@ -113,6 +190,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 # NEW: single knob for class weight (positive class), default 88
                 pos_weight=88.0):
     os.makedirs(output_path, exist_ok=True)
+    global log_file
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if os.path.exists(log_file) and IS_MAIN_PROCESS:
         os.remove(log_file)
@@ -132,13 +210,48 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     if save_val_results:
         print_and_log("Will save validation results JSON alongside each new best.", log_file)
 
-    # Build loaders (train)
-    train_loader, genotype_map = get_data_loader(
-        data_dir=data_path, dataset_type="train", batch_size=batch_size,
-        num_workers=num_workers, shuffle=True
-    )
+    # -------------------- Build loaders by mode --------------------
+    # Mode A: single root str; Mode B: (train_roots, val_roots); Mode C: list of roots
+    if isinstance(data_path, str):
+        # Mode A
+        train_loader, genotype_map = get_data_loader(
+            data_dir=data_path, dataset_type="train", batch_size=batch_size,
+            num_workers=num_workers, shuffle=True
+        )
+        try:
+            val_loader, _ = get_data_loader(
+                data_dir=data_path, dataset_type="val", batch_size=batch_size,
+                num_workers=num_workers, shuffle=False, return_paths=True
+            )
+        except Exception as e:
+            print_and_log(f"\nFATAL: Could not create validation data loader with 'return_paths=True'.", log_file)
+            print_and_log("Please ensure your 'dataset_pansoma_npy_6ch.py' can handle this flag.", log_file)
+            print_and_log(f"Error details: {e}", log_file)
+            return
 
-    # Randomly subsample training data if requested
+    elif isinstance(data_path, tuple) and len(data_path) == 2:
+        # Mode B
+        train_roots, val_roots = data_path
+        train_loader, genotype_map = _build_loader_from_roots(
+            train_roots, "train", batch_size, num_workers, shuffle=True, return_paths=False
+        )
+        val_loader, gm_val = _build_loader_from_roots(
+            val_roots, "val", batch_size, num_workers, shuffle=False, return_paths=True
+        )
+        if gm_val != genotype_map:
+            raise ValueError("Inconsistent genotype_map between train_roots and val_roots.")
+
+    elif isinstance(data_path, (list, tuple)):
+        # Mode C: multiple roots, combine train+val into training input
+        train_loader, val_loader, genotype_map = _build_mode_c_loaders(
+            data_path, batch_size=batch_size, num_workers=num_workers
+        )
+        print_and_log("Mode C: Using union(train ∪ val) as training input, and union(val) for validation.", log_file)
+
+    else:
+        raise ValueError("Unsupported data_path type.")
+
+    # Randomly subsample training data if requested (applies after combination)
     if training_data_ratio < 1.0:
         full_ds = train_loader.dataset
         n = len(full_ds)
@@ -148,18 +261,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         train_loader = DataLoader(subset, batch_size=batch_size, shuffle=True,
                                   num_workers=num_workers, pin_memory=True)
         print_and_log(f"Training subset: using {k}/{n} samples (~{training_data_ratio:.2f} of data).", log_file)
-
-    # Build loader (val)
-    try:
-        val_loader, _ = get_data_loader(
-            data_dir=data_path, dataset_type="val", batch_size=batch_size,
-            num_workers=num_workers, shuffle=False, return_paths=True
-        )
-    except Exception as e:
-        print_and_log(f"\nFATAL: Could not create validation data loader with 'return_paths=True'.", log_file)
-        print_and_log("Please ensure your 'dataset_pansoma_npy_6ch.py' can handle this flag.", log_file)
-        print_and_log(f"Error details: {e}", log_file)
-        return
 
     if not genotype_map:
         print_and_log("Error: genotype_map is empty. Check dataloader.", log_file)
@@ -241,7 +342,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     best_f1_true = float("-inf")
     best_val_acc = float("-inf")
     best_val_loss = float("inf")
-    best_prec_true = 0.0
     best_rec_true = 0.0
     last_best_ckpt_path = None
 
@@ -394,7 +494,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             best_val_loss = val_loss
             best_epoch = epoch + 1
 
-            # filename encodes epoch and F1; never overwrite previous bests
             ckpt_name = f"model_e{best_epoch:03d}_f1_{best_f1_true:.4f}.pth"
             best_path = os.path.join(output_path, ckpt_name)
             best_path = _unique_path(best_path)
@@ -620,9 +719,13 @@ def _resolve_data_roots(primary_path, extra_paths, paths_file):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Classifier on 6-channel custom .npy dataset")
 
-    # Make data_path OPTIONAL; we will enforce XOR with the files mode
+    # Make data_path OPTIONAL; we will enforce XOR with the files mode / multi mode
     parser.add_argument("data_path", nargs="?", type=str,
                         help="Dataset root containing 'train/' and 'val/' (Mode A).")
+
+    parser.add_argument("--data_paths", type=str, nargs='+', default=None,
+                        help="MULTI roots (each contains 'train/' and 'val/'). "
+                             "Train input = union(train ∪ val) from all roots; Val = union(val) (Mode C).")
 
     parser.add_argument("-o", "--output_path", default="./saved_models_6channel", type=str, help="Path to save model")
     parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3],
@@ -642,7 +745,7 @@ if __name__ == "__main__":
     parser.add_argument("--loss_type", type=str, default="weighted_ce", choices=["combined", "weighted_ce"],
                         help="Loss function to use")
 
-    # Mode B (files) — both must be provided together when using files mode
+    # Mode B (files)
     parser.add_argument("--train_data_paths_file", type=str, default=None,
                         help="Text file listing TRAIN dataset roots (one per line).")
     parser.add_argument("--val_data_paths_file", type=str, default=None,
@@ -668,25 +771,24 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # ---- Enforce: exactly one of (data_path) OR (both files) ----
+    # ---- Enforce: exactly one of (data_path) OR (both files) OR (--data_paths) ----
     has_base = args.data_path is not None
     has_both_files = (args.train_data_paths_file is not None) and (args.val_data_paths_file is not None)
+    has_multi = args.data_paths is not None
 
     if not (0 < args.training_data_ratio <= 1.0):
         parser.error(f"--training_data_ratio must be in (0,1], got {args.training_data_ratio}")
 
-    if has_base and has_both_files:
-        parser.error("Provide either positional data_path (Mode A) OR both --train_data_paths_file and "
-                     "--val_data_paths_file (Mode B), not both.")
-    if not has_base and not has_both_files:
-        parser.error("You must provide exactly one input mode:\n"
-                     "  • Mode A: data_path\n"
-                     "  • Mode B: --train_data_paths_file and --val_data_paths_file")
+    if sum([has_base, has_both_files, has_multi]) != 1:
+        parser.error("Provide exactly one input mode:\n"
+                     "  • Mode A: positional data_path\n"
+                     "  • Mode B: --train_data_paths_file and --val_data_paths_file\n"
+                     "  • Mode C: --data_paths root1 root2 ...")
 
     # Build the argument passed into train_model
     if has_base:
         data_path_or_pair = os.path.abspath(os.path.expanduser(args.data_path))
-    else:
+    elif has_both_files:
         train_roots = _read_paths_file(args.train_data_paths_file)
         val_roots = _read_paths_file(args.val_data_paths_file)
         if not train_roots:
@@ -694,6 +796,11 @@ if __name__ == "__main__":
         if not val_roots:
             parser.error(f"--val_data_paths_file is empty or unreadable: {args.val_data_paths_file}")
         data_path_or_pair = (train_roots, val_roots)
+    else:
+        # Mode C
+        if len(args.data_paths) < 1:
+            parser.error("--data_paths needs at least one root.")
+        data_path_or_pair = args.data_paths
 
     # --- DDP init (takes precedence over DataParallel) ---
     if args.ddp:
@@ -711,7 +818,6 @@ if __name__ == "__main__":
         IS_MAIN_PROCESS = True
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Hand off; train_model still discovers loaders via get_data_loader(...)
     train_model(
         data_path=data_path_or_pair, output_path=args.output_path,
         save_val_results=args.save_val_results,
@@ -725,7 +831,6 @@ if __name__ == "__main__":
         training_data_ratio=args.training_data_ratio,
         ddp=args.ddp, data_parallel=args.data_parallel, local_rank=local_rank,
         resume=args.resume,
-        # NEW: single knob
         pos_weight=args.pos_weight,
     )
 
