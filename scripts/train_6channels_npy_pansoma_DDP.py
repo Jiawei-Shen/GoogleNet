@@ -271,26 +271,16 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     else:
         raise ValueError("Unsupported data_path type.")
 
-    # ---- Optional subsample (DDP-safe: broadcast indices) ----
+    # ---- Optional subsample (DDP-safe, no collectives) ----
     if training_data_ratio < 1.0:
         full_ds = train_loader.dataset
         n = len(full_ds)
         k = max(1, int(round(n * training_data_ratio)))
 
-        if ddp and dist.is_initialized():
-            if IS_MAIN_PROCESS:
-                idx_tensor = torch.randperm(n, device='cpu')[:k]
-            else:
-                idx_tensor = torch.empty(k, dtype=torch.long, device='cpu')
-            # broadcast k then indices
-            k_tensor = torch.tensor([k], dtype=torch.long)
-            dist.broadcast(k_tensor, src=0)
-            if not IS_MAIN_PROCESS:
-                idx_tensor = torch.empty(k_tensor.item(), dtype=torch.long, device='cpu')
-            dist.broadcast(idx_tensor, src=0)
-            idx_list = idx_tensor.tolist()
-        else:
-            idx_list = torch.randperm(n, device='cpu')[:k].tolist()
+        # Deterministic subset across all ranks (no broadcast needed)
+        gen = torch.Generator()
+        gen.manual_seed(123456)  # << choose any constant; same on all ranks
+        idx_list = torch.randperm(n, generator=gen)[:k].tolist()
 
         subset = Subset(full_ds, idx_list)
         train_loader = _make_loader(
@@ -298,7 +288,8 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
             pin_memory=True, persistent_workers=True
         )
-        print_and_log(f"Training subset: using {len(subset)}/{n} samples (~{training_data_ratio:.2f} of data).", log_file)
+        print_and_log(f"Training subset: using {len(subset)}/{n} samples (~{training_data_ratio:.2f} of data).",
+                      log_file)
 
     # ---- Model / parallelism ----
     if not genotype_map:
