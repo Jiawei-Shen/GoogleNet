@@ -13,7 +13,7 @@ class NpyDataset(Dataset):
     Resolves symlinks once during initialization for faster I/O.
     """
 
-    def __init__(self, root_dir, transform=None, return_paths=False, resolve_symlinks=True, scan_workers=4):
+    def __init__(self, root_dir, transform=None, return_paths=False, resolve_symlinks=False, scan_workers=4):
         self.resolve_symlinks = resolve_symlinks
         self.scan_workers = max(16, int(scan_workers))
         self.root_dir = os.path.expanduser(root_dir)
