@@ -2,6 +2,8 @@ import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import functools  # (optional, if you later use partial)
 import os, glob, torch
 
 
