@@ -3,19 +3,22 @@ import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import functools  # (optional, if you later use partial)
 import os, glob, torch
 
 
 
 class NpyDataset(Dataset):
-    def __init__(self, root_dir, transform=None, return_paths=False,
-                 resolve_symlinks=True, scan_workers=4):
+    """
+    Custom PyTorch Dataset to load 6-channel .npy files.
+    Resolves symlinks once during initialization for faster I/O.
+    """
+
+    def __init__(self, root_dir, transform=None, return_paths=False, resolve_symlinks=True, scan_workers=4):
+        self.resolve_symlinks = resolve_symlinks
+        self.scan_workers = int(scan_workers)
         self.root_dir = os.path.expanduser(root_dir)
         self.transform = transform
         self.return_paths = return_paths
-        self.resolve_symlinks = resolve_symlinks
-        self.scan_workers = max(1, int(scan_workers))
         self.samples = []
         self.classes = []
         self.class_to_idx = {}
@@ -23,53 +26,55 @@ class NpyDataset(Dataset):
         if not os.path.isdir(self.root_dir):
             raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
 
-        # fixed class order for determinism
-        self.classes = sorted([d.name for d in os.scandir(self.root_dir) if d.is_dir()])
-        if not self.classes:
+        # scan subdirectories (class folders)
+        class_folders = sorted([d.name for d in os.scandir(self.root_dir) if d.is_dir()])
+        if not class_folders:
             raise FileNotFoundError(f"No class subdirectories found in {self.root_dir}")
 
+        self.classes = class_folders
         self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
 
-        # --- parallel scan per class dir ---
-        def _scan_one_class(cls_name):
+        for cls_name in class_folders:
             class_path = os.path.join(self.root_dir, cls_name)
             label = self.class_to_idx[cls_name]
 
-            # scandir is faster than listdir + join; sort deterministically
-            entries = sorted((e for e in os.scandir(class_path) if e.is_file()),
-                             key=lambda e: e.name)
-            out = []
-            for e in entries:
-                name = e.name
-                if not name.lower().endswith(".npy"):
-                    continue
-                file_path = e.path
+            try:
+                names = sorted(os.listdir(class_path))  # stable order across runs
+            except FileNotFoundError:
+                continue
+
+            # Worker that validates extension + resolves the real path once
+            def _resolve_one(fn: str):
+                if not fn.lower().endswith(".npy"):
+                    return None
+                file_path = os.path.join(class_path, fn)
                 real_path = os.path.realpath(file_path) if self.resolve_symlinks else file_path
-                # os.path.exists hits FS again; stat once is slightly cheaper
-                try:
-                    os.stat(real_path)
-                except FileNotFoundError:
+                if not os.path.exists(real_path):
+                    # raise to fail fast (or return None to silently skip)
                     raise FileNotFoundError(f"Broken symlink: {file_path} -> {real_path}")
-                out.append((real_path, label))
-            return cls_name, out
+                return (real_path, label)
 
-        # Use a small thread pool; network/shared filesystems benefit the most.
-        # Keep per-class determinism by extending in self.classes order.
-        results = {}
-        with ThreadPoolExecutor(max_workers=self.scan_workers) as ex:
-            futures = {ex.submit(_scan_one_class, cls): cls for cls in self.classes}
-            for fut in as_completed(futures):
-                cls, items = fut.result()
-                results[cls] = items
+            # Use a modest thread count to avoid hammering the FS
+            max_workers = getattr(self, "scan_workers", 8)
+            results = []
 
-        for cls in self.classes:  # preserve class order
-            self.samples.extend(results.get(cls, []))
+            # map preserves the order of `names`, so we don’t need to re-sort
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                for out in ex.map(_resolve_one, names, chunksize=256):
+                    if out is not None:
+                        results.append(out)
+
+            # Append all resolved items for this class
+            self.samples.extend(results)
 
         if len(self.samples) == 0:
             raise ValueError(f"No .npy files found in {self.root_dir}")
 
-        print(f"Initialized NpyDataset from {self.root_dir}: "
-              f"Found {len(self.samples)} samples in {len(self.classes)} classes.")
+        print(
+            f"Initialized NpyDataset from {self.root_dir}: "
+            f"Found {len(self.samples)} samples in {len(self.classes)} classes "
+            f"({'symlink-resolved' if self.resolve_symlinks else 'no symlink resolution'} mode)."
+        )
 
     def __len__(self):
         return len(self.samples)
@@ -83,8 +88,9 @@ class NpyDataset(Dataset):
 
         if not isinstance(image_np, np.ndarray):
             raise TypeError(f"File {file_path} did not load as a NumPy array (got {type(image_np)}).")
+
         if image_np.ndim != 3 or image_np.shape[0] != 6:
-            raise ValueError(f"{file_path} has shape {image_np.shape}; expected (6, W, H).")
+            raise ValueError(f"File {file_path} has shape {image_np.shape}, expected (6, W, H).")
 
         image_tensor = torch.from_numpy(image_np.copy()).float()
         if self.transform:
@@ -92,7 +98,8 @@ class NpyDataset(Dataset):
 
         if self.return_paths:
             return image_tensor, label, file_path
-        return image_tensor, label
+        else:
+            return image_tensor, label
 
 def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=16, shuffle: bool = False,
                     return_paths: bool = False):
