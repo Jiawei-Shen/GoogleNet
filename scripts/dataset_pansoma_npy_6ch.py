@@ -34,6 +34,8 @@ class NpyDataset(Dataset):
 
         for cls_name in class_folders:
             class_path = os.path.join(self.root_dir, cls_name)
+            label = self.class_to_idx[cls_name]
+
             for file_name in sorted(os.listdir(class_path)):
                 if not file_name.lower().endswith(".npy"):
                     continue
