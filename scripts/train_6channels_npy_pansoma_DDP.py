@@ -153,7 +153,7 @@ def _build_loader_from_roots(roots, split, batch_size, num_workers, shuffle,
     for r in roots:
         ld, gm = get_data_loader(
             data_dir=r, dataset_type=split, batch_size=batch_size,  # batch_size here is irrelevant; we rewrap below
-            num_workers=0, shuffle=False,  # avoid extra threads; just to obtain the dataset object
+            num_workers=num_workers, shuffle=False,  # avoid extra threads; just to obtain the dataset object
             return_paths=return_paths
         )
         ds = getattr(ld, "dataset", None)
@@ -236,11 +236,11 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         # Mode A: single root
         ld_tr, genotype_map = get_data_loader(
             data_dir=data_path, dataset_type="train", batch_size=batch_size,
-            num_workers=0, shuffle=False  # get dataset only
+            num_workers=num_workers, shuffle=False  # get dataset only
         )
         ld_va, _ = get_data_loader(
             data_dir=data_path, dataset_type="val", batch_size=batch_size,
-            num_workers=0, shuffle=False, return_paths=True
+            num_workers=num_workers, shuffle=False, return_paths=True
         )
         train_loader = _make_loader(ld_tr.dataset, batch_size, True, num_workers,
                                     prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
