@@ -22,6 +22,7 @@ class NpyDataset(Dataset):
         self.samples = []
         self.classes = []
         self.class_to_idx = {}
+        print(self.scan_workers)
 
         if not os.path.isdir(self.root_dir):
             raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
