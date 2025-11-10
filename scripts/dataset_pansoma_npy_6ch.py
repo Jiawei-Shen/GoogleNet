@@ -42,12 +42,12 @@ class NpyDataset(Dataset):
 
                 file_path = os.path.join(class_path, file_name)
                 # Resolve real path once (avoid re-resolving every sample)
-                real_path = os.path.realpath(file_path) if self.resolve_symlinks else file_path
-
-                if not os.path.exists(real_path):
-                    raise FileNotFoundError(f"Broken symlink: {file_path} -> {real_path}")
-
-                self.samples.append((real_path, label))
+                # real_path = os.path.realpath(file_path) if self.resolve_symlinks else file_path
+                #
+                # if not os.path.exists(real_path):
+                #     raise FileNotFoundError(f"Broken symlink: {file_path} -> {real_path}")
+                # self.samples.append((real_path, label))
+                self.samples.append((file_path, label))
 
         if len(self.samples) == 0:
             raise ValueError(f"No .npy files found in {self.root_dir}")
