@@ -77,7 +77,7 @@ def print_and_log(message, log_path):
     if not IS_MAIN_PROCESS:
         return
     print(message)
-    with open(log_file, 'a', encoding='utf-8') as f:
+    with open(log_path, 'a', encoding='utf-8') as f:
         f.write(message + '\n')
 
 
@@ -105,7 +105,7 @@ def _unique_path(path: str) -> str:
     return cand
 
 
-# ---------- NEW: utilities to build concatenated datasets/loaders ----------
+# ---------- Utilities to build concatenated datasets/loaders ----------
 def _build_loader_from_roots(roots, split, batch_size, num_workers, shuffle, return_paths=False):
     """
     Use get_data_loader for each root, grab the .dataset, check genotype_map consistency,
@@ -119,12 +119,18 @@ def _build_loader_from_roots(roots, split, batch_size, num_workers, shuffle, ret
             num_workers=num_workers, shuffle=shuffle if split == "train" else False,
             return_paths=return_paths
         )
-        if len(ld) == 0 and len(ld.dataset) == 0:
-            continue
+        # skip empty splits
+        try:
+            if len(ld) == 0 and len(ld.dataset) == 0:
+                continue
+        except TypeError:
+            # if __len__ not implemented on loader, fall back to dataset length only
+            if hasattr(ld, "dataset") and len(ld.dataset) == 0:
+                continue
+
         if genotype_map is None:
             genotype_map = gm
         else:
-            # require exact same mapping for safety
             if gm != genotype_map:
                 raise ValueError(f"Inconsistent genotype_map between roots; root={r}")
         datasets.append(ld.dataset)
@@ -142,44 +148,26 @@ def _build_loader_from_roots(roots, split, batch_size, num_workers, shuffle, ret
 
 def _build_mode_c_loaders(data_paths, batch_size, num_workers):
     """
-    Mode C: multiple roots. Train = union of (train + val) from every root.
-             Val   = union of (val) from every root (with return_paths=True).
+    Mode C: multiple roots.
+      • Train = union of TRAIN from every root.
+      • Val   = union of VAL   from every root (with return_paths=True).
     """
     roots = [os.path.abspath(os.path.expanduser(p)) for p in data_paths]
 
-    # build train from (train + val)
-    train_parts = []
-    genotype_map = None
-
-    # split=train
-    tr_loader, gm_tr = _build_loader_from_roots(
+    # TRAIN from train/ only
+    train_loader, gm_tr = _build_loader_from_roots(
         roots, "train", batch_size, num_workers, shuffle=True, return_paths=False
     )
-    train_parts.append(tr_loader.dataset)
-    genotype_map = gm_tr
 
-    # split=val (added to train, too)
-    val_for_train_loader, gm_val_for_train = _build_loader_from_roots(
-        roots, "val", batch_size, num_workers, shuffle=True, return_paths=False
-    )
-    if gm_val_for_train != genotype_map:
-        raise ValueError("Inconsistent genotype_map between 'train' and 'val' across roots.")
-    train_parts.append(val_for_train_loader.dataset)
-
-    train_concat = ConcatDataset(train_parts)
-    train_loader = DataLoader(
-        train_concat, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True
-    )
-
-    # build val from val only, with return_paths=True
+    # VAL from val/ only
     val_loader, gm_val = _build_loader_from_roots(
         roots, "val", batch_size, num_workers, shuffle=False, return_paths=True
     )
-    if gm_val != genotype_map:
-        raise ValueError("Inconsistent genotype_map between train-combined and validation across roots.")
 
-    return train_loader, val_loader, genotype_map
+    if gm_val != gm_tr:
+        raise ValueError("Inconsistent genotype_map between combined train and combined val across roots.")
+
+    return train_loader, val_loader, gm_tr
 
 
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
@@ -187,10 +175,8 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 warmup_epochs=10, weight_decay=0.05, depths=None, dims=None,
                 training_data_ratio=1.0, ddp=False, data_parallel=False, local_rank=0,
                 resume=None,
-                # NEW: single knob for class weight (positive class), default 88
                 pos_weight=88.0):
     os.makedirs(output_path, exist_ok=True)
-    global log_file
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if os.path.exists(log_file) and IS_MAIN_PROCESS:
         os.remove(log_file)
@@ -242,11 +228,11 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             raise ValueError("Inconsistent genotype_map between train_roots and val_roots.")
 
     elif isinstance(data_path, (list, tuple)):
-        # Mode C: multiple roots, combine train+val into training input
+        # Mode C: multiple roots (no mixing of val into train)
         train_loader, val_loader, genotype_map = _build_mode_c_loaders(
             data_path, batch_size=batch_size, num_workers=num_workers
         )
-        print_and_log("Mode C: Using union(train ∪ val) as training input, and union(val) for validation.", log_file)
+        print_and_log("Mode C: Using union(train) for training and union(val) for validation.", log_file)
 
     else:
         raise ValueError("Unsupported data_path type.")
@@ -682,7 +668,7 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
     return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results, metrics
 
 
-# --- Helpers for path resolution (single, non-duplicated) ---
+# --- Helpers for path resolution / files list (kept for completeness) ---
 def _read_paths_file(file_path):
     paths = []
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -725,7 +711,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--data_paths", type=str, nargs='+', default=None,
                         help="MULTI roots (each contains 'train/' and 'val/'). "
-                             "Train input = union(train ∪ val) from all roots; Val = union(val) (Mode C).")
+                             "Mode C: Train = union(train), Val = union(val) from all roots.")
 
     parser.add_argument("-o", "--output_path", default="./saved_models_6channel", type=str, help="Path to save model")
     parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3],
@@ -765,11 +751,15 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to a checkpoint .pth to resume training (loads model/optimizer/scheduler/epoch).")
 
-    # --- NEW: single positive-class weight knob (default 88) ---
+    # --- single positive-class weight knob ---
     parser.add_argument("--pos_weight", type=float, default=88.0,
                         help="Positive class weight applied to class index 1. Default: 88.0")
 
-    args = parser.parse_args()
+    # Accept/ignore extra launcher args if present
+    parser.add_argument("--local_rank", type=int, default=None,
+                        help="(Ignored) Torch launcher may pass this. We use env LOCAL_RANK instead.")
+
+    args, _unknown = parser.parse_known_args()
 
     # ---- Enforce: exactly one of (data_path) OR (both files) OR (--data_paths) ----
     has_base = args.data_path is not None
@@ -797,7 +787,6 @@ if __name__ == "__main__":
             parser.error(f"--val_data_paths_file is empty or unreadable: {args.val_data_paths_file}")
         data_path_or_pair = (train_roots, val_roots)
     else:
-        # Mode C
         if len(args.data_paths) < 1:
             parser.error("--data_paths needs at least one root.")
         data_path_or_pair = args.data_paths
