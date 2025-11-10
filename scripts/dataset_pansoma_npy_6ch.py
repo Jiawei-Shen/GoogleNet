@@ -15,7 +15,7 @@ class NpyDataset(Dataset):
 
     def __init__(self, root_dir, transform=None, return_paths=False, resolve_symlinks=True, scan_workers=4):
         self.resolve_symlinks = resolve_symlinks
-        self.scan_workers = int(scan_workers)
+        self.scan_workers = max(16, int(scan_workers))
         self.root_dir = os.path.expanduser(root_dir)
         self.transform = transform
         self.return_paths = return_paths
