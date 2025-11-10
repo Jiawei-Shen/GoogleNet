@@ -125,7 +125,7 @@ def _make_loader(dataset,
                  num_workers,
                  pin_memory=True,
                  persistent_workers=True,
-                 prefetch_factor=4,
+                 prefetch_factor=16,
                  multiprocessing_context=None,
                  sampler=None):
     kwargs = dict(
