@@ -7,16 +7,13 @@ import os, glob, torch
 
 
 class NpyDataset(Dataset):
-    """
-    Custom PyTorch Dataset to load 6-channel .npy files.
-    Resolves symlinks once during initialization for faster I/O.
-    """
-
-    def __init__(self, root_dir, transform=None, return_paths=False, resolve_symlinks=True):
+    def __init__(self, root_dir, transform=None, return_paths=False,
+                 resolve_symlinks=True, scan_workers=4):
         self.root_dir = os.path.expanduser(root_dir)
         self.transform = transform
         self.return_paths = return_paths
         self.resolve_symlinks = resolve_symlinks
+        self.scan_workers = max(1, int(scan_workers))
         self.samples = []
         self.classes = []
         self.class_to_idx = {}
@@ -24,37 +21,53 @@ class NpyDataset(Dataset):
         if not os.path.isdir(self.root_dir):
             raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
 
-        # scan subdirectories (class folders)
-        class_folders = sorted([d.name for d in os.scandir(self.root_dir) if d.is_dir()])
-        if not class_folders:
+        # fixed class order for determinism
+        self.classes = sorted([d.name for d in os.scandir(self.root_dir) if d.is_dir()])
+        if not self.classes:
             raise FileNotFoundError(f"No class subdirectories found in {self.root_dir}")
 
-        self.classes = class_folders
         self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
 
-        for cls_name in class_folders:
+        # --- parallel scan per class dir ---
+        def _scan_one_class(cls_name):
             class_path = os.path.join(self.root_dir, cls_name)
             label = self.class_to_idx[cls_name]
-            for file_name in sorted(os.listdir(class_path)):
-                if not file_name.lower().endswith(".npy"):
+
+            # scandir is faster than listdir + join; sort deterministically
+            entries = sorted((e for e in os.scandir(class_path) if e.is_file()),
+                             key=lambda e: e.name)
+            out = []
+            for e in entries:
+                name = e.name
+                if not name.lower().endswith(".npy"):
                     continue
-
-                file_path = os.path.join(class_path, file_name)
-                # resolve real path once (avoid re-resolving every sample)
+                file_path = e.path
                 real_path = os.path.realpath(file_path) if self.resolve_symlinks else file_path
-                if not os.path.exists(real_path):
+                # os.path.exists hits FS again; stat once is slightly cheaper
+                try:
+                    os.stat(real_path)
+                except FileNotFoundError:
                     raise FileNotFoundError(f"Broken symlink: {file_path} -> {real_path}")
+                out.append((real_path, label))
+            return cls_name, out
 
-                self.samples.append((real_path, label))
+        # Use a small thread pool; network/shared filesystems benefit the most.
+        # Keep per-class determinism by extending in self.classes order.
+        results = {}
+        with ThreadPoolExecutor(max_workers=self.scan_workers) as ex:
+            futures = {ex.submit(_scan_one_class, cls): cls for cls in self.classes}
+            for fut in as_completed(futures):
+                cls, items = fut.result()
+                results[cls] = items
+
+        for cls in self.classes:  # preserve class order
+            self.samples.extend(results.get(cls, []))
 
         if len(self.samples) == 0:
             raise ValueError(f"No .npy files found in {self.root_dir}")
 
-        print(
-            f"Initialized NpyDataset from {self.root_dir}: "
-            f"Found {len(self.samples)} samples in {len(self.classes)} classes "
-            f"({'symlink-resolved' if self.resolve_symlinks else 'no symlink resolution'} mode)."
-        )
+        print(f"Initialized NpyDataset from {self.root_dir}: "
+              f"Found {len(self.samples)} samples in {len(self.classes)} classes.")
 
     def __len__(self):
         return len(self.samples)
@@ -68,9 +81,8 @@ class NpyDataset(Dataset):
 
         if not isinstance(image_np, np.ndarray):
             raise TypeError(f"File {file_path} did not load as a NumPy array (got {type(image_np)}).")
-
         if image_np.ndim != 3 or image_np.shape[0] != 6:
-            raise ValueError(f"File {file_path} has shape {image_np.shape}, expected (6, W, H).")
+            raise ValueError(f"{file_path} has shape {image_np.shape}; expected (6, W, H).")
 
         image_tensor = torch.from_numpy(image_np.copy()).float()
         if self.transform:
@@ -78,8 +90,7 @@ class NpyDataset(Dataset):
 
         if self.return_paths:
             return image_tensor, label, file_path
-        else:
-            return image_tensor, label
+        return image_tensor, label
 
 def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=16, shuffle: bool = False,
                     return_paths: bool = False):
@@ -152,7 +163,7 @@ def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=16, shuff
     datasets = []
     unified_class_to_idx = None
     for d in dataset_dirs:
-        ds = NpyDataset(root_dir=d, transform=transform, return_paths=return_paths)
+        ds = NpyDataset(root_dir=d, transform=transform, return_paths=return_paths, scan_workers=num_workers)
         if unified_class_to_idx is None:
             unified_class_to_idx = ds.class_to_idx
         else:
