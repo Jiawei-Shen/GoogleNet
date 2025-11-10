@@ -13,7 +13,7 @@ class NpyDataset(Dataset):
     Accepts .npy files with the shape (6, W, H).
     """
 
-    def __init__(self, root_dir, transform=None, return_paths=False, resolve_symlinks=True):
+    def __init__(self, root_dir, transform=None, return_paths=False, resolve_symlinks=False):
         self.root_dir = os.path.expanduser(root_dir)
         self.transform = transform
         self.return_paths = return_paths
