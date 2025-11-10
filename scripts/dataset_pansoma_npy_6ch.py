@@ -34,38 +34,56 @@ class NpyDataset(Dataset):
         self.classes = class_folders
         self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
 
-        for cls_name in class_folders:
-            class_path = os.path.join(self.root_dir, cls_name)
-            label = self.class_to_idx[cls_name]
+        if resolve_symlinks:
+            for cls_name in class_folders:
+                class_path = os.path.join(self.root_dir, cls_name)
+                label = self.class_to_idx[cls_name]
 
-            try:
-                names = sorted(os.listdir(class_path))  # stable order across runs
-            except FileNotFoundError:
-                continue
+                try:
+                    names = sorted(os.listdir(class_path))  # stable order across runs
+                except FileNotFoundError:
+                    continue
 
-            # Worker that validates extension + resolves the real path once
-            def _resolve_one(fn: str):
-                if not fn.lower().endswith(".npy"):
-                    return None
-                file_path = os.path.join(class_path, fn)
-                real_path = os.path.realpath(file_path) if self.resolve_symlinks else file_path
-                if not os.path.exists(real_path):
-                    # raise to fail fast (or return None to silently skip)
-                    raise FileNotFoundError(f"Broken symlink: {file_path} -> {real_path}")
-                return (real_path, label)
+                # Worker that validates extension + resolves the real path once
+                def _resolve_one(fn: str):
+                    if not fn.lower().endswith(".npy"):
+                        return None
+                    file_path = os.path.join(class_path, fn)
+                    real_path = os.path.realpath(file_path) if self.resolve_symlinks else file_path
+                    if not os.path.exists(real_path):
+                        # raise to fail fast (or return None to silently skip)
+                        raise FileNotFoundError(f"Broken symlink: {file_path} -> {real_path}")
+                    return (real_path, label)
 
-            # Use a modest thread count to avoid hammering the FS
-            max_workers = getattr(self, "scan_workers", 8)
-            results = []
+                # Use a modest thread count to avoid hammering the FS
+                max_workers = getattr(self, "scan_workers", 8)
+                results = []
 
-            # map preserves the order of `names`, so we don’t need to re-sort
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                for out in ex.map(_resolve_one, names, chunksize=256):
-                    if out is not None:
-                        results.append(out)
+                # map preserves the order of `names`, so we don’t need to re-sort
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    for out in ex.map(_resolve_one, names, chunksize=256):
+                        if out is not None:
+                            results.append(out)
 
-            # Append all resolved items for this class
-            self.samples.extend(results)
+                # Append all resolved items for this class
+                self.samples.extend(results)
+        else:
+            for cls_name in class_folders:
+                class_path = os.path.join(self.root_dir, cls_name)
+                label = self.class_to_idx[cls_name]
+
+                for file_name in sorted(os.listdir(class_path)):
+                    if not file_name.lower().endswith(".npy"):
+                        continue
+
+                    file_path = os.path.join(class_path, file_name)
+                    # Resolve real path once (avoid re-resolving every sample)
+                    real_path = os.path.realpath(file_path) if self.resolve_symlinks else file_path
+
+                    if not os.path.exists(real_path):
+                        raise FileNotFoundError(f"Broken symlink: {file_path} -> {real_path}")
+
+                    self.samples.append((real_path, label))
 
         if len(self.samples) == 0:
             raise ValueError(f"No .npy files found in {self.root_dir}")
