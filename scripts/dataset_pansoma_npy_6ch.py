@@ -8,15 +8,15 @@ import os, glob, torch
 
 class NpyDataset(Dataset):
     """
-    --- REVISED ---
     Custom PyTorch Dataset to load 6-channel .npy files.
-    Accepts .npy files with the shape (6, W, H).
+    Resolves symlinks once during initialization for faster I/O.
     """
 
-    def __init__(self, root_dir, transform=None, return_paths=False):
+    def __init__(self, root_dir, transform=None, return_paths=False, resolve_symlinks=True):
         self.root_dir = os.path.expanduser(root_dir)
         self.transform = transform
         self.return_paths = return_paths
+        self.resolve_symlinks = resolve_symlinks
         self.samples = []
         self.classes = []
         self.class_to_idx = {}
@@ -24,6 +24,7 @@ class NpyDataset(Dataset):
         if not os.path.isdir(self.root_dir):
             raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
 
+        # scan subdirectories (class folders)
         class_folders = sorted([d.name for d in os.scandir(self.root_dir) if d.is_dir()])
         if not class_folders:
             raise FileNotFoundError(f"No class subdirectories found in {self.root_dir}")
@@ -33,16 +34,27 @@ class NpyDataset(Dataset):
 
         for cls_name in class_folders:
             class_path = os.path.join(self.root_dir, cls_name)
+            label = self.class_to_idx[cls_name]
             for file_name in sorted(os.listdir(class_path)):
-                if file_name.lower().endswith(".npy"):
-                    file_path = os.path.join(class_path, file_name)
-                    self.samples.append((file_path, self.class_to_idx[cls_name]))
+                if not file_name.lower().endswith(".npy"):
+                    continue
+
+                file_path = os.path.join(class_path, file_name)
+                # resolve real path once (avoid re-resolving every sample)
+                real_path = os.path.realpath(file_path) if self.resolve_symlinks else file_path
+                if not os.path.exists(real_path):
+                    raise FileNotFoundError(f"Broken symlink: {file_path} -> {real_path}")
+
+                self.samples.append((real_path, label))
 
         if len(self.samples) == 0:
             raise ValueError(f"No .npy files found in {self.root_dir}")
 
         print(
-            f"Initialized NpyDataset from {self.root_dir}: Found {len(self.samples)} samples in {len(self.classes)} classes.")
+            f"Initialized NpyDataset from {self.root_dir}: "
+            f"Found {len(self.samples)} samples in {len(self.classes)} classes "
+            f"({'symlink-resolved' if self.resolve_symlinks else 'no symlink resolution'} mode)."
+        )
 
     def __len__(self):
         return len(self.samples)
@@ -55,15 +67,10 @@ class NpyDataset(Dataset):
             raise RuntimeError(f"Failed to load .npy file {file_path}: {e}")
 
         if not isinstance(image_np, np.ndarray):
-            raise TypeError(f"File {file_path} did not load as a NumPy array (loaded type: {type(image_np)}).")
+            raise TypeError(f"File {file_path} did not load as a NumPy array (got {type(image_np)}).")
 
-        # --- REVISED: Validate for 6 channels in (C, W, H) format ---
-        # This check now assumes the input shape is (6, W, H) as requested.
         if image_np.ndim != 3 or image_np.shape[0] != 6:
-            raise ValueError(
-                f"Loaded .npy file {file_path} has an unsupported shape {image_np.shape}. "
-                f"Expected shape is (6, W, H)."
-            )
+            raise ValueError(f"File {file_path} has shape {image_np.shape}, expected (6, W, H).")
 
         image_tensor = torch.from_numpy(image_np.copy()).float()
         if self.transform:
@@ -73,7 +80,6 @@ class NpyDataset(Dataset):
             return image_tensor, label, file_path
         else:
             return image_tensor, label
-
 
 def get_data_loader(data_dir, dataset_type, batch_size=32, num_workers=16, shuffle: bool = False,
                     return_paths: bool = False):
