@@ -1,34 +1,39 @@
 #!/usr/bin/env python3
 import argparse
-import torch
-import torch.optim as optim
-import torch.nn as nn
-import sys
-import os
-from tqdm import tqdm
-from collections import defaultdict
-import torch.nn.functional as F
-from torch.utils.data import Subset, DataLoader, ConcatDataset
-from torch.utils.data.distributed import DistributedSampler
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
 import json
+import os
+import sys
+from collections import defaultdict
 
-# --- Schedulers ---
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.utils.data import DataLoader, Subset, ConcatDataset
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 
+# ---- env + backend knobs (helps speed) ----
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+torch.backends.cudnn.benchmark = True
+
+# local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from mynet import ConvNeXtCBAMClassifier
-from dataset_pansoma_npy_6ch import get_data_loader
+from dataset_pansoma_npy_6ch import get_data_loader  # returns (loader, genotype_map)
 
-# Globals updated in __main__ when using DDP
+# Globals updated in __main__ with DDP
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-IS_MAIN_PROCESS = True  # rank-0 logging only when DDP is enabled
+IS_MAIN_PROCESS = True  # rank-0 logging only
 
 
+# ---------------- Losses ----------------
 class MultiClassFocalLoss(nn.Module):
     def __init__(self, gamma=2.0, weight=None, reduction='mean'):
-        super(MultiClassFocalLoss, self).__init__()
+        super().__init__()
         self.gamma = gamma
         self.weight = weight
         self.reduction = reduction
@@ -43,10 +48,9 @@ class MultiClassFocalLoss(nn.Module):
             log_pt = log_pt * at
 
         focal_loss = -1 * (1 - pt) ** self.gamma * log_pt
-
         if self.reduction == 'mean':
             return focal_loss.mean()
-        elif self.reduction == 'sum':
+        if self.reduction == 'sum':
             return focal_loss.sum()
         return focal_loss
 
@@ -61,13 +65,12 @@ class CombinedFocalWeightedCELoss(nn.Module):
     def forward(self, logits, targets, current_lr):
         focal_weight = 1.0 - (current_lr / self.initial_lr)
         wce_weight = 1.0 - focal_weight
-        loss_focal = self.focal_loss(logits, targets)
-        loss_wce = self.wce_loss(logits, targets)
-        return focal_weight * loss_focal + wce_weight * loss_wce
+        return focal_weight * self.focal_loss(logits, targets) + wce_weight * self.wce_loss(logits, targets)
 
 
+# ---------------- Utils ----------------
 def init_weights(m):
-    if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+    if isinstance(m, (nn.Conv2d, nn.Linear)):
         nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
@@ -76,7 +79,7 @@ def init_weights(m):
 def print_and_log(message, log_path):
     if not IS_MAIN_PROCESS:
         return
-    print(message)
+    print(message, flush=True)
     with open(log_path, 'a', encoding='utf-8') as f:
         f.write(message + '\n')
 
@@ -93,7 +96,6 @@ def _load_state_dict(m, state):
 
 
 def _unique_path(path: str) -> str:
-    """Return a path that does not exist by appending _v{n} if needed."""
     if not os.path.exists(path):
         return path
     base, ext = os.path.splitext(path)
@@ -105,224 +107,261 @@ def _unique_path(path: str) -> str:
     return cand
 
 
-# ---------- Utilities to build concatenated datasets/loaders ----------
-def _build_loader_from_roots(roots, split, batch_size, num_workers, shuffle, return_paths=False):
-    """
-    Use get_data_loader for each root, grab the .dataset, check genotype_map consistency,
-    then return a DataLoader over ConcatDataset.
-    """
+def _read_paths_file(file_path):
+    paths = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith('#'):
+                continue
+            paths.append(os.path.abspath(os.path.expanduser(s)))
+    return paths
+
+
+# ---- central helper to build loaders with fast knobs ----
+def _make_loader(dataset,
+                 batch_size,
+                 shuffle,
+                 num_workers,
+                 pin_memory=True,
+                 persistent_workers=True,
+                 prefetch_factor=4,
+                 multiprocessing_context=None,
+                 sampler=None):
+    kwargs = dict(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=(shuffle and sampler is None),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
+    if multiprocessing_context is not None:
+        kwargs["multiprocessing_context"] = multiprocessing_context
+    if sampler is not None:
+        kwargs["sampler"] = sampler
+        kwargs["shuffle"] = False
+    return DataLoader(**kwargs)
+
+
+# ---- build from many roots via get_data_loader, but rewrap datasets with fast knobs ----
+def _build_loader_from_roots(roots, split, batch_size, num_workers, shuffle,
+                             prefetch_factor, mp_ctx, return_paths=False):
     datasets = []
     genotype_map = None
     for r in roots:
         ld, gm = get_data_loader(
-            data_dir=r, dataset_type=split, batch_size=batch_size,
-            num_workers=num_workers, shuffle=shuffle if split == "train" else False,
+            data_dir=r, dataset_type=split, batch_size=batch_size,  # batch_size here is irrelevant; we rewrap below
+            num_workers=0, shuffle=False,  # avoid extra threads; just to obtain the dataset object
             return_paths=return_paths
         )
-        # skip empty splits
+        ds = getattr(ld, "dataset", None)
+        if ds is None:
+            continue
         try:
-            if len(ld) == 0 and len(ld.dataset) == 0:
+            if len(ds) == 0:
                 continue
-        except TypeError:
-            # if __len__ not implemented on loader, fall back to dataset length only
-            if hasattr(ld, "dataset") and len(ld.dataset) == 0:
-                continue
+        except Exception:
+            pass
 
         if genotype_map is None:
             genotype_map = gm
-        else:
-            if gm != genotype_map:
-                raise ValueError(f"Inconsistent genotype_map between roots; root={r}")
-        datasets.append(ld.dataset)
+        elif gm != genotype_map:
+            raise ValueError(f"Inconsistent genotype_map between roots; offending root: {r}")
+        datasets.append(ds)
 
     if not datasets:
         raise ValueError(f"No datasets found for split='{split}' in provided roots.")
 
     concat = ConcatDataset(datasets)
-    loader = DataLoader(
-        concat, batch_size=batch_size, shuffle=shuffle,
-        num_workers=num_workers, pin_memory=True
+    loader = _make_loader(
+        dataset=concat,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        multiprocessing_context=mp_ctx,
+        pin_memory=True,
+        persistent_workers=True,
+        sampler=None,
     )
     return loader, genotype_map
 
 
-def _build_mode_c_loaders(data_paths, batch_size, num_workers):
+def _build_mode_c_loaders(data_paths, batch_size, num_workers, prefetch_factor, mp_ctx):
     """
     Mode C: multiple roots.
       • Train = union of TRAIN from every root.
       • Val   = union of VAL   from every root (with return_paths=True).
     """
     roots = [os.path.abspath(os.path.expanduser(p)) for p in data_paths]
-
-    # TRAIN from train/ only
     train_loader, gm_tr = _build_loader_from_roots(
-        roots, "train", batch_size, num_workers, shuffle=True, return_paths=False
+        roots, "train", batch_size, num_workers, shuffle=True,
+        prefetch_factor=prefetch_factor, mp_ctx=mp_ctx, return_paths=False
     )
-
-    # VAL from val/ only
     val_loader, gm_val = _build_loader_from_roots(
-        roots, "val", batch_size, num_workers, shuffle=False, return_paths=True
+        roots, "val", batch_size, num_workers, shuffle=False,
+        prefetch_factor=prefetch_factor, mp_ctx=mp_ctx, return_paths=True
     )
-
     if gm_val != gm_tr:
         raise ValueError("Inconsistent genotype_map between combined train and combined val across roots.")
-
     return train_loader, val_loader, gm_tr
 
 
-def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=0.0001,
+# ---------------- Train / Eval ----------------
+def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=1e-4,
                 batch_size=32, num_workers=4, loss_type='weighted_ce',
                 warmup_epochs=10, weight_decay=0.05, depths=None, dims=None,
                 training_data_ratio=1.0, ddp=False, data_parallel=False, local_rank=0,
-                resume=None,
-                pos_weight=88.0):
+                resume=None, pos_weight=88.0,
+                prefetch_factor=4, mp_context=None):
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if os.path.exists(log_file) and IS_MAIN_PROCESS:
         os.remove(log_file)
 
-    MIN_SAVE_EPOCH = 5  # first checkpoint after 5 epochs
+    MIN_SAVE_EPOCH = 5
 
     if not (0 < training_data_ratio <= 1.0):
         raise ValueError(f"--training_data_ratio must be in (0,1], got {training_data_ratio}")
 
     print_and_log(f"Using device: {device}", log_file)
     print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
-    print_and_log(f"Using Cosine Annealing scheduler with a {warmup_epochs}-epoch linear warmup.", log_file)
-    print_and_log(
-        f"Checkpointing: snapshot at epoch {MIN_SAVE_EPOCH}, then save a NEW file whenever validation F1(true) improves.",
-        log_file)
-    print_and_log(f"Using {num_workers} workers for data loading.", log_file)
-    if save_val_results:
-        print_and_log("Will save validation results JSON alongside each new best.", log_file)
+    print_and_log(f"Using CosineAnnealing with {warmup_epochs} warmup epochs.", log_file)
+    print_and_log(f"DataLoader: workers={num_workers}, pin_memory=True, persistent_workers=True, prefetch_factor={prefetch_factor}, mp_ctx={mp_context}", log_file)
 
-    # -------------------- Build loaders by mode --------------------
-    # Mode A: single root str; Mode B: (train_roots, val_roots); Mode C: list of roots
+    # ---------------- Build loaders ----------------
     if isinstance(data_path, str):
-        # Mode A
-        train_loader, genotype_map = get_data_loader(
+        # Mode A: single root
+        ld_tr, genotype_map = get_data_loader(
             data_dir=data_path, dataset_type="train", batch_size=batch_size,
-            num_workers=num_workers, shuffle=True
+            num_workers=0, shuffle=False  # get dataset only
         )
-        try:
-            val_loader, _ = get_data_loader(
-                data_dir=data_path, dataset_type="val", batch_size=batch_size,
-                num_workers=num_workers, shuffle=False, return_paths=True
-            )
-        except Exception as e:
-            print_and_log(f"\nFATAL: Could not create validation data loader with 'return_paths=True'.", log_file)
-            print_and_log("Please ensure your 'dataset_pansoma_npy_6ch.py' can handle this flag.", log_file)
-            print_and_log(f"Error details: {e}", log_file)
-            return
-
+        ld_va, _ = get_data_loader(
+            data_dir=data_path, dataset_type="val", batch_size=batch_size,
+            num_workers=0, shuffle=False, return_paths=True
+        )
+        train_loader = _make_loader(ld_tr.dataset, batch_size, True, num_workers,
+                                    prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
+                                    pin_memory=True, persistent_workers=True)
+        val_loader = _make_loader(ld_va.dataset, batch_size, False, num_workers,
+                                  prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
+                                  pin_memory=True, persistent_workers=True)
     elif isinstance(data_path, tuple) and len(data_path) == 2:
-        # Mode B
+        # Mode B: explicit (train_roots, val_roots)
         train_roots, val_roots = data_path
         train_loader, genotype_map = _build_loader_from_roots(
-            train_roots, "train", batch_size, num_workers, shuffle=True, return_paths=False
+            train_roots, "train", batch_size, num_workers, True,
+            prefetch_factor=prefetch_factor, mp_ctx=mp_context, return_paths=False
         )
         val_loader, gm_val = _build_loader_from_roots(
-            val_roots, "val", batch_size, num_workers, shuffle=False, return_paths=True
+            val_roots, "val", batch_size, num_workers, False,
+            prefetch_factor=prefetch_factor, mp_ctx=mp_context, return_paths=True
         )
         if gm_val != genotype_map:
             raise ValueError("Inconsistent genotype_map between train_roots and val_roots.")
-
     elif isinstance(data_path, (list, tuple)):
-        # Mode C: multiple roots (no mixing of val into train)
+        # Mode C: multiple roots
         train_loader, val_loader, genotype_map = _build_mode_c_loaders(
-            data_path, batch_size=batch_size, num_workers=num_workers
+            data_path, batch_size=batch_size, num_workers=num_workers,
+            prefetch_factor=prefetch_factor, mp_ctx=mp_context
         )
-        print_and_log("Mode C: Using union(train) for training and union(val) for validation.", log_file)
-
+        print_and_log("Mode C: Train=union(train), Val=union(val) across all roots.", log_file)
     else:
         raise ValueError("Unsupported data_path type.")
 
-    # Randomly subsample training data if requested (applies after combination)
+    # ---- Optional subsample (DDP-safe: broadcast indices) ----
     if training_data_ratio < 1.0:
         full_ds = train_loader.dataset
         n = len(full_ds)
         k = max(1, int(round(n * training_data_ratio)))
-        idx = torch.randperm(n, device=device)[:k].cpu().tolist()
-        subset = Subset(full_ds, idx)
-        train_loader = DataLoader(subset, batch_size=batch_size, shuffle=True,
-                                  num_workers=num_workers, pin_memory=True)
-        print_and_log(f"Training subset: using {k}/{n} samples (~{training_data_ratio:.2f} of data).", log_file)
 
+        if ddp and dist.is_initialized():
+            if IS_MAIN_PROCESS:
+                idx_tensor = torch.randperm(n, device='cpu')[:k]
+            else:
+                idx_tensor = torch.empty(k, dtype=torch.long, device='cpu')
+            # broadcast k then indices
+            k_tensor = torch.tensor([k], dtype=torch.long)
+            dist.broadcast(k_tensor, src=0)
+            if not IS_MAIN_PROCESS:
+                idx_tensor = torch.empty(k_tensor.item(), dtype=torch.long, device='cpu')
+            dist.broadcast(idx_tensor, src=0)
+            idx_list = idx_tensor.tolist()
+        else:
+            idx_list = torch.randperm(n, device='cpu')[:k].tolist()
+
+        subset = Subset(full_ds, idx_list)
+        train_loader = _make_loader(
+            subset, batch_size, True, num_workers,
+            prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
+            pin_memory=True, persistent_workers=True
+        )
+        print_and_log(f"Training subset: using {len(subset)}/{n} samples (~{training_data_ratio:.2f} of data).", log_file)
+
+    # ---- Model / parallelism ----
     if not genotype_map:
         print_and_log("Error: genotype_map is empty. Check dataloader.", log_file)
         return
     num_classes = len(genotype_map)
-    if num_classes == 0:
-        print_and_log("Error: Number of classes is 0. Check dataloader.", log_file)
-        return
     print_and_log(f"Number of classes: {num_classes}", log_file)
-    sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
 
-    model = ConvNeXtCBAMClassifier(in_channels=6, class_num=num_classes,
-                                   depths=depths, dims=dims).to(device)
+    model = ConvNeXtCBAMClassifier(in_channels=6, class_num=num_classes, depths=depths, dims=dims).to(device)
 
-    # Optional DataParallel (single-process, multi-GPU), ignored when DDP
     if (not ddp) and data_parallel and torch.cuda.is_available():
         n = torch.cuda.device_count()
         if n > 1:
-            print_and_log(f"Wrapping model in DataParallel across {n} GPUs.", log_file)
+            print_and_log(f"DataParallel across {n} GPUs.", log_file)
             model = nn.DataParallel(model)
         else:
-            print_and_log("DataParallel requested but only one CUDA device found; running on a single GPU.", log_file)
+            print_and_log("DataParallel requested but single GPU detected; running single-GPU.", log_file)
 
-    # DDP (multi-process) takes precedence if requested
     if ddp:
         print_and_log(f"Wrapping model in DistributedDataParallel on cuda:{local_rank}.", log_file)
         model = DistributedDataParallel(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            gradient_as_bucket_view=True,
-            broadcast_buffers=False,
+            model, device_ids=[local_rank], output_device=local_rank,
+            gradient_as_bucket_view=True, broadcast_buffers=False,
         )
-
-        # Attach DistributedSampler to train/val datasets
+        # Replace loaders with samplers for true DDP sharding
         train_dataset = train_loader.dataset
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=num_workers,
-                                  pin_memory=True, sampler=train_sampler)
-
         val_dataset = val_loader.dataset
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
         val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=num_workers,
-                                pin_memory=True, sampler=val_sampler)
+        train_loader = _make_loader(train_dataset, batch_size, True, num_workers,
+                                    prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
+                                    pin_memory=True, persistent_workers=True, sampler=train_sampler)
+        val_loader = _make_loader(val_dataset, batch_size, False, num_workers,
+                                  prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
+                                  pin_memory=True, persistent_workers=True, sampler=val_sampler)
     else:
-        train_sampler = None  # for uniform API below
+        train_sampler = None
 
     model.apply(init_weights)
 
-    # --- Class weights (simple, user-controlled) ---
-    pos_weight_value = float(pos_weight)  # positive class weight knob
+    # ---- Loss / Optim / Sched ----
+    pos_weight_value = float(pos_weight)
     class_weights = torch.ones(num_classes, device=device, dtype=torch.float32)
     if num_classes >= 2:
-        class_weights[1] = pos_weight_value  # assume class index 1 is the "positive/true" class
-    else:
-        class_weights[0] = 1.0  # edge case
+        class_weights[1] = pos_weight_value
 
     print_and_log(f"Class weights: {class_weights.tolist()} (from --pos_weight={pos_weight_value})", log_file)
 
     if loss_type == "combined":
         criterion = CombinedFocalWeightedCELoss(initial_lr=learning_rate, pos_weight=class_weights)
-        print_and_log(f"Using Combined Focal Loss and Weighted CE Loss.", log_file)
+        print_and_log("Using Combined(Focal + Weighted CE) Loss.", log_file)
     elif loss_type == "weighted_ce":
         criterion = nn.CrossEntropyLoss(weight=class_weights)
-        print_and_log(f"Using Weighted CE Loss.", log_file)
+        print_and_log("Using Weighted CE Loss.", log_file)
     else:
         raise ValueError(f"Unsupported loss_type: {loss_type}")
 
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    print_and_log(f"Using AdamW optimizer with weight decay: {weight_decay}", log_file)
-
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
-    main_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=0)
+    main_scheduler = CosineAnnealingLR(optimizer, T_max=max(1, num_epochs - warmup_epochs), eta_min=0)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
 
-    # ---- Resume support ----
+    # ---- Resume ----
     start_epoch = 0
     best_epoch = 0
     best_f1_true = float("-inf")
@@ -349,10 +388,11 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         except Exception as e:
             print_and_log(f"WARNING: Failed to load checkpoint '{resume}': {e}", log_file)
 
-    # ---- Training loop ----
+    # ---- Train loop ----
+    sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
+
     for epoch in range(start_epoch, num_epochs):
         model.train()
-
         if ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -361,49 +401,39 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         total_train = 0
 
         current_lr = optimizer.param_groups[0]['lr']
-        progress_bar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch + 1}/{num_epochs} LR: {current_lr:.1e}",
-            leave=True,
-            disable=not IS_MAIN_PROCESS
-        )
+        progress_bar = tqdm(train_loader,
+                            desc=f"Epoch {epoch + 1}/{num_epochs} LR: {current_lr:.1e}",
+                            leave=True,
+                            disable=not IS_MAIN_PROCESS)
 
         batch_count = 0
         for images, labels in progress_bar:
-            images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
             outputs = model(images)
 
             if loss_type == "combined":
                 if isinstance(outputs, tuple) and len(outputs) == 3:
                     main_output, aux1, aux2 = outputs
-                    loss1 = criterion(main_output, labels, current_lr)
-                    loss2 = criterion(aux1, labels, current_lr)
-                    loss3 = criterion(aux2, labels, current_lr)
-                    loss = loss1 + 0.3 * loss2 + 0.3 * loss3
+                    loss = (criterion(main_output, labels, current_lr)
+                            + 0.3 * criterion(aux1, labels, current_lr)
+                            + 0.3 * criterion(aux2, labels, current_lr))
                     outputs_for_acc = main_output
-                elif isinstance(outputs, torch.Tensor):
+                else:
                     loss = criterion(outputs, labels, current_lr)
                     outputs_for_acc = outputs
-                else:
-                    if IS_MAIN_PROCESS:
-                        progress_bar.close()
-                    raise TypeError(f"Model output type not recognized: {type(outputs)}")
             else:
                 if isinstance(outputs, tuple) and len(outputs) == 3:
                     main_output, aux1, aux2 = outputs
-                    loss1 = criterion(main_output, labels)
-                    loss2 = criterion(aux1, labels)
-                    loss3 = criterion(aux2, labels)
-                    loss = loss1 + 0.3 * loss2 + 0.3 * loss3
+                    loss = (criterion(main_output, labels)
+                            + 0.3 * criterion(aux1, labels)
+                            + 0.3 * criterion(aux2, labels))
                     outputs_for_acc = main_output
-                elif isinstance(outputs, torch.Tensor):
+                else:
                     loss = criterion(outputs, labels)
                     outputs_for_acc = outputs
-                else:
-                    if IS_MAIN_PROCESS:
-                        progress_bar.close()
-                    raise TypeError(f"Model output type not recognized: {type(outputs)}")
 
             loss.backward()
             optimizer.step()
@@ -420,7 +450,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 progress_bar.set_postfix(loss=f"{avg_loss_train:.4f}", acc=f"{avg_acc_train:.2f}%")
 
         epoch_train_loss = (running_loss / batch_count) if batch_count > 0 else 0.0
-        epoch_train_acc = (correct_train / total_train) * 100 if total_train > 0 else 0.0
+        epoch_train_acc = (correct_train / max(1, total_train)) * 100.0
 
         world_size = dist.get_world_size() if ddp and dist.is_initialized() else 1
         val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = evaluate_model(
@@ -431,33 +461,31 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         if IS_MAIN_PROCESS and class_stats_val:
             print_and_log("\nClass-wise Validation Accuracy:", log_file)
             for class_name in sorted_class_names_from_map:
-                stats = class_stats_val.get(class_name, {})
+                s = class_stats_val.get(class_name, {})
                 print_and_log(
-                    f"  {class_name} (Index {stats.get('idx', 'N/A')}): {stats.get('acc', 0):.2f}% "
-                    f"({stats.get('correct', 0)}/{stats.get('total', 0)})",
-                    log_file)
+                    f"  {class_name} (idx {s.get('idx','N/A')}): {s.get('acc',0):.2f}% "
+                    f"({s.get('correct',0)}/{s.get('total',0)})", log_file)
 
-        # True-class metrics
         val_prec_true = val_metrics.get('precision_true', 0.0)
         val_rec_true = val_metrics.get('recall_true', 0.0)
         val_f1_true = val_metrics.get('f1_true', 0.0)
         pos_idx = val_metrics.get('pos_class_idx', None)
 
-        summary_msg = (
-            f"Epoch {epoch + 1}/{num_epochs} Summary - "
-            f"Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.2f}%, "
-            f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}% | "
-            f"Prec(true): {val_prec_true * 100:.2f}%, "
-            f"Rec(true): {val_rec_true * 100:.2f}%, "
-            f"F1(true): {val_f1_true:.4f} "
-            f"(LR: {current_lr:.1e}" + (f", pos_idx={pos_idx}" if pos_idx is not None else "") + ")"
+        print_and_log(
+            f"Epoch {epoch + 1}/{num_epochs} "
+            f"| Train Loss {epoch_train_loss:.4f} Acc {epoch_train_acc:.2f}% "
+            f"| Val Loss {val_loss:.4f} Acc {val_acc:.2f}% "
+            f"| Prec(true) {val_prec_true*100:.2f}% Rec(true) {val_rec_true*100:.2f}% F1(true) {val_f1_true:.4f} "
+            f"(LR {current_lr:.1e}{', pos_idx='+str(pos_idx) if pos_idx is not None else ''})",
+            log_file
         )
-        print_and_log(summary_msg, log_file)
 
-        # Snapshot at epoch 5 (rank 0 only)
+        improved = (val_f1_true > best_f1_true) or \
+                   (val_f1_true == best_f1_true and val_rec_true > best_rec_true) or \
+                   (val_f1_true == best_f1_true and val_rec_true == best_rec_true and val_loss < best_val_loss)
+
         if (epoch + 1) == MIN_SAVE_EPOCH and IS_MAIN_PROCESS:
-            snap_path = os.path.join(output_path, f"model_epoch_{MIN_SAVE_EPOCH}.pth")
-            snap_path = _unique_path(snap_path)
+            snap_path = _unique_path(os.path.join(output_path, f"model_epoch_{MIN_SAVE_EPOCH}.pth"))
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': _state_dict(model),
@@ -466,12 +494,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 'genotype_map': genotype_map,
                 'in_channels': 6
             }, snap_path)
-            print_and_log(f"\nSnapshot saved at epoch {epoch + 1}: {snap_path}", log_file)
-
-        # Save on validation improvement by F1(true); tie-breakers: higher recall_true, then lower val_loss
-        improved = (val_f1_true > best_f1_true) or \
-                   (val_f1_true == best_f1_true and val_rec_true > best_rec_true) or \
-                   (val_f1_true == best_f1_true and val_rec_true == best_rec_true and val_loss < best_val_loss)
+            print_and_log(f"Snapshot saved at epoch {epoch + 1}: {snap_path}", log_file)
 
         if (epoch + 1) >= MIN_SAVE_EPOCH and improved and IS_MAIN_PROCESS:
             best_f1_true = val_f1_true
@@ -480,10 +503,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             best_val_loss = val_loss
             best_epoch = epoch + 1
 
-            ckpt_name = f"model_e{best_epoch:03d}_f1_{best_f1_true:.4f}.pth"
-            best_path = os.path.join(output_path, ckpt_name)
-            best_path = _unique_path(best_path)
-
+            best_path = _unique_path(os.path.join(output_path, f"model_e{best_epoch:03d}_f1_{best_f1_true:.4f}.pth"))
             payload = {
                 'epoch': best_epoch,
                 'model_state_dict': _state_dict(model),
@@ -498,17 +518,14 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             }
             torch.save(payload, best_path)
             last_best_ckpt_path = best_path
-
             print_and_log(
-                f"\nNew BEST at epoch {best_epoch}: "
-                f"F1(true) {best_f1_true:.4f} | Rec(true) {best_rec_true*100:.2f}% | "
-                f"Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
-                f"Saved: {best_path}", log_file)
+                f"New BEST @epoch {best_epoch}: F1(true) {best_f1_true:.4f} | "
+                f"Rec(true) {best_rec_true*100:.2f}% | Val Acc {best_val_acc:.2f}% | "
+                f"Val Loss {best_val_loss:.4f}. Saved: {best_path}", log_file
+            )
 
             if save_val_results:
-                result_name = f"validation_results_e{best_epoch:03d}_f1_{best_f1_true:.4f}.json"
-                result_path = os.path.join(output_path, result_name)
-                result_path = _unique_path(result_path)
+                result_path = _unique_path(os.path.join(output_path, f"validation_results_e{best_epoch:03d}_f1_{best_f1_true:.4f}.json"))
                 try:
                     with open(result_path, 'w') as f:
                         json.dump({
@@ -530,11 +547,8 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         f"Training complete. Best epoch: {best_epoch} "
         f"| F1(true) {best_f1_true:.4f} | Rec(true) {best_rec_true*100:.2f}% "
         f"| Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
+        f"{'Best model: '+last_best_ckpt_path if last_best_ckpt_path else 'No best checkpoint saved.'}"
     )
-    if last_best_ckpt_path:
-        final_msg += f"Best model: {last_best_ckpt_path}"
-    else:
-        final_msg += "No best checkpoint saved."
     print_and_log(final_msg, log_file)
 
 
@@ -542,15 +556,13 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
                    ddp=False, world_size=1):
     model.eval()
     batch_count_eval = 0
-
     num_classes = len(genotype_map) if genotype_map else 0
 
-    # Tensors for global metrics (on device)
+    # global accumulators on device
     correct_eval = torch.zeros(1, device=device, dtype=torch.long)
     total_eval = torch.zeros(1, device=device, dtype=torch.long)
     loss_sum = torch.zeros(1, device=device, dtype=torch.float)
 
-    # Per-class counters for metrics
     tp = torch.zeros(num_classes, device=device, dtype=torch.long)
     fp = torch.zeros(num_classes, device=device, dtype=torch.long)
     fn = torch.zeros(num_classes, device=device, dtype=torch.long)
@@ -561,9 +573,7 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
     idx_to_class = {v: k for k, v in genotype_map.items()} if genotype_map else {}
 
     if not data_loader:
-        metrics = {
-            'precision_true': 0.0, 'recall_true': 0.0, 'f1_true': 0.0, 'pos_class_idx': None
-        }
+        metrics = {'precision_true': 0.0, 'recall_true': 0.0, 'f1_true': 0.0, 'pos_class_idx': None}
         return 0.0, 0.0, {}, {}, metrics
 
     with torch.no_grad():
@@ -574,7 +584,8 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
                 images, labels = batch
                 paths = [""] * labels.size(0)
 
-            images, labels = images.to(device), labels.to(device)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             outputs = model(images)
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
@@ -590,7 +601,6 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
             for i in range(labels.size(0)):
                 pred_idx = int(predicted[i])
                 true_idx = int(labels[i])
-
                 class_total_counts[true_idx] += 1
                 if pred_idx == true_idx:
                     class_correct_counts[true_idx] += 1
@@ -608,7 +618,6 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
         dist.all_reduce(correct_eval, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_eval, op=dist.ReduceOp.SUM)
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-
         if num_classes > 0:
             dist.all_reduce(tp, op=dist.ReduceOp.SUM)
             dist.all_reduce(fp, op=dist.ReduceOp.SUM)
@@ -630,7 +639,7 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
                 'acc': acc_c, 'correct': correct_c, 'total': total_c, 'idx': class_idx
             }
 
-    # Positive ("true") class F1
+    # choose positive class index
     pos_idx = None
     if genotype_map:
         for name, idx in genotype_map.items():
@@ -638,16 +647,7 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
                 pos_idx = idx
                 break
     if pos_idx is None:
-        if 1 < num_classes:
-            pos_idx = 1
-        elif num_classes > 0:
-            supports = class_total_counts.clone()
-            if supports.sum() > 0:
-                pos_idx = int(torch.nonzero(supports == supports[supports > 0].min(), as_tuple=False)[0].item())
-            else:
-                pos_idx = 0
-        else:
-            pos_idx = 0
+        pos_idx = 1 if num_classes > 1 else 0
 
     tpc = float(tp[pos_idx].item() if pos_idx < num_classes else 0.0)
     fpc = float(fp[pos_idx].item() if pos_idx < num_classes else 0.0)
@@ -655,8 +655,7 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
 
     precision_true = (tpc / (tpc + fpc)) if (tpc + fpc) > 0 else 0.0
     recall_true = (tpc / (tpc + fnc)) if (tpc + fnc) > 0 else 0.0
-    f1_true = (2 * precision_true * recall_true / (precision_true + recall_true)) \
-        if (precision_true + recall_true) > 0 else 0.0
+    f1_true = (2 * precision_true * recall_true / (precision_true + recall_true)) if (precision_true + recall_true) > 0 else 0.0
 
     metrics = {
         'precision_true': precision_true,
@@ -664,22 +663,10 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
         'f1_true': f1_true,
         'pos_class_idx': pos_idx,
     }
-
     return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results, metrics
 
 
-# --- Helpers for path resolution / files list (kept for completeness) ---
-def _read_paths_file(file_path):
-    paths = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith('#'):
-                continue
-            paths.append(os.path.abspath(os.path.expanduser(s)))
-    return paths
-
-
+# ---------------- Main ----------------
 def _resolve_data_roots(primary_path, extra_paths, paths_file):
     candidates = []
     if primary_path:
@@ -705,63 +692,50 @@ def _resolve_data_roots(primary_path, extra_paths, paths_file):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Classifier on 6-channel custom .npy dataset")
 
-    # Make data_path OPTIONAL; we will enforce XOR with the files mode / multi mode
+    # Input modes
     parser.add_argument("data_path", nargs="?", type=str,
                         help="Dataset root containing 'train/' and 'val/' (Mode A).")
-
     parser.add_argument("--data_paths", type=str, nargs='+', default=None,
                         help="MULTI roots (each contains 'train/' and 'val/'). "
-                             "Mode C: Train = union(train), Val = union(val) from all roots.")
+                             "Mode C: Train=union(train), Val=union(val).")
+    parser.add_argument("--train_data_paths_file", type=str, default=None,
+                        help="Text file listing TRAIN dataset roots (one per line). (Mode B)")
+    parser.add_argument("--val_data_paths_file", type=str, default=None,
+                        help="Text file listing VAL dataset roots (one per line). (Mode B)")
 
+    # Model / train
     parser.add_argument("-o", "--output_path", default="./saved_models_6channel", type=str, help="Path to save model")
-    parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3],
-                        help="A list of depths for the ConvNeXt stages (e.g., 3 3 27 3)")
-    parser.add_argument("--dims", type=int, nargs='+', default=[192, 384, 768, 1536],
-                        help="A list of dimensions for the ConvNeXt stages (e.g., 192 384 768 1536)")
+    parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3])
+    parser.add_argument("--dims", type=int, nargs='+', default=[192, 384, 768, 1536])
+    parser.add_argument("--epochs", type=int, default=70)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch_size", type=int, default=32)
 
-    parser.add_argument("--epochs", type=int, default=70, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.0001, help="Initial learning rate")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for data loading")
+    # Loader knobs
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--mp_context", type=str, default=None, choices=[None, "fork", "forkserver", "spawn"])
 
     # Optimizer / scheduler
-    parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of epochs for linear LR warmup")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
-    parser.add_argument("--save_val_results", action='store_true', help="Save validation results when best is found.")
-    parser.add_argument("--loss_type", type=str, default="weighted_ce", choices=["combined", "weighted_ce"],
-                        help="Loss function to use")
+    parser.add_argument("--warmup_epochs", type=int, default=3)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--save_val_results", action='store_true')
+    parser.add_argument("--loss_type", type=str, default="weighted_ce", choices=["combined", "weighted_ce"])
 
-    # Mode B (files)
-    parser.add_argument("--train_data_paths_file", type=str, default=None,
-                        help="Text file listing TRAIN dataset roots (one per line).")
-    parser.add_argument("--val_data_paths_file", type=str, default=None,
-                        help="Text file listing VAL dataset roots (one per line).")
+    # Subsample
+    parser.add_argument("--training_data_ratio", type=float, default=1.0)
 
-    # Subsample ratio
-    parser.add_argument("--training_data_ratio", type=float, default=1.0,
-                        help="Proportion of training data to use (0–1]. Randomly subsamples the training set.")
+    # Parallel
+    parser.add_argument("--ddp", action="store_true")
+    parser.add_argument("--data_parallel", action="store_true")
+    parser.add_argument("--local_rank", type=int, default=None, help="(Ignored) Torch launcher may pass this.")
 
-    # Multi-GPU switches
-    parser.add_argument("--ddp", action="store_true",
-                        help="Use DistributedDataParallel (multi-process). Launch with torchrun.")
-    parser.add_argument("--data_parallel", action="store_true",
-                        help="Use nn.DataParallel across all visible GPUs (single process). Ignored if --ddp is set.")
-
-    # Resume
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Path to a checkpoint .pth to resume training (loads model/optimizer/scheduler/epoch).")
-
-    # --- single positive-class weight knob ---
-    parser.add_argument("--pos_weight", type=float, default=88.0,
-                        help="Positive class weight applied to class index 1. Default: 88.0")
-
-    # Accept/ignore extra launcher args if present
-    parser.add_argument("--local_rank", type=int, default=None,
-                        help="(Ignored) Torch launcher may pass this. We use env LOCAL_RANK instead.")
+    # Resume / weights
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--pos_weight", type=float, default=88.0)
 
     args, _unknown = parser.parse_known_args()
 
-    # ---- Enforce: exactly one of (data_path) OR (both files) OR (--data_paths) ----
     has_base = args.data_path is not None
     has_both_files = (args.train_data_paths_file is not None) and (args.val_data_paths_file is not None)
     has_multi = args.data_paths is not None
@@ -775,7 +749,7 @@ if __name__ == "__main__":
                      "  • Mode B: --train_data_paths_file and --val_data_paths_file\n"
                      "  • Mode C: --data_paths root1 root2 ...")
 
-    # Build the argument passed into train_model
+    # Build param for train_model
     if has_base:
         data_path_or_pair = os.path.abspath(os.path.expanduser(args.data_path))
     elif has_both_files:
@@ -791,7 +765,7 @@ if __name__ == "__main__":
             parser.error("--data_paths needs at least one root.")
         data_path_or_pair = args.data_paths
 
-    # --- DDP init (takes precedence over DataParallel) ---
+    # DDP init
     if args.ddp:
         if not torch.cuda.is_available():
             raise RuntimeError("DDP requires CUDA available.")
@@ -812,15 +786,13 @@ if __name__ == "__main__":
         save_val_results=args.save_val_results,
         num_epochs=args.epochs, learning_rate=args.lr,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        loss_type=args.loss_type,
-        warmup_epochs=args.warmup_epochs,
-        weight_decay=args.weight_decay,
-        depths=args.depths,
-        dims=args.dims,
+        loss_type=args.loss_type, warmup_epochs=args.warmup_epochs,
+        weight_decay=args.weight_decay, depths=args.depths, dims=args.dims,
         training_data_ratio=args.training_data_ratio,
         ddp=args.ddp, data_parallel=args.data_parallel, local_rank=local_rank,
-        resume=args.resume,
-        pos_weight=args.pos_weight,
+        resume=args.resume, pos_weight=args.pos_weight,
+        prefetch_factor=args.prefetch_factor,
+        mp_context=(None if args.mp_context in (None, "None") else args.mp_context)
     )
 
     if args.ddp and dist.is_initialized():
