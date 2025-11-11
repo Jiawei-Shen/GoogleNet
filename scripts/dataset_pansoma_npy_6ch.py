@@ -61,7 +61,8 @@ class NpyDataset(Dataset):
     def __getitem__(self, idx):
         file_path, label = self.samples[idx]
         try:
-            image_np = np.load(file_path)
+            # image_np = np.load(file_path)
+            image_np = np.load(file_path, mmap_mode='r')
         except Exception as e:
             raise RuntimeError(f"Failed to load .npy file {file_path}: {e}")
 
