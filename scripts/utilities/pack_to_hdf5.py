@@ -17,8 +17,8 @@ def _scan_one_class(args):
             if not fn.lower().endswith(".npy"): continue
             fp = os.path.join(cls_dir, fn)
             rp = os.path.realpath(fp) if resolve_symlinks else fp
-            if not os.path.exists(rp):
-                raise FileNotFoundError(f"Broken symlink or missing file: {fp} -> {rp}")
+            # if not os.path.exists(rp):
+            #     raise FileNotFoundError(f"Broken symlink or missing file: {fp} -> {rp}")
             out.append((rp, label))
     except PermissionError:
         pass
