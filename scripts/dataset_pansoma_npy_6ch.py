@@ -13,13 +13,14 @@ class NpyDataset(Dataset):
     Accepts .npy files with the shape (6, W, H).
     """
 
-    def __init__(self, root_dir, transform=None, return_paths=False):
+    def __init__(self, root_dir, transform=None, return_paths=False, resolve_symlinks=False):
         self.root_dir = os.path.expanduser(root_dir)
         self.transform = transform
         self.return_paths = return_paths
         self.samples = []
         self.classes = []
         self.class_to_idx = {}
+        self.resolve_symlinks = resolve_symlinks
 
         if not os.path.isdir(self.root_dir):
             raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
@@ -33,10 +34,20 @@ class NpyDataset(Dataset):
 
         for cls_name in class_folders:
             class_path = os.path.join(self.root_dir, cls_name)
+            label = self.class_to_idx[cls_name]
+
             for file_name in sorted(os.listdir(class_path)):
-                if file_name.lower().endswith(".npy"):
-                    file_path = os.path.join(class_path, file_name)
-                    self.samples.append((file_path, self.class_to_idx[cls_name]))
+                if not file_name.lower().endswith(".npy"):
+                    continue
+
+                file_path = os.path.join(class_path, file_name)
+                # Resolve real path once (avoid re-resolving every sample)
+                # real_path = os.path.realpath(file_path) if self.resolve_symlinks else file_path
+                #
+                # if not os.path.exists(real_path):
+                #     raise FileNotFoundError(f"Broken symlink: {file_path} -> {real_path}")
+                # self.samples.append((real_path, label))
+                self.samples.append((file_path, label))
 
         if len(self.samples) == 0:
             raise ValueError(f"No .npy files found in {self.root_dir}")
@@ -50,7 +61,8 @@ class NpyDataset(Dataset):
     def __getitem__(self, idx):
         file_path, label = self.samples[idx]
         try:
-            image_np = np.load(file_path)
+            # image_np = np.load(file_path)
+            image_np = np.load(file_path, mmap_mode='r')
         except Exception as e:
             raise RuntimeError(f"Failed to load .npy file {file_path}: {e}")
 
