@@ -146,7 +146,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         idx = torch.randperm(n, device=device)[:k].cpu().tolist()
         subset = Subset(full_ds, idx)
         train_loader = DataLoader(subset, batch_size=batch_size, shuffle=True,
-                                  num_workers=num_workers, pin_memory=True)
+                                  num_workers=num_workers, pin_memory=True, prefetch_factor=4)
         print_and_log(f"Training subset: using {k}/{n} samples (~{training_data_ratio:.2f} of data).", log_file)
 
     # Build loader (val)
@@ -198,12 +198,12 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         train_dataset = train_loader.dataset
         train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=num_workers,
-                                  pin_memory=True, sampler=train_sampler)
+                                  pin_memory=True, sampler=train_sampler, prefetch_factor=4)
 
         val_dataset = val_loader.dataset
         val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=num_workers,
-                                pin_memory=True, sampler=val_sampler)
+                                pin_memory=True, sampler=val_sampler, prefetch_factor=4)
     else:
         train_sampler = None  # for uniform API below
 
@@ -636,7 +636,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for data loading")
 
     # Optimizer / scheduler
-    parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of epochs for linear LR warmup")
+    parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of epochs for linear LR warmup")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
     parser.add_argument("--save_val_results", action='store_true', help="Save validation results when best is found.")
     parser.add_argument("--loss_type", type=str, default="weighted_ce", choices=["combined", "weighted_ce"],
