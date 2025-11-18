@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 SRC_ROOT = "/scratch/jshen/data/Pansoma/COLO829T_Pacbio/6ch_training_data_P25_SNV/ALL_chr_merged_REAL/train"
 DST_ROOT = "/scratch/jshen/data/Pansoma/COLO829T_Pacbio/6ch_training_data_P25_SNV/ALL_chr_merged_REAL_sharded/train"
 SHARD_SIZE = 4096
-N_THREADS = 8          # 🔥 adjust: 4–16 depending on disk + CPU
+N_THREADS = 16          # 🔥 adjust: 4–16 depending on disk + CPU
 # ============================================
 
 os.makedirs(DST_ROOT, exist_ok=True)
