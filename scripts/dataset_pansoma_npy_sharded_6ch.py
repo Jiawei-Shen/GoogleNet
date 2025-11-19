@@ -181,9 +181,10 @@ class NPYShardDataset(Dataset):
                 f"has shape {x.shape}, expected (6, H, W)."
             )
 
-        # This will give a non-writable tensor (backed by memmap),
-        # but we never modify inputs in-place, so it's fine.
-        x_tensor = torch.from_numpy(x).float()
+        # Make a writable, contiguous copy in float32 (cheap compared to disk I/O & GPU compute)
+        x_np = np.array(x, dtype=np.float32, copy=True)  # ensures writable
+        x_tensor = torch.from_numpy(x_np)
+
         y_tensor = torch.tensor(int(y), dtype=torch.long)
 
         if self.transform is not None:
