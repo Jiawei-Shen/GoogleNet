@@ -12,26 +12,18 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 #  Sharded NPY dataset with LRU memmap cache (fixes open-FD blowup)
 # ─────────────────────────────────────────────────────────────
 
-
 class NPYShardDataset(Dataset):
     """
-    Sharded NPY dataset:
+    Dataset for sharded .npy files written as:
 
-        root_dir/
-            X_train_000_x.npy   (N0, 6, H, W)
-            X_train_000_y.npy   (N0,)
-            X_train_001_x.npy   (N1, 6, H, W)
-            X_train_001_y.npy   (N1,)
-            ...
+        shard_x: (N, 6, H, W)   e.g.  shard_train_000_x.npy
+        shard_y: (N,)           e.g.  shard_train_000_y.npy
 
-    or generally: anything matching "*_x.npy" with a paired "*_y.npy".
-
-    Key ideas (like your fast NPZ LRU):
-
-      * Do NOT use memmap for training.
-      * Load entire shard (x,y) into RAM when first needed.
-      * Keep only a small number of shards cached (LRU) per worker.
-      * Per-sample access is then just RAM indexing.
+    This version:
+      • Does NOT keep all shards memmapped at once (avoids 'Too many open files').
+      • Only stores paths + sizes in __init__.
+      • Lazily opens shards with np.load(..., mmap_mode="r") in __getitem__.
+      • Uses a small LRU cache (max_cached_shards) per worker to reuse open memmaps.
     """
 
     def __init__(
@@ -39,7 +31,7 @@ class NPYShardDataset(Dataset):
         root_dir: str,
         transform=None,
         return_paths: bool = False,
-        max_cached_shards: int = 1,  # 1 shard ~= 470MB, so per-worker RAM tradeoff
+        max_cached_shards: int = 2,   # <= tune: RAM vs # of open files
     ):
         self.root_dir = os.path.abspath(os.path.expanduser(root_dir))
         self.transform = transform
@@ -49,102 +41,88 @@ class NPYShardDataset(Dataset):
         if not os.path.isdir(self.root_dir):
             raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
 
-        # Find shard pairs: *_x.npy with corresponding *_y.npy
-        all_files = sorted(os.listdir(self.root_dir))
-        x_paths: List[str] = []
-
-        for f in all_files:
-            if not f.endswith("_x.npy"):
-                continue
-            x_path = os.path.join(self.root_dir, f)
-            y_path = x_path.replace("_x.npy", "_y.npy")
-            if not os.path.isfile(y_path):
-                print(f"[NPYShardDataset] WARNING: found {x_path} but missing {y_path}, skipping.")
-                continue
-            x_paths.append(x_path)
+        # Expect files like:  shard_xxx_x.npy  &  shard_xxx_y.npy
+        x_paths = sorted(glob.glob(os.path.join(self.root_dir, "*_x.npy")))
+        y_paths = sorted(glob.glob(os.path.join(self.root_dir, "*_y.npy")))
 
         if not x_paths:
             raise ValueError(f"No *_x.npy shard files found in {self.root_dir}")
+        if len(x_paths) != len(y_paths):
+            raise ValueError(
+                f"Shard count mismatch in {self.root_dir}: "
+                f"{len(x_paths)} *_x.npy vs {len(y_paths)} *_y.npy"
+            )
 
-        self.x_paths: List[str] = []
-        self.y_paths: List[str] = []
+        self.x_paths: List[str] = x_paths
+        self.y_paths: List[str] = y_paths
         self.shard_sizes: List[int] = []
         self.cumulative_sizes: List[int] = []
 
+        self.C = None
+        self.H = None
+        self.W = None
         total = 0
-        C = H = W = None
-        dtype = None
 
-        # Only open each shard once here just to validate shapes
-        for x_path in x_paths:
-            y_path = x_path.replace("_x.npy", "_y.npy")
+        # ── Scan each shard once to get N and shape, then immediately close ──
+        for x_path, y_path in zip(self.x_paths, self.y_paths):
+            # x: (N, 6, H, W) int8 (memmapped; only header is read)
+            x_arr = np.load(x_path, mmap_mode="r")
+            if x_arr.ndim != 4 or x_arr.shape[1] != 6:
+                raise ValueError(
+                    f"{x_path}: expected x shape (N, 6, H, W), got {x_arr.shape}"
+                )
 
-            try:
-                # --- load feature shard ---
-                x_arr = np.load(x_path, allow_pickle=False)
-                if x_arr.ndim != 4 or x_arr.shape[1] != 6:
+            n, C, H, W = x_arr.shape
+            if self.C is None:
+                self.C, self.H, self.W = C, H, W
+            else:
+                if (C, H, W) != (self.C, self.H, self.W):
                     raise ValueError(
-                        f"{x_path}: expected shape (N, 6, H, W), got {x_arr.shape}"
+                        f"{x_path}: inconsistent shard shape {x_arr.shape}, "
+                        f"expected (*, {self.C}, {self.H}, {self.W})"
                     )
-                n, c, h, w = x_arr.shape
-                if C is None:
-                    C, H, W = c, h, w
-                    dtype = x_arr.dtype
-                else:
-                    if (c, h, w) != (C, H, W):
-                        raise ValueError(
-                            f"{x_path}: inconsistent shape {x_arr.shape}, "
-                            f"expected (*, {C}, {H}, {W})"
-                        )
+            # drop the memmap -> closes FD
+            del x_arr
 
-                # --- load label shard ---
-                y_arr = np.load(y_path, allow_pickle=False)
-                if y_arr.ndim != 1:
-                    raise ValueError(f"{y_path}: expected 1D labels, got {y_arr.shape}")
-                if y_arr.shape[0] != n:
-                    raise ValueError(
-                        f"{x_path}/{y_path}: feature/label length mismatch: {n} vs {y_arr.shape[0]}"
-                    )
+            # y: (N,)
+            y_arr = np.load(y_path, mmap_mode="r")
+            if y_arr.shape[0] != n:
+                raise ValueError(
+                    f"{y_path}: label length mismatch: {y_arr.shape[0]} vs {n}"
+                )
+            del y_arr
 
-            except Exception as e:
-                print(f"[NPYShardDataset] WARNING: skipping bad shard pair {x_path}, {y_path}: {e}")
-                continue
-
-            # Valid shard
-            self.x_paths.append(x_path)
-            self.y_paths.append(y_path)
             self.shard_sizes.append(n)
             total += n
             self.cumulative_sizes.append(total)
 
-        if total == 0 or not self.x_paths:
+        if total == 0:
             raise ValueError(
-                f"NPYShardDataset from {self.root_dir} has zero usable samples "
-                f"(all shards invalid or skipped)."
+                f"NPYShardDataset from {self.root_dir} has zero usable samples."
             )
 
-        self.num_channels = C
-        self.height = H
-        self.width = W
-        self.dtype = dtype
-
-        # LRU cache: shard_idx -> (x_arr, y_arr)
-        self._shard_cache: "OrderedDict[int, Tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+        # LRU cache: shard_idx -> (x_memmap, y_memmap)
+        self._shard_cache: "OrderedDict[int, Tuple[np.memmap, np.memmap]]" = OrderedDict()
 
         print(
             f"Initialized NPYShardDataset from {self.root_dir}: "
             f"{len(self.x_paths)} shards, {total} samples total. "
-            f"Shape=(6,{H},{W}) dtype={dtype}, max_cached_shards={self.max_cached_shards}"
+            f"shape per sample = (6, {self.H}, {self.W}), "
+            f"max_cached_shards={self.max_cached_shards}"
         )
 
+    # ─────────────────────────────────────────────────────────
+    #  indexing helpers
+    # ─────────────────────────────────────────────────────────
     def __len__(self) -> int:
         return self.cumulative_sizes[-1]
 
     def _locate(self, idx: int) -> Tuple[int, int]:
+        """Global index -> (shard_idx, local_idx)."""
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of range 0..{len(self)-1}")
 
-        # linear scan is fine; could be binary search if you want
+        # linear scan is OK for few hundred shards; can binary-search if needed
         for shard_idx, cum in enumerate(self.cumulative_sizes):
             if idx < cum:
                 prev_cum = 0 if shard_idx == 0 else self.cumulative_sizes[shard_idx - 1]
@@ -154,26 +132,34 @@ class NPYShardDataset(Dataset):
         raise RuntimeError(f"Failed to locate index {idx}")
 
     def _get_shard_arrays(self, shard_idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        # LRU hit
+        """
+        Return (x_memmap, y_memmap) for a given shard_idx.
+
+        Uses an LRU cache to limit how many shards are currently memmapped,
+        which avoids blowing past the OS file-descriptor limit.
+        """
+        # Cache hit: move to end (most recently used)
         if shard_idx in self._shard_cache:
             x_arr, y_arr = self._shard_cache.pop(shard_idx)
-            self._shard_cache[shard_idx] = (x_arr, y_arr)  # move to end
+            self._shard_cache[shard_idx] = (x_arr, y_arr)
             return x_arr, y_arr
 
-        # Cache miss: load full shard into RAM (NO memmap)
+        # Cache miss: open with memmap
         x_path = self.x_paths[shard_idx]
         y_path = self.y_paths[shard_idx]
 
-        x_arr = np.load(x_path)   # shape (N, 6, H, W)
-        y_arr = np.load(y_path)   # shape (N,)
+        x_arr = np.load(x_path, mmap_mode="r")   # (N, 6, H, W)
+        y_arr = np.load(y_path, mmap_mode="r")   # (N,)
 
-        # Ensure contiguous & writable; matches old fast path
-        x_arr = np.ascontiguousarray(x_arr)
-        y_arr = np.ascontiguousarray(y_arr)
-
+        # store in cache
         self._shard_cache[shard_idx] = (x_arr, y_arr)
+
+        # Evict least-recently-used shard if over capacity
         if len(self._shard_cache) > self.max_cached_shards:
-            self._shard_cache.popitem(last=False)  # evict least-recently-used
+            old_idx, (old_x, old_y) = self._shard_cache.popitem(last=False)
+            # dropping references allows OS to close FDs
+            del old_x
+            del old_y
 
         return x_arr, y_arr
 
@@ -182,7 +168,7 @@ class NPYShardDataset(Dataset):
         x_arr, y_arr = self._get_shard_arrays(shard_idx)
 
         try:
-            x = x_arr[local_idx]   # (6, H, W)
+            x = x_arr[local_idx]   # (6, H, W) view into memmap
             y = y_arr[local_idx]   # scalar
         except Exception as e:
             raise RuntimeError(
@@ -191,12 +177,13 @@ class NPYShardDataset(Dataset):
 
         if x.ndim != 3 or x.shape[0] != 6:
             raise ValueError(
-                f"Sample from shard_idx={shard_idx} local_idx={local_idx} has shape {x.shape}, "
-                f"expected (6, H, W)."
+                f"Sample from shard_idx={shard_idx} local_idx={local_idx} "
+                f"has shape {x.shape}, expected (6, H, W)."
             )
 
-        # Copy is cheap compared to 470MB shard load; ensures writable, kills the warning
-        x_tensor = torch.from_numpy(x.copy()).float()
+        # This will give a non-writable tensor (backed by memmap),
+        # but we never modify inputs in-place, so it's fine.
+        x_tensor = torch.from_numpy(x).float()
         y_tensor = torch.tensor(int(y), dtype=torch.long)
 
         if self.transform is not None:
@@ -207,7 +194,6 @@ class NPYShardDataset(Dataset):
             return x_tensor, y_tensor, sample_id
         else:
             return x_tensor, y_tensor
-
 
 
 # ─────────────────────────────────────────────────────────────
