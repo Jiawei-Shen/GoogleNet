@@ -1,27 +1,29 @@
 import os
 import glob
 from typing import List, Tuple, Dict, Union
+from collections import OrderedDict
 
 import numpy as np
 import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
-# ---------------- NPY-sharded Dataset ----------------
+# ─────────────────────────────────────────────────────────────
+#  Sharded NPY dataset with LRU memmap cache (fixes open-FD blowup)
+# ─────────────────────────────────────────────────────────────
+
 class NPYShardDataset(Dataset):
     """
-    Dataset for NPY shards.
+    Dataset for sharded .npy files written as:
 
-    Each shard is represented by two files in `root_dir`:
-      - shard_x.npy: shape (N, 6, H, W)  (features)
-      - shard_y.npy: shape (N,)          (labels)
+        shard_x: (N, 6, H, W)   e.g.  shard_train_000_x.npy
+        shard_y: (N,)           e.g.  shard_train_000_y.npy
 
-    Example:
-        shard_00000_x.npy
-        shard_00000_y.npy
-
-    All x-files and y-files are opened with mmap_mode="r" for
-    true random access without decompression.
+    This version:
+      • Does NOT keep all shards memmapped at once (avoids 'Too many open files').
+      • Only stores paths + sizes in __init__.
+      • Lazily opens shards with np.load(..., mmap_mode="r") in __getitem__.
+      • Uses a small LRU cache (max_cached_shards) per worker to reuse open memmaps.
     """
 
     def __init__(
@@ -29,84 +31,98 @@ class NPYShardDataset(Dataset):
         root_dir: str,
         transform=None,
         return_paths: bool = False,
+        max_cached_shards: int = 2,   # <= tune: RAM vs # of open files
     ):
         self.root_dir = os.path.abspath(os.path.expanduser(root_dir))
         self.transform = transform
         self.return_paths = return_paths
+        self.max_cached_shards = max_cached_shards
 
         if not os.path.isdir(self.root_dir):
             raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
 
-        # Find all *_x.npy shards
-        x_paths = sorted(
-            [
-                os.path.join(self.root_dir, f)
-                for f in os.listdir(self.root_dir)
-                if f.endswith("_x.npy")
-            ]
-        )
+        # Expect files like:  shard_xxx_x.npy  &  shard_xxx_y.npy
+        x_paths = sorted(glob.glob(os.path.join(self.root_dir, "*_x.npy")))
+        y_paths = sorted(glob.glob(os.path.join(self.root_dir, "*_y.npy")))
 
         if not x_paths:
             raise ValueError(f"No *_x.npy shard files found in {self.root_dir}")
+        if len(x_paths) != len(y_paths):
+            raise ValueError(
+                f"Shard count mismatch in {self.root_dir}: "
+                f"{len(x_paths)} *_x.npy vs {len(y_paths)} *_y.npy"
+            )
 
-        self.shard_x_paths: List[str] = []
-        self.shard_y_paths: List[str] = []
+        self.x_paths: List[str] = x_paths
+        self.y_paths: List[str] = y_paths
         self.shard_sizes: List[int] = []
         self.cumulative_sizes: List[int] = []
 
-        # We keep memmap arrays in memory for fast indexing
-        self._x_arrays: List[np.memmap] = []
-        self._y_arrays: List[np.memmap] = []
-
+        self.C = None
+        self.H = None
+        self.W = None
         total = 0
 
-        for x_path in x_paths:
-            base = x_path[:-6]  # strip "_x.npy"
-            y_path = base + "_y.npy"
-
-            if not os.path.exists(y_path):
-                raise FileNotFoundError(f"Missing label shard for {x_path}: expected {y_path}")
-
-            # Open with memmap
+        # ── Scan each shard once to get N and shape, then immediately close ──
+        for x_path, y_path in zip(self.x_paths, self.y_paths):
+            # x: (N, 6, H, W) int8 (memmapped; only header is read)
             x_arr = np.load(x_path, mmap_mode="r")
-            y_arr = np.load(y_path, mmap_mode="r")
-
             if x_arr.ndim != 4 or x_arr.shape[1] != 6:
                 raise ValueError(
                     f"{x_path}: expected x shape (N, 6, H, W), got {x_arr.shape}"
                 )
 
-            n = int(x_arr.shape[0])
+            n, C, H, W = x_arr.shape
+            if self.C is None:
+                self.C, self.H, self.W = C, H, W
+            else:
+                if (C, H, W) != (self.C, self.H, self.W):
+                    raise ValueError(
+                        f"{x_path}: inconsistent shard shape {x_arr.shape}, "
+                        f"expected (*, {self.C}, {self.H}, {self.W})"
+                    )
+            # drop the memmap -> closes FD
+            del x_arr
+
+            # y: (N,)
+            y_arr = np.load(y_path, mmap_mode="r")
             if y_arr.shape[0] != n:
                 raise ValueError(
-                    f"{x_path}: feature and label length mismatch: {x_arr.shape[0]} vs {y_arr.shape[0]}"
+                    f"{y_path}: label length mismatch: {y_arr.shape[0]} vs {n}"
                 )
-
-            self.shard_x_paths.append(x_path)
-            self.shard_y_paths.append(y_path)
-            self._x_arrays.append(x_arr)
-            self._y_arrays.append(y_arr)
+            del y_arr
 
             self.shard_sizes.append(n)
             total += n
             self.cumulative_sizes.append(total)
 
         if total == 0:
-            raise ValueError(f"NPYShardDataset from {self.root_dir} has zero samples.")
+            raise ValueError(
+                f"NPYShardDataset from {self.root_dir} has zero usable samples."
+            )
+
+        # LRU cache: shard_idx -> (x_memmap, y_memmap)
+        self._shard_cache: "OrderedDict[int, Tuple[np.memmap, np.memmap]]" = OrderedDict()
 
         print(
             f"Initialized NPYShardDataset from {self.root_dir}: "
-            f"{len(self.shard_x_paths)} shards, {total} samples total."
+            f"{len(self.x_paths)} shards, {total} samples total. "
+            f"shape per sample = (6, {self.H}, {self.W}), "
+            f"max_cached_shards={self.max_cached_shards}"
         )
 
+    # ─────────────────────────────────────────────────────────
+    #  indexing helpers
+    # ─────────────────────────────────────────────────────────
     def __len__(self) -> int:
         return self.cumulative_sizes[-1]
 
     def _locate(self, idx: int) -> Tuple[int, int]:
+        """Global index -> (shard_idx, local_idx)."""
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of range 0..{len(self)-1}")
 
-        # simple linear scan is fine given shard count is small (~hundreds)
+        # linear scan is OK for few hundred shards; can binary-search if needed
         for shard_idx, cum in enumerate(self.cumulative_sizes):
             if idx < cum:
                 prev_cum = 0 if shard_idx == 0 else self.cumulative_sizes[shard_idx - 1]
@@ -115,15 +131,45 @@ class NPYShardDataset(Dataset):
 
         raise RuntimeError(f"Failed to locate index {idx}")
 
+    def _get_shard_arrays(self, shard_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Return (x_memmap, y_memmap) for a given shard_idx.
+
+        Uses an LRU cache to limit how many shards are currently memmapped,
+        which avoids blowing past the OS file-descriptor limit.
+        """
+        # Cache hit: move to end (most recently used)
+        if shard_idx in self._shard_cache:
+            x_arr, y_arr = self._shard_cache.pop(shard_idx)
+            self._shard_cache[shard_idx] = (x_arr, y_arr)
+            return x_arr, y_arr
+
+        # Cache miss: open with memmap
+        x_path = self.x_paths[shard_idx]
+        y_path = self.y_paths[shard_idx]
+
+        x_arr = np.load(x_path, mmap_mode="r")   # (N, 6, H, W)
+        y_arr = np.load(y_path, mmap_mode="r")   # (N,)
+
+        # store in cache
+        self._shard_cache[shard_idx] = (x_arr, y_arr)
+
+        # Evict least-recently-used shard if over capacity
+        if len(self._shard_cache) > self.max_cached_shards:
+            old_idx, (old_x, old_y) = self._shard_cache.popitem(last=False)
+            # dropping references allows OS to close FDs
+            del old_x
+            del old_y
+
+        return x_arr, y_arr
+
     def __getitem__(self, idx: int):
         shard_idx, local_idx = self._locate(idx)
-
-        x_arr = self._x_arrays[shard_idx]
-        y_arr = self._y_arrays[shard_idx]
+        x_arr, y_arr = self._get_shard_arrays(shard_idx)
 
         try:
-            x = x_arr[local_idx]  # (6, H, W)
-            y = y_arr[local_idx]  # scalar
+            x = x_arr[local_idx]   # (6, H, W) view into memmap
+            y = y_arr[local_idx]   # scalar
         except Exception as e:
             raise RuntimeError(
                 f"Failed to access local_idx={local_idx} in shard_idx={shard_idx}: {e}"
@@ -131,38 +177,40 @@ class NPYShardDataset(Dataset):
 
         if x.ndim != 3 or x.shape[0] != 6:
             raise ValueError(
-                f"Sample from shard_idx={shard_idx} local_idx={local_idx} has shape {x.shape}, "
-                f"expected (6, H, W)."
+                f"Sample from shard_idx={shard_idx} local_idx={local_idx} "
+                f"has shape {x.shape}, expected (6, H, W)."
             )
 
-        # 👇 this copy makes the array writable, removing the warning
-        x_tensor = torch.from_numpy(x.copy()).float()
+        # This will give a non-writable tensor (backed by memmap),
+        # but we never modify inputs in-place, so it's fine.
+        x_tensor = torch.from_numpy(x).float()
         y_tensor = torch.tensor(int(y), dtype=torch.long)
 
         if self.transform is not None:
             x_tensor = self.transform(x_tensor)
 
         if self.return_paths:
-            sample_id = f"{os.path.basename(self.shard_x_paths[shard_idx])}#{local_idx}"
+            sample_id = f"{os.path.basename(self.x_paths[shard_idx])}#{local_idx}"
             return x_tensor, y_tensor, sample_id
         else:
             return x_tensor, y_tensor
 
 
-# We hardcode the genotype map to match your original ("false", "true") binary setup.
+# ─────────────────────────────────────────────────────────────
+#  Genotype map & get_data_loader (unchanged API)
+# ─────────────────────────────────────────────────────────────
+
 GENOTYPE_MAP: Dict[str, int] = {
     "false": 0,
     "true": 1,
 }
 
-
-def _to_list(x) -> List[str]:
+def _to_list(x):
     if x is None:
         return []
     if isinstance(x, (list, tuple)):
         return list(x)
     return [x]
-
 
 def get_data_loader(
     data_dir: Union[str, List[str], Tuple],
@@ -173,26 +221,23 @@ def get_data_loader(
     return_paths: bool = False,
 ):
     """
-    NPY-sharded version of your original get_data_loader.
+    NPY-sharded version of your original get_data_loader, same interface.
 
-    Behavior:
-      • If data_dir is (train_roots, val_roots):
-          - Pick roots by dataset_type ("train" -> train_roots, "val" -> val_roots)
-          - For EACH root, include BOTH 'train' and 'val' subfolders
-            (to preserve your previous behavior).
-      • Else (str or list/tuple of str): back-compat mode:
-          - Include only the requested `dataset_type` subfolder for each root.
-
-    Layout expected:
+    Layout per root:
         root/
           train/
-            shard_00000_x.npy
-            shard_00000_y.npy
+            shard_train_000_x.npy
+            shard_train_000_y.npy
             ...
           val/
-            shard_00000_x.npy
-            shard_00000_y.npy
+            shard_val_000_x.npy
+            shard_val_000_y.npy
             ...
+
+    Supports:
+      • data_dir = "/path/to/root"
+      • data_dir = ["/root1", "/root2", ...]
+      • data_dir = (train_roots, val_roots)  # split-mode
     """
     # Decide roots & subfolders
     if (
@@ -200,27 +245,23 @@ def get_data_loader(
         and len(data_dir) == 2
         and (isinstance(data_dir[0], (str, list, tuple)) and isinstance(data_dir[1], (str, list, tuple)))
     ):
-        # New split-mode: (train_roots, val_roots)
         roots = _to_list(data_dir[0] if dataset_type == "train" else data_dir[1])
-        subfolders = ["train", "val"]  # include BOTH for each root (your old behavior)
+        subfolders = ["train", "val"]  # your original slightly-unusual behavior
     else:
-        # Back-compat: single root or list of roots; only requested split
         roots = _to_list(data_dir)
         subfolders = [dataset_type]
 
-    # Build actual dataset dirs
     dataset_dirs: List[str] = []
     for r in roots:
         r = os.path.abspath(os.path.expanduser(r))
         for sf in subfolders:
             dataset_dirs.append(os.path.join(r, sf))
 
-    # Existence check
     missing = [p for p in dataset_dirs if not os.path.exists(p)]
     if missing:
         raise FileNotFoundError(f"Dataset path(s) do not exist: {missing}")
 
-    # Normalization (same stats as your original)
+    # Same 6-channel normalization as before
     transform = transforms.Compose([
         transforms.Normalize(
             mean=[
@@ -242,10 +283,14 @@ def get_data_loader(
         )
     ])
 
-    # Build datasets
     datasets: List[Dataset] = []
     for d in dataset_dirs:
-        ds = NPYShardDataset(root_dir=d, transform=transform, return_paths=return_paths)
+        ds = NPYShardDataset(
+            root_dir=d,
+            transform=transform,
+            return_paths=return_paths,
+            max_cached_shards=2,   # <- keep this small to avoid too many open files
+        )
         datasets.append(ds)
 
     if len(datasets) == 1:
@@ -261,7 +306,6 @@ def get_data_loader(
         pin_memory=True,
     )
 
-    # Return loader and genotype map
     return loader, GENOTYPE_MAP
 
 
