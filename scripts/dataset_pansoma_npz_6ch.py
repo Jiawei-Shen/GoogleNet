@@ -18,10 +18,8 @@ class NPZShardDataset(Dataset):
 
     We support several key conventions:
       • ('x', 'y')
-      • ('data', 'labels')
-      • ('arr_0', 'arr_1')  [as a fallback when there are exactly two unnamed arrays]
-
-    For each shard we record which keys to use, so mixed formats are OK.
+      • ('data', 'labels')   <-- this is what you have now
+      • ('arr_0', 'arr_1')   [fallback when there are exactly two unnamed arrays]
     """
 
     def __init__(
@@ -38,7 +36,7 @@ class NPZShardDataset(Dataset):
             raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
 
         # Find all .npz files
-        self.shard_paths: List[str] = sorted(
+        shard_paths = sorted(
             [
                 os.path.join(self.root_dir, f)
                 for f in os.listdir(self.root_dir)
@@ -46,37 +44,37 @@ class NPZShardDataset(Dataset):
             ]
         )
 
-        if not self.shard_paths:
+        if not shard_paths:
             raise ValueError(f"No .npz files found in {self.root_dir}")
 
-        # For each shard: size (N) and key pair (x_key, y_key)
+        # We will keep only valid shards
+        self.shard_paths: List[str] = []
         self.shard_sizes: List[int] = []
         self.cumulative_sizes: List[int] = []
-        self.shard_key_pairs: List[Tuple[str, str]] = []
+
+        # Global key names (must be consistent across shards)
+        self.x_key: str = ""
+        self.y_key: str = ""
 
         total = 0
-        kept_paths: List[str] = []
 
-        for p in self.shard_paths:
+        for p in shard_paths:
             try:
                 with np.load(p) as data:
                     files = list(data.files)
                     key_set = set(files)
 
+                    # Decide feature/label keys
                     x_key = y_key = None
-
-                    # 1) Preferred: 'x', 'y'
                     if "x" in key_set and "y" in key_set:
                         x_key, y_key = "x", "y"
-                    # 2) Common alt: 'data', 'labels'
                     elif "data" in key_set and "labels" in key_set:
                         x_key, y_key = "data", "labels"
-                    # 3) Fallback: exactly two arrays arr_0, arr_1
                     elif set(files) == {"arr_0", "arr_1"} and len(files) == 2:
                         x_key, y_key = "arr_0", "arr_1"
                     else:
                         print(
-                            f"[NPZShardDataset] WARNING: Skipping shard {p} – "
+                            f"[NPZShardDataset] WARNING: skipping shard {p} – "
                             f"could not find ('x','y'), ('data','labels') or ('arr_0','arr_1'). "
                             f"Keys present: {files}"
                         )
@@ -92,36 +90,41 @@ class NPZShardDataset(Dataset):
                             f"{x_arr.shape[0]} vs {y_arr.shape[0]}"
                         )
 
-                    # Light sanity check on channel dimension
                     if x_arr.ndim != 4 or x_arr.shape[1] != 6:
                         raise ValueError(
                             f"{p}: expected x shape (N, 6, H, W), got {x_arr.shape}"
                         )
 
             except Exception as e:
-                # If something is wrong with this shard, log and skip it
-                print(f"[NPZShardDataset] WARNING: Skipping bad shard {p}: {e}")
+                print(f"[NPZShardDataset] WARNING: skipping bad shard {p}: {e}")
                 continue
 
-            # This shard is good – keep it
-            kept_paths.append(p)
-            self.shard_key_pairs.append((x_key, y_key))
+            # For the first valid shard, record the key names
+            if not self.shard_paths:
+                self.x_key, self.y_key = x_key, y_key
+            else:
+                # Enforce same key names across shards
+                if x_key != self.x_key or y_key != self.y_key:
+                    raise RuntimeError(
+                        f"Shard {p} uses different keys ({x_key}, {y_key}) "
+                        f"than previous shards ({self.x_key}, {self.y_key})."
+                    )
+
+            self.shard_paths.append(p)
             self.shard_sizes.append(n)
             total += n
             self.cumulative_sizes.append(total)
 
-        # Overwrite with only the good ones
-        self.shard_paths = kept_paths
-
         if total == 0 or not self.shard_paths:
             raise ValueError(
                 f"NPZShardDataset from {self.root_dir} has zero usable samples "
-                f"(all shards were invalid or skipped)."
+                f"(all shards invalid or skipped)."
             )
 
         print(
             f"Initialized NPZShardDataset from {self.root_dir}: "
-            f"{len(self.shard_paths)} shards, {total} samples total."
+            f"{len(self.shard_paths)} shards, {total} samples total. "
+            f"Using keys: x='{self.x_key}', y='{self.y_key}'."
         )
 
     def __len__(self) -> int:
@@ -130,7 +133,6 @@ class NPZShardDataset(Dataset):
     def _locate(self, idx: int) -> Tuple[int, int]:
         """
         Map global idx -> (shard_idx, local_idx).
-        Simple linear scan is fine for a modest number of shards.
         """
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of range 0..{len(self)-1}")
@@ -141,18 +143,16 @@ class NPZShardDataset(Dataset):
                 local_idx = idx - prev_cum
                 return shard_idx, local_idx
 
-        # Should never get here
         raise RuntimeError(f"Failed to locate index {idx}")
 
     def __getitem__(self, idx: int):
         shard_idx, local_idx = self._locate(idx)
         shard_path = self.shard_paths[shard_idx]
-        x_key, y_key = self.shard_key_pairs[shard_idx]
 
         try:
             data = np.load(shard_path)
-            x = data[x_key][local_idx]    # (6, H, W)
-            y = data[y_key][local_idx]    # scalar
+            x = data[self.x_key][local_idx]    # (6, H, W)
+            y = data[self.y_key][local_idx]    # scalar
         except Exception as e:
             raise RuntimeError(
                 f"Failed to load sample idx={idx} from NPZ shard {shard_path}: {e}"
@@ -164,6 +164,7 @@ class NPZShardDataset(Dataset):
                 f"expected (6, H, W)."
             )
 
+        # data is int8 -> convert to float32 for the model
         x_tensor = torch.from_numpy(x).float()
         y_tensor = torch.tensor(int(y), dtype=torch.long)
 
