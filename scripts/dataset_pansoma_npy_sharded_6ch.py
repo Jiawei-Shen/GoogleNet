@@ -80,29 +80,31 @@ class NPYShardDataset(Dataset):
             y_path = x_path.replace("_x.npy", "_y.npy")
 
             try:
-                with np.load(x_path) as x_arr:
-                    if x_arr.ndim != 4 or x_arr.shape[1] != 6:
+                # --- load feature shard ---
+                x_arr = np.load(x_path, allow_pickle=False)
+                if x_arr.ndim != 4 or x_arr.shape[1] != 6:
+                    raise ValueError(
+                        f"{x_path}: expected shape (N, 6, H, W), got {x_arr.shape}"
+                    )
+                n, c, h, w = x_arr.shape
+                if C is None:
+                    C, H, W = c, h, w
+                    dtype = x_arr.dtype
+                else:
+                    if (c, h, w) != (C, H, W):
                         raise ValueError(
-                            f"{x_path}: expected shape (N, 6, H, W), got {x_arr.shape}"
+                            f"{x_path}: inconsistent shape {x_arr.shape}, "
+                            f"expected (*, {C}, {H}, {W})"
                         )
-                    n, c, h, w = x_arr.shape
-                    if C is None:
-                        C, H, W = c, h, w
-                        dtype = x_arr.dtype
-                    else:
-                        if (c, h, w) != (C, H, W):
-                            raise ValueError(
-                                f"{x_path}: inconsistent shape {x_arr.shape}, "
-                                f"expected (*, {C}, {H}, {W})"
-                            )
 
-                with np.load(y_path) as y_arr:
-                    if y_arr.ndim != 1:
-                        raise ValueError(f"{y_path}: expected 1D labels, got {y_arr.shape}")
-                    if y_arr.shape[0] != n:
-                        raise ValueError(
-                            f"{x_path}/{y_path}: feature/label length mismatch: {n} vs {y_arr.shape[0]}"
-                        )
+                # --- load label shard ---
+                y_arr = np.load(y_path, allow_pickle=False)
+                if y_arr.ndim != 1:
+                    raise ValueError(f"{y_path}: expected 1D labels, got {y_arr.shape}")
+                if y_arr.shape[0] != n:
+                    raise ValueError(
+                        f"{x_path}/{y_path}: feature/label length mismatch: {n} vs {y_arr.shape[0]}"
+                    )
 
             except Exception as e:
                 print(f"[NPYShardDataset] WARNING: skipping bad shard pair {x_path}, {y_path}: {e}")
