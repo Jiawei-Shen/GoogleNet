@@ -75,7 +75,7 @@ def main():
     ap.add_argument("root", type=str, help="root folder containing train/ val/")
     ap.add_argument("--splits", nargs="+", default=["train", "val"])
     ap.add_argument("--pattern", type=str, default="shard_*.npz")
-    ap.add_argument("--workers", type=int, default=cpu_count())
+    ap.add_argument("", type=int, default=cpu_count())
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--remove-npz", action="store_true")
     args = ap.parse_args()

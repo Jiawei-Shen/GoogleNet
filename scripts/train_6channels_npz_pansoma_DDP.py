@@ -24,8 +24,8 @@ torch.backends.cudnn.benchmark = True
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from mynet import ConvNeXtCBAMClassifier
 
-# *** CHANGED: use NPZ-based dataset loader ***
-from dataset_pansoma_npz_6ch import get_data_loader  # returns (loader, genotype_map)
+# *** CHANGED: use NPY-sharded dataset loader (memmap) ***
+from dataset_pansoma_npy_sharded_6ch import get_data_loader  # returns (loader, genotype_map)
 
 # Globals updated in __main__ with DDP
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -232,7 +232,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
     print_and_log(f"Using CosineAnnealing with {warmup_epochs} warmup epochs.", log_file)
     print_and_log(
-        f"DataLoader (NPZ): workers={num_workers}, pin_memory=True, "
+        f"DataLoader (NPY shards, memmap): workers={num_workers}, pin_memory=True, "
         f"persistent_workers=True, prefetch_factor={prefetch_factor}, mp_ctx={mp_context}",
         log_file,
     )
@@ -611,8 +611,8 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
 
                 if idx_to_class and paths[i]:
                     predicted_class_name = idx_to_class.get(pred_idx, str(pred_idx))
-                    # paths[i] is something like "shard_0001.npz#123" or full path
-                    inference_results[predicted_class_name].append(os.path.basename(paths[i]))
+                    # paths[i] is something like "shard_0001_x.npy#123" or a full path
+                    inference_results[predicted_class_name].append(os.path.basename(str(paths[i])))
 
     if ddp and world_size > 1 and dist.is_initialized():
         dist.all_reduce(correct_eval, op=dist.ReduceOp.SUM)
@@ -690,7 +690,7 @@ def _resolve_data_roots(primary_path, extra_paths, paths_file):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a Classifier on 6-channel NPZ-sharded dataset")
+    parser = argparse.ArgumentParser(description="Train a Classifier on 6-channel NPY-sharded dataset")
 
     # Input modes
     parser.add_argument("data_path", nargs="?", type=str,
