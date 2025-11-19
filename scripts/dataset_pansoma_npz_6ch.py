@@ -7,6 +7,7 @@ import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
+from collections import OrderedDict
 
 class NPZShardDataset(Dataset):
     """
@@ -16,10 +17,13 @@ class NPZShardDataset(Dataset):
       - features: shape (N, 6, H, W)
       - labels:   shape (N,)
 
-    We support several key conventions:
+    Supported key conventions:
       • ('x', 'y')
-      • ('data', 'labels')   <-- this is what you have now
-      • ('arr_0', 'arr_1')   [fallback when there are exactly two unnamed arrays]
+      • ('data', 'labels')   <-- your case
+      • ('arr_0', 'arr_1')   (when exactly two arrays exist)
+
+    To avoid insane slowness, we cache a small number of fully
+    loaded shards in RAM per worker (LRU cache).
     """
 
     def __init__(
@@ -27,10 +31,12 @@ class NPZShardDataset(Dataset):
         root_dir: str,
         transform=None,
         return_paths: bool = False,
+        max_cached_shards: int = 1,  # <= IMPORTANT: RAM vs speed tradeoff
     ):
         self.root_dir = os.path.abspath(os.path.expanduser(root_dir))
         self.transform = transform
         self.return_paths = return_paths
+        self.max_cached_shards = max_cached_shards
 
         if not os.path.isdir(self.root_dir):
             raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
@@ -47,12 +53,10 @@ class NPZShardDataset(Dataset):
         if not shard_paths:
             raise ValueError(f"No .npz files found in {self.root_dir}")
 
-        # We will keep only valid shards
         self.shard_paths: List[str] = []
         self.shard_sizes: List[int] = []
         self.cumulative_sizes: List[int] = []
 
-        # Global key names (must be consistent across shards)
         self.x_key: str = ""
         self.y_key: str = ""
 
@@ -64,7 +68,6 @@ class NPZShardDataset(Dataset):
                     files = list(data.files)
                     key_set = set(files)
 
-                    # Decide feature/label keys
                     x_key = y_key = None
                     if "x" in key_set and "y" in key_set:
                         x_key, y_key = "x", "y"
@@ -99,11 +102,9 @@ class NPZShardDataset(Dataset):
                 print(f"[NPZShardDataset] WARNING: skipping bad shard {p}: {e}")
                 continue
 
-            # For the first valid shard, record the key names
             if not self.shard_paths:
                 self.x_key, self.y_key = x_key, y_key
             else:
-                # Enforce same key names across shards
                 if x_key != self.x_key or y_key != self.y_key:
                     raise RuntimeError(
                         f"Shard {p} uses different keys ({x_key}, {y_key}) "
@@ -121,19 +122,20 @@ class NPZShardDataset(Dataset):
                 f"(all shards invalid or skipped)."
             )
 
+        # LRU cache: shard_idx -> (x_arr, y_arr)
+        self._shard_cache: "OrderedDict[int, Tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+
         print(
             f"Initialized NPZShardDataset from {self.root_dir}: "
             f"{len(self.shard_paths)} shards, {total} samples total. "
-            f"Using keys: x='{self.x_key}', y='{self.y_key}'."
+            f"Using keys: x='{self.x_key}', y='{self.y_key}'. "
+            f"max_cached_shards={self.max_cached_shards}"
         )
 
     def __len__(self) -> int:
         return self.cumulative_sizes[-1]
 
     def _locate(self, idx: int) -> Tuple[int, int]:
-        """
-        Map global idx -> (shard_idx, local_idx).
-        """
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of range 0..{len(self)-1}")
 
@@ -145,34 +147,56 @@ class NPZShardDataset(Dataset):
 
         raise RuntimeError(f"Failed to locate index {idx}")
 
+    def _get_shard_arrays(self, shard_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        # LRU hit
+        if shard_idx in self._shard_cache:
+            x_arr, y_arr = self._shard_cache.pop(shard_idx)
+            self._shard_cache[shard_idx] = x_arr, y_arr  # move to end (most recent)
+            return x_arr, y_arr
+
+        # Cache miss: load and maybe evict oldest
+        path = self.shard_paths[shard_idx]
+        with np.load(path) as data:
+            x_arr = data[self.x_key]     # (N, 6, H, W), int8
+            y_arr = data[self.y_key]     # (N,)
+
+            # Make sure they're real ndarrays, not weird views
+            x_arr = np.ascontiguousarray(x_arr)
+            y_arr = np.ascontiguousarray(y_arr)
+
+        self._shard_cache[shard_idx] = (x_arr, y_arr)
+        # Evict least-recently-used
+        if len(self._shard_cache) > self.max_cached_shards:
+            self._shard_cache.popitem(last=False)
+
+        return x_arr, y_arr
+
     def __getitem__(self, idx: int):
         shard_idx, local_idx = self._locate(idx)
-        shard_path = self.shard_paths[shard_idx]
+        x_arr, y_arr = self._get_shard_arrays(shard_idx)
 
         try:
-            data = np.load(shard_path)
-            x = data[self.x_key][local_idx]    # (6, H, W)
-            y = data[self.y_key][local_idx]    # scalar
+            x = x_arr[local_idx]    # (6, H, W)
+            y = y_arr[local_idx]    # scalar
         except Exception as e:
             raise RuntimeError(
-                f"Failed to load sample idx={idx} from NPZ shard {shard_path}: {e}"
+                f"Failed to access local_idx={local_idx} in shard_idx={shard_idx}: {e}"
             )
 
         if x.ndim != 3 or x.shape[0] != 6:
             raise ValueError(
-                f"Sample from {shard_path} at local_idx={local_idx} has shape {x.shape}, "
+                f"Sample from shard_idx={shard_idx} local_idx={local_idx} has shape {x.shape}, "
                 f"expected (6, H, W)."
             )
 
-        # data is int8 -> convert to float32 for the model
-        x_tensor = torch.from_numpy(x).float()
+        x_tensor = torch.from_numpy(x).float()  # per-sample cast, cheap
         y_tensor = torch.tensor(int(y), dtype=torch.long)
 
         if self.transform is not None:
             x_tensor = self.transform(x_tensor)
 
         if self.return_paths:
-            sample_id = f"{os.path.basename(shard_path)}#{local_idx}"
+            sample_id = f"{os.path.basename(self.shard_paths[shard_idx])}#{local_idx}"
             return x_tensor, y_tensor, sample_id
         else:
             return x_tensor, y_tensor
