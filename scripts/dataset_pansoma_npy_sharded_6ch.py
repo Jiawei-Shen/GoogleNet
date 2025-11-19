@@ -290,7 +290,7 @@ def get_data_loader(
             root_dir=d,
             transform=transform,
             return_paths=return_paths,
-            max_cached_shards=2,   # <- keep this small to avoid too many open files
+            max_cached_shards=256,   # <- keep this small to avoid too many open files
         )
         datasets.append(ds)
 
