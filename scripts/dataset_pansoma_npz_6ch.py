@@ -12,11 +12,16 @@ class NPZShardDataset(Dataset):
     """
     Dataset for NPZ shards.
 
-    Each .npz file is expected to contain:
-        x: (N, 6, H, W) float-like
-        y: (N,) int class indices
+    Each .npz file is expected to contain two arrays:
+      - features: shape (N, 6, H, W)
+      - labels:   shape (N,)
 
-    We treat each shard as a mini-dataset and map a global index -> (shard_idx, local_idx).
+    We support several key conventions:
+      • ('x', 'y')
+      • ('data', 'labels')
+      • ('arr_0', 'arr_1')  [as a fallback when there are exactly two unnamed arrays]
+
+    For each shard we record which keys to use, so mixed formats are OK.
     """
 
     def __init__(
@@ -32,7 +37,7 @@ class NPZShardDataset(Dataset):
         if not os.path.isdir(self.root_dir):
             raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
 
-        # Find all .npz files (non-recursive, like your old per-class dirs)
+        # Find all .npz files
         self.shard_paths: List[str] = sorted(
             [
                 os.path.join(self.root_dir, f)
@@ -44,28 +49,75 @@ class NPZShardDataset(Dataset):
         if not self.shard_paths:
             raise ValueError(f"No .npz files found in {self.root_dir}")
 
-        # Pre-scan shard sizes (but don't keep full arrays)
+        # For each shard: size (N) and key pair (x_key, y_key)
         self.shard_sizes: List[int] = []
         self.cumulative_sizes: List[int] = []
+        self.shard_key_pairs: List[Tuple[str, str]] = []
 
         total = 0
+        kept_paths: List[str] = []
+
         for p in self.shard_paths:
             try:
                 with np.load(p) as data:
-                    if "x" not in data or "y" not in data:
-                        raise KeyError(f"{p} missing 'x' or 'y' keys")
-                    n = int(data["x"].shape[0])
-                    if data["y"].shape[0] != n:
-                        raise ValueError(f"{p}: x and y length mismatch: {data['x'].shape[0]} vs {data['y'].shape[0]}")
-            except Exception as e:
-                raise RuntimeError(f"Failed to inspect NPZ shard {p}: {e}")
+                    files = list(data.files)
+                    key_set = set(files)
 
+                    x_key = y_key = None
+
+                    # 1) Preferred: 'x', 'y'
+                    if "x" in key_set and "y" in key_set:
+                        x_key, y_key = "x", "y"
+                    # 2) Common alt: 'data', 'labels'
+                    elif "data" in key_set and "labels" in key_set:
+                        x_key, y_key = "data", "labels"
+                    # 3) Fallback: exactly two arrays arr_0, arr_1
+                    elif set(files) == {"arr_0", "arr_1"} and len(files) == 2:
+                        x_key, y_key = "arr_0", "arr_1"
+                    else:
+                        print(
+                            f"[NPZShardDataset] WARNING: Skipping shard {p} – "
+                            f"could not find ('x','y'), ('data','labels') or ('arr_0','arr_1'). "
+                            f"Keys present: {files}"
+                        )
+                        continue
+
+                    x_arr = data[x_key]
+                    y_arr = data[y_key]
+
+                    n = int(x_arr.shape[0])
+                    if y_arr.shape[0] != n:
+                        raise ValueError(
+                            f"{p}: feature and label length mismatch: "
+                            f"{x_arr.shape[0]} vs {y_arr.shape[0]}"
+                        )
+
+                    # Light sanity check on channel dimension
+                    if x_arr.ndim != 4 or x_arr.shape[1] != 6:
+                        raise ValueError(
+                            f"{p}: expected x shape (N, 6, H, W), got {x_arr.shape}"
+                        )
+
+            except Exception as e:
+                # If something is wrong with this shard, log and skip it
+                print(f"[NPZShardDataset] WARNING: Skipping bad shard {p}: {e}")
+                continue
+
+            # This shard is good – keep it
+            kept_paths.append(p)
+            self.shard_key_pairs.append((x_key, y_key))
             self.shard_sizes.append(n)
             total += n
             self.cumulative_sizes.append(total)
 
-        if total == 0:
-            raise ValueError(f"NPZShardDataset from {self.root_dir} has zero total samples.")
+        # Overwrite with only the good ones
+        self.shard_paths = kept_paths
+
+        if total == 0 or not self.shard_paths:
+            raise ValueError(
+                f"NPZShardDataset from {self.root_dir} has zero usable samples "
+                f"(all shards were invalid or skipped)."
+            )
 
         print(
             f"Initialized NPZShardDataset from {self.root_dir}: "
@@ -95,13 +147,16 @@ class NPZShardDataset(Dataset):
     def __getitem__(self, idx: int):
         shard_idx, local_idx = self._locate(idx)
         shard_path = self.shard_paths[shard_idx]
+        x_key, y_key = self.shard_key_pairs[shard_idx]
 
         try:
-            data = np.load(shard_path)  # allow_pickle=False by default in recent NumPy
-            x = data["x"][local_idx]    # (6, H, W)
-            y = data["y"][local_idx]    # scalar
+            data = np.load(shard_path)
+            x = data[x_key][local_idx]    # (6, H, W)
+            y = data[y_key][local_idx]    # scalar
         except Exception as e:
-            raise RuntimeError(f"Failed to load sample idx={idx} from NPZ shard {shard_path}: {e}")
+            raise RuntimeError(
+                f"Failed to load sample idx={idx} from NPZ shard {shard_path}: {e}"
+            )
 
         if x.ndim != 3 or x.shape[0] != 6:
             raise ValueError(
@@ -116,8 +171,6 @@ class NPZShardDataset(Dataset):
             x_tensor = self.transform(x_tensor)
 
         if self.return_paths:
-            # Provide a sample identifier, not just the shard path:
-            # e.g. "shard_0001.npz#123"
             sample_id = f"{os.path.basename(shard_path)}#{local_idx}"
             return x_tensor, y_tensor, sample_id
         else:
