@@ -122,8 +122,8 @@ class NPYShardDataset(Dataset):
         y_arr = self._y_arrays[shard_idx]
 
         try:
-            x = x_arr[local_idx]    # (6, H, W)
-            y = y_arr[local_idx]    # scalar
+            x = x_arr[local_idx]  # (6, H, W)
+            y = y_arr[local_idx]  # scalar
         except Exception as e:
             raise RuntimeError(
                 f"Failed to access local_idx={local_idx} in shard_idx={shard_idx}: {e}"
@@ -135,7 +135,8 @@ class NPYShardDataset(Dataset):
                 f"expected (6, H, W)."
             )
 
-        x_tensor = torch.from_numpy(x).float()  # per-sample cast to float32
+        # 👇 this copy makes the array writable, removing the warning
+        x_tensor = torch.from_numpy(x.copy()).float()
         y_tensor = torch.tensor(int(y), dtype=torch.long)
 
         if self.transform is not None:
