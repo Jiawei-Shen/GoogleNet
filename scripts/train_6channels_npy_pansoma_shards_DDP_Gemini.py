@@ -31,7 +31,6 @@ IS_MAIN_PROCESS = True
 
 
 # ---------------- Losses & Utils ----------------
-# (Same Loss classes as before, kept brief for readability)
 class CombinedFocalWeightedCELoss(nn.Module):
     def __init__(self, initial_lr, pos_weight=None, gamma=2.0):
         super().__init__()
@@ -41,7 +40,6 @@ class CombinedFocalWeightedCELoss(nn.Module):
         self.initial_lr = initial_lr
 
     def forward(self, logits, targets, current_lr):
-        # Simplified Focal implementation for brevity
         log_pt = F.log_softmax(logits, dim=1).gather(1, targets.view(-1, 1)).squeeze(1)
         pt = torch.exp(log_pt)
         if self.pos_weight is not None: log_pt = log_pt * self.pos_weight.gather(0, targets)
@@ -84,9 +82,7 @@ def _find_all_shards(roots, subfolder="train"):
     files = []
     for r in roots:
         r = os.path.abspath(os.path.expanduser(r))
-        # Check root
         files.extend(glob.glob(os.path.join(r, "*_data.npy")))
-        # Check subfolder
         files.extend(glob.glob(os.path.join(r, subfolder, "*_data.npy")))
     return sorted(list(set(files)))
 
@@ -109,6 +105,10 @@ def train_model(data_path, output_path, num_epochs=70, learning_rate=1e-4, batch
 
     print_and_log(f"Device: {device} | Epochs: {num_epochs} | Strategy: Just-In-Time RAM Loading", log_file)
 
+    # Fix defaults if None (argparse defaults handle this, but just in case)
+    if depths is None: depths = [3, 3, 27, 3]
+    if dims is None: dims = [192, 384, 768, 1536]
+
     # 1. Resolve Data Paths
     if isinstance(data_path, (list, tuple)) and len(data_path) == 2:
         train_roots, val_roots = data_path
@@ -117,15 +117,14 @@ def train_model(data_path, output_path, num_epochs=70, learning_rate=1e-4, batch
     else:
         train_roots = val_roots = [data_path]
 
-    # 2. Find all shard files (Strings only, no loaders yet)
+    # 2. Find all shard files
     train_shard_paths = _find_all_shards(train_roots, "train")
     if not train_shard_paths: raise ValueError("No shards found!")
 
-    # 3. Build Validation Loader (Standard)
+    # 3. Build Validation Loader
     val_loader, genotype_map = get_data_loader(val_roots, "val", batch_size, num_workers, False, return_paths=True)
     num_classes = len(genotype_map)
 
-    # Calculate estimated batches per epoch (assuming 4096 per shard)
     total_samples = len(train_shard_paths) * 4096
     total_batches = total_samples // batch_size
     print_and_log(f"Found {len(train_shard_paths)} shards. Est. batches: {total_batches}", log_file)
@@ -171,7 +170,6 @@ def train_model(data_path, output_path, num_epochs=70, learning_rate=1e-4, batch
         batches_done = 0
         curr_lr = optimizer.param_groups[0]['lr']
 
-        # Shuffle shards deterministically across ranks
         g = torch.Generator()
         g.manual_seed(epoch + 1000)
         perm = torch.randperm(len(train_shard_paths), generator=g).tolist()
@@ -183,10 +181,7 @@ def train_model(data_path, output_path, num_epochs=70, learning_rate=1e-4, batch
             shard_path = train_shard_paths[shard_idx]
 
             try:
-                # A. Load Shard into RAM (Fast IO for training)
                 ds = NpyDataset(root_dir=shard_path, transform=transform, load_to_ram=True)
-
-                # B. Create Loader
                 sampler = DistributedSampler(ds, shuffle=True, drop_last=False) if ddp else None
                 if ddp: sampler.set_epoch(epoch)
 
@@ -195,13 +190,12 @@ def train_model(data_path, output_path, num_epochs=70, learning_rate=1e-4, batch
                                     pin_memory=True, persistent_workers=(num_workers > 0),
                                     prefetch_factor=prefetch_factor if num_workers > 0 else None)
 
-                # C. Train on this shard
                 for images, labels in loader:
                     images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
                     optimizer.zero_grad(set_to_none=True)
 
                     out = model(images)
-                    if isinstance(out, tuple): out = out[0]  # Ignore aux for brevity or handle as before
+                    if isinstance(out, tuple): out = out[0]
 
                     loss = criterion(out, labels, curr_lr) if loss_type == "combined" else criterion(out, labels)
                     loss.backward()
@@ -215,12 +209,8 @@ def train_model(data_path, output_path, num_epochs=70, learning_rate=1e-4, batch
 
                     if IS_MAIN_PROCESS: pbar.update(1)
 
-                # D. CLEANUP: Delete loader and dataset to FREE RAM immediately
                 del loader
                 del ds
-                # Optional: Force GC if memory is tight (usually not needed but safe)
-                # import gc; gc.collect()
-
             except Exception as e:
                 if IS_MAIN_PROCESS: print(f"Skipping shard {os.path.basename(shard_path)}: {e}")
                 continue
@@ -235,7 +225,9 @@ def train_model(data_path, output_path, num_epochs=70, learning_rate=1e-4, batch
 
         tr_loss = running_loss / max(1, batches_done)
         tr_acc = correct / max(1, total) * 100
-        print_and_log(f"Ep {epoch + 1} | Tr Loss {tr_loss:.4f} Acc {tr_acc:.1f}% | Val F1 {f1:.4f}", log_file)
+        print_and_log(
+            f"Ep {epoch + 1} | Tr Loss {tr_loss:.4f} Acc {tr_acc:.1f}% | Val Loss {val_loss:.4f} Acc {val_acc:.1f}% F1 {f1:.4f}",
+            log_file)
 
         if IS_MAIN_PROCESS:
             state = {'epoch': epoch + 1,
@@ -306,6 +298,19 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=70)
 
+    # Missing args added back
+    parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3])
+    parser.add_argument("--dims", type=int, nargs='+', default=[192, 384, 768, 1536])
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--loss_type", default="weighted_ce")
+    parser.add_argument("--pos_weight", type=float, default=88.0)
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--warmup_epochs", type=int, default=3)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--resume", type=str)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--mp_context", type=str, default=None)
+
     args, _ = parser.parse_known_args()
 
     if args.train_data_paths_file:
@@ -319,7 +324,24 @@ if __name__ == "__main__":
         IS_MAIN_PROCESS = (dist.get_rank() == 0)
         if IS_MAIN_PROCESS: print(f"DDP Init: Size={dist.get_world_size()}")
 
-    train_model(data_in, args.output_path, batch_size=args.batch_size, epochs=args.epochs,
-                ddp=args.ddp, local_rank=args.local_rank)
+    train_model(
+        data_in, args.output_path,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        ddp=args.ddp,
+        local_rank=args.local_rank,
+        # Pass explicit args to fix "NoneType" error
+        depths=args.depths,
+        dims=args.dims,
+        learning_rate=args.lr,
+        loss_type=args.loss_type,
+        pos_weight=args.pos_weight,
+        num_workers=args.num_workers,
+        warmup_epochs=args.warmup_epochs,
+        weight_decay=args.weight_decay,
+        resume=args.resume,
+        prefetch_factor=args.prefetch_factor,
+        mp_context=args.mp_context
+    )
 
     if args.ddp: dist.destroy_process_group()
