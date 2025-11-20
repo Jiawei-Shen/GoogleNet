@@ -4,10 +4,10 @@ import json
 import os
 import sys
 from collections import defaultdict
-
 import glob
-import numpy as np
+import math
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -26,7 +26,7 @@ torch.backends.cudnn.benchmark = True
 # local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from mynet import ConvNeXtCBAMClassifier
-from dataset_pansoma_npy_6ch import get_data_loader  # returns (loader, genotype_map)
+from dataset_pansoma_npy_6ch import get_data_loader  # legacy non-sharded loader
 
 # Globals updated in __main__ with DDP
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -121,7 +121,216 @@ def _read_paths_file(file_path):
     return paths
 
 
-# ---- DataLoader helper ----
+# ---------------- Shard helpers (.npy) ----------------
+def _discover_shards(split_root):
+    """
+    Robustly pair shard_*_data.npy and shard_*_labels.npy by base ID.
+    Skips shards that don't have both files, and logs them.
+    """
+    data_paths = sorted(glob.glob(os.path.join(split_root, "shard_*_data.npy")))
+    label_paths = sorted(glob.glob(os.path.join(split_root, "shard_*_labels.npy")))
+
+    data_map = {
+        os.path.basename(p).replace("_data.npy", ""): p
+        for p in data_paths
+    }
+    label_map = {
+        os.path.basename(p).replace("_labels.npy", ""): p
+        for p in label_paths
+    }
+
+    shard_ids = sorted(set(data_map.keys()) | set(label_map.keys()))
+    pairs = []
+    missing_data = []
+    missing_labels = []
+
+    for sid in shard_ids:
+        dp = data_map.get(sid)
+        lp = label_map.get(sid)
+        if dp is None:
+            missing_data.append(sid)
+        elif lp is None:
+            missing_labels.append(sid)
+        else:
+            pairs.append((dp, lp))
+
+    if not pairs:
+        raise ValueError(f"No valid shard pairs found in {split_root}.")
+
+    print(f"[discover_shards] {split_root}: "
+          f"{len(pairs)} valid pairs, {len(missing_data)} missing_data, {len(missing_labels)} missing_labels")
+    if missing_data:
+        print("  Shards missing data:", ", ".join(missing_data))
+    if missing_labels:
+        print("  Shards missing labels:", ", ".join(missing_labels))
+
+    return pairs
+
+
+def _discover_shards_multi(roots, split):
+    """
+    Discover shards across multiple roots for the given split ("train" or "val").
+    Each root is expected to contain <root>/<split>/shard_*_data.npy and shard_*_labels.npy.
+    """
+    all_pairs = []
+    for r in roots:
+        base = os.path.abspath(os.path.expanduser(r))
+        split_root = os.path.join(base, split)
+        if not os.path.isdir(split_root):
+            print(f"[discover_shards_multi] WARNING: {split_root} does not exist or is not a directory; skipping.")
+            continue
+        pairs = _discover_shards(split_root)
+        all_pairs.extend(pairs)
+
+    if not all_pairs:
+        raise ValueError(f"No valid shard pairs found for split='{split}' in any of roots: {roots}")
+
+    return all_pairs
+
+
+def _shard_stats(shards, batch_size):
+    """
+    Compute total samples and total batches across all shards.
+    """
+    total_samples = 0
+    total_batches = 0
+    for _, lp in shards:
+        y = np.load(lp, mmap_mode="r")
+        n = int(y.shape[0])
+        total_samples += n
+        total_batches += (n + batch_size - 1) // batch_size
+    return total_samples, total_batches
+
+
+def _infer_genotype_map_from_shards(train_shards):
+    """
+    Infer num_classes and a simple genotype_map from labels in the first shard.
+    Binary {0,1} -> {"false":0, "true":1}
+    Else -> {"class_0":0, "class_1":1, ...}
+    """
+    _, labels_path = train_shards[0]
+    y = np.load(labels_path, mmap_mode="r")
+    uniq = sorted(int(v) for v in np.unique(y))
+    genotype_map = {}
+    if uniq == [0, 1]:
+        genotype_map["false"] = 0
+        genotype_map["true"] = 1
+    else:
+        for cls_idx in uniq:
+            genotype_map[f"class_{cls_idx}"] = cls_idx
+    return genotype_map
+
+
+def _iter_sharded_batches(
+    shards,
+    batch_size,
+    device,
+    seed=None,
+    shuffle_shards=True,
+    shuffle_within_shard=True,
+):
+    """
+    Single-process / single-GPU shard iterator:
+      - Randomizes shard order each epoch (if shuffle_shards)
+      - Randomizes sample order within each shard (if shuffle_within_shard)
+      - Yields (x, y) mini-batches of size batch_size.
+    """
+    rng = np.random.default_rng(seed)
+    shard_indices = np.arange(len(shards))
+    if shuffle_shards:
+        rng.shuffle(shard_indices)
+
+    for si in shard_indices:
+        data_path, labels_path = shards[si]
+        xs = np.load(data_path, mmap_mode="r")   # (N, C, H, W)
+        ys = np.load(labels_path, mmap_mode="r") # (N,)
+        n = int(ys.shape[0])
+        if n == 0:
+            continue
+
+        idxs = np.arange(n)
+        if shuffle_within_shard:
+            rng.shuffle(idxs)
+
+        for start in range(0, n, batch_size):
+            batch_idx = idxs[start:start + batch_size]
+            batch_x = torch.from_numpy(xs[batch_idx]).float().to(device, non_blocking=True)
+            batch_y = torch.from_numpy(ys[batch_idx]).long().to(device, non_blocking=True)
+            yield batch_x, batch_y
+
+
+def _iter_sharded_batches_ddp(
+    shards,
+    batch_size,
+    device,
+    epoch,
+    rank,
+    world_size,
+    shuffle_shards=True,
+):
+    """
+    DDP-safe shard iterator:
+      - All ranks use the same shuffled shard order per epoch.
+      - For each shard, we make one random permutation of indices (same on all ranks).
+      - That permutation is evenly split across ranks (disjoint subsets).
+      - Each rank only iterates over its subset, batched by batch_size.
+    """
+    rng_shards = np.random.default_rng(epoch)
+    shard_indices = np.arange(len(shards))
+    if shuffle_shards:
+        rng_shards.shuffle(shard_indices)
+
+    for si in shard_indices:
+        data_path, labels_path = shards[si]
+        xs = np.load(data_path, mmap_mode="r")
+        ys = np.load(labels_path, mmap_mode="r")
+        n = int(ys.shape[0])
+        if n == 0:
+            continue
+
+        # same permutation on *all* ranks
+        seed = epoch * 1000003 + si
+        rng = np.random.default_rng(seed)
+        idxs = np.arange(n)
+        rng.shuffle(idxs)
+
+        # split across ranks
+        per_rank = int(math.ceil(n / world_size))
+        start = rank * per_rank
+        end = min(start + per_rank, n)
+        if start >= n:
+            continue
+
+        rank_idxs = idxs[start:end]
+
+        for b_start in range(0, len(rank_idxs), batch_size):
+            b_sel = rank_idxs[b_start:b_start + batch_size]
+            batch_x = torch.from_numpy(xs[b_sel]).float().to(device, non_blocking=True)
+            batch_y = torch.from_numpy(ys[b_sel]).long().to(device, non_blocking=True)
+            yield batch_x, batch_y
+
+
+def _iter_sharded_val_batches(shards, batch_size, device):
+    """
+    Validation iterator: deterministic order, no shuffling, yields (x, y, paths)
+    with dummy paths (empty strings).
+    """
+    for data_path, labels_path in shards:
+        xs = np.load(data_path, mmap_mode="r")
+        ys = np.load(labels_path, mmap_mode="r")
+        n = int(ys.shape[0])
+        if n == 0:
+            continue
+
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            batch_x = torch.from_numpy(xs[start:end]).float().to(device, non_blocking=True)
+            batch_y = torch.from_numpy(ys[start:end]).long().to(device, non_blocking=True)
+            dummy_paths = [""] * batch_y.size(0)
+            yield batch_x, batch_y, dummy_paths
+
+
+# ---- central helper to build loaders with fast knobs (non-sharded) ----
 def _make_loader(dataset,
                  batch_size,
                  shuffle,
@@ -148,9 +357,11 @@ def _make_loader(dataset,
     return DataLoader(**kwargs)
 
 
-# ---- build from many roots via get_data_loader ----
 def _build_loader_from_roots(roots, split, batch_size, num_workers, shuffle,
                              prefetch_factor, mp_ctx, return_paths=False):
+    """
+    Non-sharded Mode B/C helper: multiple roots using get_data_loader and ConcatDataset.
+    """
     datasets = []
     genotype_map = None
     for r in roots:
@@ -194,7 +405,7 @@ def _build_loader_from_roots(roots, split, batch_size, num_workers, shuffle,
 
 def _build_mode_c_loaders(data_paths, batch_size, num_workers, prefetch_factor, mp_ctx):
     """
-    Mode C: multiple roots.
+    Mode C (non-sharded): multiple roots with classic directory layout.
       • Train = union of TRAIN from every root.
       • Val   = union of VAL   from every root (with return_paths=True).
     """
@@ -212,105 +423,6 @@ def _build_mode_c_loaders(data_paths, batch_size, num_workers, prefetch_factor, 
     return train_loader, val_loader, gm_tr
 
 
-# -------------- SHARD HELPERS ----------------
-def _discover_shards(split_root):
-    """
-    Given e.g. /root/train or /root/val, return list of (data_path, labels_path)
-    for shard_XXXXX_data.npy / shard_XXXXX_labels.npy.
-    """
-    data_paths = sorted(glob.glob(os.path.join(split_root, "shard_*_data.npy")))
-    label_paths = sorted(glob.glob(os.path.join(split_root, "shard_*_labels.npy")))
-    if len(data_paths) == 0 or len(data_paths) != len(label_paths):
-        raise ValueError(
-            f"Shard discovery failed in {split_root}: "
-            f"{len(data_paths)} data shards, {len(label_paths)} label shards."
-        )
-    return list(zip(data_paths, label_paths))
-
-
-def _shard_stats(shards, batch_size):
-    """
-    Compute total samples and total batches across all shards.
-    """
-    shard_sizes = []
-    total_samples = 0
-    total_batches = 0
-    for _, lp in shards:
-        y = np.load(lp, mmap_mode="r")
-        n = int(y.shape[0])
-        shard_sizes.append(n)
-        total_samples += n
-        total_batches += (n + batch_size - 1) // batch_size
-    return shard_sizes, total_samples, total_batches
-
-
-def _infer_genotype_map_from_shards(train_shards):
-    """
-    Infer num_classes and a simple genotype_map from labels in the first shard.
-    Names:
-        - If binary {0,1}: "false" -> 0, "true" -> 1
-        - Else: "class_0", "class_1", ...
-    """
-    _, labels_path = train_shards[0]
-    y = np.load(labels_path, mmap_mode="r")
-    uniq = sorted(int(v) for v in np.unique(y))
-    genotype_map = {}
-    if uniq == [0, 1]:
-        genotype_map["false"] = 0
-        genotype_map["true"] = 1
-    else:
-        for cls_idx in uniq:
-            genotype_map[f"class_{cls_idx}"] = cls_idx
-    return genotype_map
-
-
-def _iter_sharded_batches(shards, batch_size, device, seed=None,
-                          shuffle_shards=True, shuffle_within_shard=True):
-    """
-    Generator over (images, labels) that:
-      - Randomizes shard order each epoch (if shuffle_shards)
-      - Within each shard, randomizes row order (if shuffle_within_shard)
-      - Yields mini-batches of size batch_size
-    """
-    rng = np.random.default_rng(seed)
-    shard_indices = np.arange(len(shards))
-    if shuffle_shards:
-        rng.shuffle(shard_indices)
-
-    for si in shard_indices:
-        data_path, labels_path = shards[si]
-        xs = np.load(data_path, mmap_mode="r")   # shape (N, C, H, W)
-        ys = np.load(labels_path, mmap_mode="r") # shape (N,)
-
-        n = int(ys.shape[0])
-        idxs = np.arange(n)
-        if shuffle_within_shard:
-            rng.shuffle(idxs)
-
-        for start in range(0, n, batch_size):
-            batch_idx = idxs[start:start + batch_size]
-            batch_x = torch.from_numpy(xs[batch_idx]).float().to(device, non_blocking=True)
-            batch_y = torch.from_numpy(ys[batch_idx]).long().to(device, non_blocking=True)
-            yield batch_x, batch_y
-
-
-def _iter_sharded_val_batches(shards, batch_size, device):
-    """
-    Validation iterator: deterministic order, no shuffling, yields (images, labels, paths)
-    with dummy paths.
-    """
-    for data_path, labels_path in shards:
-        xs = np.load(data_path, mmap_mode="r")
-        ys = np.load(labels_path, mmap_mode="r")
-        n = int(ys.shape[0])
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            batch_x = torch.from_numpy(xs[start:end]).float().to(device, non_blocking=True)
-            batch_y = torch.from_numpy(ys[start:end]).long().to(device, non_blocking=True)
-            dummy_paths = [""] * batch_y.size(0)
-            yield batch_x, batch_y, dummy_paths
-
-
 # ---------------- Train / Eval ----------------
 def train_model(data_path, output_path, save_val_results=False, num_epochs=100, learning_rate=1e-4,
                 batch_size=32, num_workers=4, loss_type='weighted_ce',
@@ -318,7 +430,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 training_data_ratio=1.0, ddp=False, data_parallel=False, local_rank=0,
                 resume=None, pos_weight=88.0,
                 prefetch_factor=4, mp_context=None):
-
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if os.path.exists(log_file) and IS_MAIN_PROCESS:
@@ -332,8 +443,18 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     print_and_log(f"Using device: {device}", log_file)
     print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
     print_and_log(f"Using CosineAnnealing with {warmup_epochs} warmup epochs.", log_file)
-    print_and_log(f"DataLoader: workers={num_workers}, pin_memory=True, persistent_workers=True, "
-                  f"prefetch_factor={prefetch_factor}, mp_ctx={mp_context}", log_file)
+    print_and_log(
+        f"DataLoader (non-sharded): workers={num_workers}, pin_memory=True, "
+        f"persistent_workers=True, prefetch_factor={prefetch_factor}, mp_ctx={mp_context}", log_file
+    )
+
+    # ---- DDP rank/world size ----
+    if ddp and dist.is_initialized():
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+    else:
+        world_size = 1
+        rank = 0
 
     # ---------------- Detect shard-based mode ----------------
     use_sharded_mode = False
@@ -341,41 +462,44 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     val_shards = None
     num_train_batches = None
 
+    candidate_roots = None
     if isinstance(data_path, str):
-        train_root_candidate = os.path.join(os.path.abspath(os.path.expanduser(data_path)), "train")
-        if os.path.isdir(train_root_candidate) and glob.glob(os.path.join(train_root_candidate, "shard_*_data.npy")):
-            use_sharded_mode = True
+        candidate_roots = [data_path]
+    elif isinstance(data_path, (list, tuple)) and all(isinstance(p, str) for p in data_path):
+        # Mode C multi-root: list of roots, all strings
+        candidate_roots = list(data_path)
 
-    # ---------------- Build loaders or shard lists ----------------
+    if candidate_roots is not None:
+        for r in candidate_roots:
+            train_root_candidate = os.path.join(os.path.abspath(os.path.expanduser(r)), "train")
+            pattern = os.path.join(train_root_candidate, "shard_*_data.npy")
+            if os.path.isdir(train_root_candidate) and glob.glob(pattern):
+                use_sharded_mode = True
+                break
+
+    # ---------------- Build loaders or shard sets ----------------
     if use_sharded_mode:
-        if ddp:
-            print_and_log("ERROR: shard-by-shard training is not implemented with --ddp. "
-                          "Run without --ddp for now.", log_file)
-            return
+        roots = [os.path.abspath(os.path.expanduser(r)) for r in candidate_roots]
 
-        base_root = os.path.abspath(os.path.expanduser(data_path))
-        train_root = os.path.join(base_root, "train")
-        val_root = os.path.join(base_root, "val")
+        train_shards = _discover_shards_multi(roots, split="train")
+        val_shards = _discover_shards_multi(roots, split="val")
 
-        train_shards = _discover_shards(train_root)
-        val_shards = _discover_shards(val_root)
-
-        shard_sizes, total_train_samples, num_train_batches = _shard_stats(train_shards, batch_size)
+        total_train_samples, num_train_batches = _shard_stats(train_shards, batch_size)
         genotype_map = _infer_genotype_map_from_shards(train_shards)
 
-        print_and_log(f"Shard-based training enabled.", log_file)
+        print_and_log(f"Shard-based training enabled (multi-root OK).", log_file)
+        print_and_log(f"  Roots        : {len(roots)}", log_file)
         print_and_log(f"  Train shards : {len(train_shards)} (total samples={total_train_samples})", log_file)
         print_and_log(f"  Val shards   : {len(val_shards)}", log_file)
-        print_and_log(f"  Total train batches per epoch (approx): {num_train_batches}", log_file)
+        print_and_log(f"  Approx train batches/epoch: {num_train_batches}", log_file)
 
         if training_data_ratio != 1.0:
-            print_and_log(f"WARNING: training_data_ratio != 1.0 is not supported in shard mode; "
-                          f"ignoring and using full data.", log_file)
+            print_and_log(f"WARNING: training_data_ratio != 1.0 ignored in shard mode (using full data).", log_file)
 
         train_loader = None
         val_loader = None
     else:
-        # ---- Original code path (non-sharded, using get_data_loader) ----
+        # ---- Original non-sharded logic (Modes A/B/C with NpyDataset) ----
         if isinstance(data_path, str):
             # Mode A: single root
             ld_tr, genotype_map = get_data_loader(
@@ -386,12 +510,16 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 data_dir=data_path, dataset_type="val", batch_size=batch_size,
                 num_workers=num_workers, shuffle=False, return_paths=True
             )
-            train_loader = _make_loader(ld_tr.dataset, batch_size, True, num_workers,
-                                        prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
-                                        pin_memory=True, persistent_workers=True)
-            val_loader = _make_loader(ld_va.dataset, batch_size, False, num_workers,
-                                      prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
-                                      pin_memory=True, persistent_workers=True)
+            train_loader = _make_loader(
+                ld_tr.dataset, batch_size, True, num_workers,
+                prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
+                pin_memory=True, persistent_workers=True
+            )
+            val_loader = _make_loader(
+                ld_va.dataset, batch_size, False, num_workers,
+                prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
+                pin_memory=True, persistent_workers=True
+            )
         elif isinstance(data_path, tuple) and len(data_path) == 2:
             # Mode B: explicit (train_roots, val_roots)
             train_roots, val_roots = data_path
@@ -406,16 +534,16 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
             if gm_val != genotype_map:
                 raise ValueError("Inconsistent genotype_map between train_roots and val_roots.")
         elif isinstance(data_path, (list, tuple)):
-            # Mode C: multiple roots
+            # Mode C: multiple roots, classic layout
             train_loader, val_loader, genotype_map = _build_mode_c_loaders(
                 data_path, batch_size=batch_size, num_workers=num_workers,
                 prefetch_factor=prefetch_factor, mp_ctx=mp_context
             )
-            print_and_log("Mode C: Train=union(train), Val=union(val) across all roots.", log_file)
+            print_and_log("Mode C (non-sharded): Train=union(train), Val=union(val) across all roots.", log_file)
         else:
             raise ValueError("Unsupported data_path type.")
 
-        # ---- Optional subsample (DDP-safe, no collectives) ----
+        # Optional subsample (DDP-safe, no collectives)
         if training_data_ratio < 1.0:
             full_ds = train_loader.dataset
             n = len(full_ds)
@@ -431,12 +559,13 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
                 pin_memory=True, persistent_workers=True
             )
-            print_and_log(f"Training subset: using {len(subset)}/{n} samples (~{training_data_ratio:.2f} of data).",
-                          log_file)
+            print_and_log(
+                f"Training subset: using {len(subset)}/{n} samples (~{training_data_ratio:.2f} of data).", log_file
+            )
 
     # ---- Model / parallelism ----
     if not genotype_map:
-        print_and_log("Error: genotype_map is empty. Check dataloader / shard labels.", log_file)
+        print_and_log("Error: genotype_map is empty. Check dataloader or shard labels.", log_file)
         return
     num_classes = len(genotype_map)
     print_and_log(f"Number of classes: {num_classes}", log_file)
@@ -451,24 +580,28 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         else:
             print_and_log("DataParallel requested but single GPU detected; running single-GPU.", log_file)
 
-    if ddp and (not use_sharded_mode):
+    train_sampler = None
+    if ddp:
         print_and_log(f"Wrapping model in DistributedDataParallel on cuda:{local_rank}.", log_file)
         model = DistributedDataParallel(
             model, device_ids=[local_rank], output_device=local_rank,
             gradient_as_bucket_view=True, broadcast_buffers=False,
         )
-        train_dataset = train_loader.dataset
-        val_dataset = val_loader.dataset
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
-        train_loader = _make_loader(train_dataset, batch_size, True, num_workers,
-                                    prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
-                                    pin_memory=True, persistent_workers=True, sampler=train_sampler)
-        val_loader = _make_loader(val_dataset, batch_size, False, num_workers,
-                                  prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
-                                  pin_memory=True, persistent_workers=True, sampler=val_sampler)
-    else:
-        train_sampler = None
+        if (not use_sharded_mode) and (train_loader is not None) and (val_loader is not None):
+            train_dataset = train_loader.dataset
+            val_dataset = val_loader.dataset
+            train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
+            val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
+            train_loader = _make_loader(
+                train_dataset, batch_size, True, num_workers,
+                prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
+                pin_memory=True, persistent_workers=True, sampler=train_sampler
+            )
+            val_loader = _make_loader(
+                val_dataset, batch_size, False, num_workers,
+                prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
+                pin_memory=True, persistent_workers=True, sampler=val_sampler
+            )
 
     model.apply(init_weights)
 
@@ -521,9 +654,9 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         except Exception as e:
             print_and_log(f"WARNING: Failed to load checkpoint '{resume}': {e}", log_file)
 
-    # ---- Train loop ----
     sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
 
+    # ---------------- Train loop ----------------
     for epoch in range(start_epoch, num_epochs):
         model.train()
         if ddp and train_sampler is not None and (not use_sharded_mode):
@@ -532,23 +665,34 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         running_loss = 0.0
         correct_train = 0
         total_train = 0
+        batch_count = 0
 
         current_lr = optimizer.param_groups[0]['lr']
 
-        # Choose training iterator depending on mode
+        # Choose training iterator depending on mode + DDP
         if use_sharded_mode:
-            train_iter = _iter_sharded_batches(
-                train_shards,
-                batch_size=batch_size,
-                device=device,
-                seed=epoch,  # epoch-based seed => different shard & intra-shard order each epoch
-                shuffle_shards=True,
-                shuffle_within_shard=True,
-            )
-            total_batches = num_train_batches
+            if ddp and world_size > 1:
+                train_iter = _iter_sharded_batches_ddp(
+                    train_shards,
+                    batch_size=batch_size,
+                    device=device,
+                    epoch=epoch,
+                    rank=rank,
+                    world_size=world_size,
+                    shuffle_shards=True,
+                )
+            else:
+                train_iter = _iter_sharded_batches(
+                    train_shards,
+                    batch_size=batch_size,
+                    device=device,
+                    seed=epoch,
+                    shuffle_shards=True,
+                    shuffle_within_shard=True,
+                )
+
             progress_bar = tqdm(
                 train_iter,
-                total=total_batches,
                 desc=f"Epoch {epoch + 1}/{num_epochs} LR: {current_lr:.1e}",
                 leave=True,
                 disable=not IS_MAIN_PROCESS,
@@ -562,7 +706,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 disable=not IS_MAIN_PROCESS,
             )
 
-        batch_count = 0
         for images, labels in progress_bar:
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
@@ -602,15 +745,13 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
             if IS_MAIN_PROCESS and total_train > 0 and batch_count > 0:
                 avg_loss_train = running_loss / batch_count
-                avg_acc_train = (correct_train / total_train) * 100
+                avg_acc_train = (correct_train / total_train) * 100.0
                 progress_bar.set_postfix(loss=f"{avg_loss_train:.4f}", acc=f"{avg_acc_train:.2f}%")
 
-        epoch_train_loss = (running_loss / batch_count) if batch_count > 0 else 0.0
+        epoch_train_loss = (running_loss / max(1, batch_count))
         epoch_train_acc = (correct_train / max(1, total_train)) * 100.0
 
-        world_size = dist.get_world_size() if ddp and dist.is_initialized() else 1
-
-        # Build val iterable depending on mode
+        # Build validation iterator
         if use_sharded_mode:
             val_iter_for_eval = _iter_sharded_val_batches(
                 val_shards, batch_size=batch_size, device=device
@@ -620,7 +761,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
         val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = evaluate_model(
             model, val_iter_for_eval, criterion, genotype_map, log_file, loss_type, current_lr,
-            ddp=ddp and (not use_sharded_mode), world_size=world_size
+            ddp=ddp, world_size=world_size
         )
 
         if IS_MAIN_PROCESS and class_stats_val:
@@ -691,7 +832,8 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
 
             if save_val_results:
                 result_path = _unique_path(os.path.join(
-                    output_path, f"validation_results_e{best_epoch:03d}_f1_{best_f1_true:.4f}.json"))
+                    output_path, f"validation_results_e{best_epoch:03d}_f1_{best_f1_true:.4f}.json"
+                ))
                 try:
                     with open(result_path, 'w') as f:
                         json.dump({
@@ -718,7 +860,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
     print_and_log(final_msg, log_file)
 
 
-def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_type, current_lr,
+def evaluate_model(model, data_iter, criterion, genotype_map, log_file, loss_type, current_lr,
                    ddp=False, world_size=1):
     model.eval()
     batch_count_eval = 0
@@ -738,12 +880,13 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
     inference_results = defaultdict(list)
     idx_to_class = {v: k for k, v in genotype_map.items()} if genotype_map else {}
 
-    if not data_loader:
+    # allow any iterable / generator
+    if data_iter is None:
         metrics = {'precision_true': 0.0, 'recall_true': 0.0, 'f1_true': 0.0, 'pos_class_idx': None}
         return 0.0, 0.0, {}, {}, metrics
 
     with torch.no_grad():
-        for batch in data_loader:
+        for batch in data_iter:
             if len(batch) == 3:
                 images, labels, paths = batch
             else:
@@ -833,42 +976,19 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
 
 
 # ---------------- Main ----------------
-def _resolve_data_roots(primary_path, extra_paths, paths_file):
-    candidates = []
-    if primary_path:
-        candidates.append(os.path.abspath(os.path.expanduser(primary_path)))
-    if extra_paths:
-        for p in extra_paths:
-            candidates.append(os.path.abspath(os.path.expanduser(p)))
-    if paths_file:
-        candidates.extend(_read_paths_file(paths_file))
-    seen = set()
-    deduped = []
-    for p in candidates:
-        if p not in seen:
-            seen.add(p)
-            deduped.append(p)
-    if len(deduped) == 0:
-        return primary_path
-    if len(deduped) == 1:
-        return deduped[0]
-    return deduped
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a Classifier on 6-channel custom .npy dataset")
+    parser = argparse.ArgumentParser(description="Train a Classifier on 6-channel custom .npy dataset (sharded or classic)")
 
     # Input modes
     parser.add_argument("data_path", nargs="?", type=str,
-                        help="Dataset root containing 'train/' and 'val/'. "
-                             "If 'train/' has shard_*_data.npy, shard-based mode is used.")
+                        help="Dataset root containing 'train/' and 'val/' (Mode A, classic or sharded).")
     parser.add_argument("--data_paths", type=str, nargs='+', default=None,
                         help="MULTI roots (each contains 'train/' and 'val/'). "
-                             "Mode C: Train=union(train), Val=union(val).")
+                             "Mode C: Train=union(train), Val=union(val) or shard mode.")
     parser.add_argument("--train_data_paths_file", type=str, default=None,
-                        help="Text file listing TRAIN dataset roots (one per line). (Mode B)")
+                        help="Text file listing TRAIN dataset roots (one per line). (Mode B, classic only)")
     parser.add_argument("--val_data_paths_file", type=str, default=None,
-                        help="Text file listing VAL dataset roots (one per line). (Mode B)")
+                        help="Text file listing VAL dataset roots (one per line). (Mode B, classic only)")
 
     # Model / train
     parser.add_argument("-o", "--output_path", default="./saved_models_6channel", type=str, help="Path to save model")
@@ -881,24 +1001,21 @@ if __name__ == "__main__":
     # Loader knobs
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--prefetch_factor", type=int, default=4)
-    parser.add_argument("--mp_context", type=str, default=None,
-                        choices=[None, "fork", "forkserver", "spawn"])
+    parser.add_argument("--mp_context", type=str, default=None, choices=[None, "fork", "forkserver", "spawn"])
 
     # Optimizer / scheduler
     parser.add_argument("--warmup_epochs", type=int, default=3)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--save_val_results", action='store_true')
-    parser.add_argument("--loss_type", type=str, default="weighted_ce",
-                        choices=["combined", "weighted_ce"])
+    parser.add_argument("--loss_type", type=str, default="weighted_ce", choices=["combined", "weighted_ce"])
 
-    # Subsample
+    # Subsample (non-sharded only)
     parser.add_argument("--training_data_ratio", type=float, default=1.0)
 
     # Parallel
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--data_parallel", action="store_true")
-    parser.add_argument("--local_rank", type=int, default=None,
-                        help="(Ignored) Torch launcher may pass this.")
+    parser.add_argument("--local_rank", type=int, default=None, help="(Ignored) Torch launcher may pass this.")
 
     # Resume / weights
     parser.add_argument("--resume", type=str, default=None)
@@ -945,8 +1062,7 @@ if __name__ == "__main__":
         dist.init_process_group(backend="nccl", init_method="env://")
         IS_MAIN_PROCESS = (dist.get_rank() == 0)
         if IS_MAIN_PROCESS:
-            print(f"[DDP] World size={dist.get_world_size()} | "
-                  f"Local rank={local_rank} | Global rank={dist.get_rank()}")
+            print(f"[DDP] World size={dist.get_world_size()} | Local rank={local_rank} | Global rank={dist.get_rank()}")
     else:
         local_rank = 0
         IS_MAIN_PROCESS = True

@@ -25,7 +25,7 @@ torch.backends.cudnn.benchmark = True
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 try:
     from mynet import ConvNeXtCBAMClassifier
-    from dataset_pansoma_npy_sharded_6ch_DDP import get_data_loader  # returns (loader, genotype_map)
+    from dataset_pansoma_npy_sharded_6ch_DDP_Gemini import get_data_loader  # returns (loader, genotype_map)
 except ImportError:
     # Fallback for standalone testing if local files missing
     print("Warning: Local imports failed. Ensure 'mynet' and 'dataset_pansoma_npy_6ch' are in path.")
