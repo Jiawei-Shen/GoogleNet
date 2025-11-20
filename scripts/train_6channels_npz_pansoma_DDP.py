@@ -24,8 +24,12 @@ torch.backends.cudnn.benchmark = True
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from mynet import ConvNeXtCBAMClassifier
 
-# *** CHANGED: use NPY-sharded dataset loader (memmap) ***
-from dataset_pansoma_npy_sharded_6ch import get_data_loader  # returns (loader, genotype_map)
+# Use sharded NPY dataset loader + shard-window sampler
+from dataset_pansoma_npy_sharded_6ch import (
+    get_data_loader,
+    NPYShardDataset,
+    ShardWindowSampler,
+)
 
 # Globals updated in __main__ with DDP
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -217,7 +221,10 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
                 warmup_epochs=10, weight_decay=0.05, depths=None, dims=None,
                 training_data_ratio=1.0, ddp=False, data_parallel=False, local_rank=0,
                 resume=None, pos_weight=88.0,
-                prefetch_factor=4, mp_context=None):
+                prefetch_factor=4, mp_context=None,
+                use_shard_windows=False,
+                false_shards_per_window=50,
+                true_shards_per_window=1):
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_6ch.txt")
     if os.path.exists(log_file) and IS_MAIN_PROCESS:
@@ -237,23 +244,79 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         log_file,
     )
 
+    # If DDP, ignore shard-window sampler (we use DistributedSampler instead)
+    if ddp and use_shard_windows:
+        print_and_log("NOTE: --use_shard_windows is ignored in DDP mode (using DistributedSampler instead).", log_file)
+        use_shard_windows = False
+
     # ---------------- Build loaders ----------------
     if isinstance(data_path, str):
         # Mode A: single root
         ld_tr, genotype_map = get_data_loader(
             data_dir=data_path, dataset_type="train", batch_size=batch_size,
-            num_workers=num_workers, shuffle=False  # get dataset only
+            num_workers=num_workers, shuffle=False  # just to get dataset
         )
         ld_va, _ = get_data_loader(
             data_dir=data_path, dataset_type="val", batch_size=batch_size,
             num_workers=num_workers, shuffle=False, return_paths=True
         )
-        train_loader = _make_loader(ld_tr.dataset, batch_size, True, num_workers,
-                                    prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
-                                    pin_memory=True, persistent_workers=True)
-        val_loader = _make_loader(ld_va.dataset, batch_size, False, num_workers,
-                                  prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
-                                  pin_memory=True, persistent_workers=True)
+
+        base_train_ds = ld_tr.dataset
+        base_val_ds = ld_va.dataset
+
+        train_sampler = None
+
+        if use_shard_windows and (not ddp):
+            # Expect NPYShardDataset in Mode A
+            if isinstance(base_train_ds, NPYShardDataset):
+                train_sampler = ShardWindowSampler(
+                    base_train_ds,
+                    false_shards_per_window=false_shards_per_window,
+                    true_shards_per_window=true_shards_per_window,
+                    shuffle_within_window=True,
+                    seed=1234,
+                )
+                print_and_log(
+                    f"Using ShardWindowSampler: false_shards_per_window={false_shards_per_window}, "
+                    f"true_shards_per_window={true_shards_per_window}", log_file
+                )
+                train_loader = _make_loader(
+                    base_train_ds,
+                    batch_size=batch_size,
+                    shuffle=False,  # sampler controls order
+                    num_workers=num_workers,
+                    prefetch_factor=prefetch_factor,
+                    multiprocessing_context=mp_context,
+                    pin_memory=True,
+                    persistent_workers=True,
+                    sampler=train_sampler,
+                )
+            else:
+                print_and_log(
+                    "WARNING: use_shard_windows=True, but train dataset is not NPYShardDataset; "
+                    "falling back to normal shuffle.",
+                    log_file
+                )
+                train_loader = _make_loader(
+                    base_train_ds, batch_size, True, num_workers,
+                    prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
+                    pin_memory=True, persistent_workers=True
+                )
+        else:
+            # Standard random shuffle
+            train_loader = _make_loader(
+                base_train_ds, batch_size, True, num_workers,
+                prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
+                pin_memory=True, persistent_workers=True
+            )
+
+        # Validation: plain sequential
+        val_loader = _make_loader(
+            base_val_ds, batch_size, False, num_workers,
+            prefetch_factor=prefetch_factor, multiprocessing_context=mp_context,
+            pin_memory=True, persistent_workers=True
+        )
+
     elif isinstance(data_path, tuple) and len(data_path) == 2:
         # Mode B: explicit (train_roots, val_roots)
         train_roots, val_roots = data_path
@@ -283,7 +346,6 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         n = len(full_ds)
         k = max(1, int(round(n * training_data_ratio)))
 
-        # Deterministic subset across all ranks (no broadcast needed)
         gen = torch.Generator()
         gen.manual_seed(123456)
         idx_list = torch.randperm(n, generator=gen)[:k].tolist()
@@ -611,7 +673,6 @@ def evaluate_model(model, data_loader, criterion, genotype_map, log_file, loss_t
 
                 if idx_to_class and paths[i]:
                     predicted_class_name = idx_to_class.get(pred_idx, str(pred_idx))
-                    # paths[i] is something like "shard_0001_x.npy#123" or a full path
                     inference_results[predicted_class_name].append(os.path.basename(str(paths[i])))
 
     if ddp and world_size > 1 and dist.is_initialized():
@@ -716,6 +777,15 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch_factor", type=int, default=4)
     parser.add_argument("--mp_context", type=str, default=None, choices=[None, "fork", "forkserver", "spawn"])
 
+    # Shard-window sampling (Mode A, non-DDP)
+    parser.add_argument("--use_shard_windows", action="store_true",
+                        help="Enable shard-window sampling over all-false and all-true shards (Mode A, non-DDP).")
+    parser.add_argument("--false_shards_per_window", type=int, default=50,
+                        help="Number of all-false shards in each training window.")
+    parser.add_argument("--true_shards_per_window", type=int, default=1,
+                        help="Base number of all-true shards per window; "
+                             "window k uses min((k+1)*this, total_true_shards) tail shards.")
+
     # Optimizer / scheduler
     parser.add_argument("--warmup_epochs", type=int, default=3)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -792,7 +862,10 @@ if __name__ == "__main__":
         ddp=args.ddp, data_parallel=args.data_parallel, local_rank=local_rank,
         resume=args.resume, pos_weight=args.pos_weight,
         prefetch_factor=args.prefetch_factor,
-        mp_context=(None if args.mp_context in (None, "None") else args.mp_context)
+        mp_context=(None if args.mp_context in (None, "None") else args.mp_context),
+        use_shard_windows=args.use_shard_windows,
+        false_shards_per_window=args.false_shards_per_window,
+        true_shards_per_window=args.true_shards_per_window,
     )
 
     if args.ddp and dist.is_initialized():

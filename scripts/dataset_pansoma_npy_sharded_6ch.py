@@ -6,10 +6,11 @@ from typing import List, Tuple, Dict, Union
 import numpy as np
 import torch
 import torchvision.transforms as transforms
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, Sampler
+
 
 # ─────────────────────────────────────────────────────────────
-#  Label map (same as before)
+#  Label map
 # ─────────────────────────────────────────────────────────────
 
 GENOTYPE_MAP: Dict[str, int] = {
@@ -19,22 +20,22 @@ GENOTYPE_MAP: Dict[str, int] = {
 
 
 # ─────────────────────────────────────────────────────────────
-#  Sharded NPY dataset with LRU memmap cache + index_map
+#  Sharded NPY dataset with shard_labels + index_map
 # ─────────────────────────────────────────────────────────────
 
 class NPYShardDataset(Dataset):
     """
     Dataset for sharded .npy files written as:
 
-        shard_x: (N, 6, H, W)   e.g.  shard_00000_x.npy
-        shard_y: (N,)           e.g.  shard_00000_y.npy
+        shard_*_x.npy: (N, 6, H, W)
+        shard_*_y.npy: (N,)
 
     This version:
 
-      • Stores only shard paths + sizes in __init__.
+      • Only stores shard paths + sizes in __init__.
       • Precomputes index_map[global_idx] = (shard_idx, local_idx).
-      • Lazily opens shards with np.load(..., mmap_mode="r") via an LRU cache.
-      • No _locate() / cumulative scan in the hot path.
+      • Lazily opens shards with np.load(..., mmap_mode="r") via a small LRU cache.
+      • Records shard_labels (0 for all-false, 1 for all-true, -1 for mixed/unknown).
     """
 
     def __init__(
@@ -42,7 +43,7 @@ class NPYShardDataset(Dataset):
         root_dir: str,
         transform=None,
         return_paths: bool = False,
-        max_cached_shards: int = 16,
+        max_cached_shards: int = 2,
     ):
         self.root_dir = os.path.abspath(os.path.expanduser(root_dir))
         self.transform = transform
@@ -66,15 +67,17 @@ class NPYShardDataset(Dataset):
         self.x_paths: List[str] = x_paths
         self.y_paths: List[str] = y_paths
         self.shard_sizes: List[int] = []
+        self.shard_labels: List[int] = []  # 0 (all-false), 1 (all-true), -1 (mixed/unknown)
 
         self.C = None
         self.H = None
         self.W = None
 
-        # ── Scan each shard once to get N and shape ──
         total = 0
+        # ── Scan each shard once to get N, shape, and label purity ──
         for x_path, y_path in zip(self.x_paths, self.y_paths):
-            x_arr = np.load(x_path, mmap_mode="r")  # (N, 6, H, W)
+            # x: (N, 6, H, W)
+            x_arr = np.load(x_path, mmap_mode="r")
             if x_arr.ndim != 4 or x_arr.shape[1] != 6:
                 raise ValueError(
                     f"{x_path}: expected x shape (N, 6, H, W), got {x_arr.shape}"
@@ -90,11 +93,21 @@ class NPYShardDataset(Dataset):
                     )
             del x_arr
 
-            y_arr = np.load(y_path, mmap_mode="r")  # (N,)
+            # y: (N,)
+            y_arr = np.load(y_path, mmap_mode="r")
             if y_arr.shape[0] != n:
                 raise ValueError(
                     f"{y_path}: label length mismatch: {y_arr.shape[0]} vs {n}"
                 )
+
+            # Determine shard label purity: all 0, all 1, or mixed
+            uniq = np.unique(y_arr)
+            if uniq.size == 1 and int(uniq[0]) in (0, 1):
+                shard_label = int(uniq[0])  # 0 or 1
+            else:
+                shard_label = -1  # mixed / unexpected
+            self.shard_labels.append(shard_label)
+
             del y_arr
 
             self.shard_sizes.append(n)
@@ -109,8 +122,11 @@ class NPYShardDataset(Dataset):
         # Precompute global index -> (shard_idx, local_idx)
         # ─────────────────────────────────────────────────
         self.index_map = np.empty((total, 2), dtype=np.int32)
+        self.shard_offsets = np.empty(len(self.shard_sizes), dtype=np.int64)
+
         pos = 0
         for shard_idx, n in enumerate(self.shard_sizes):
+            self.shard_offsets[shard_idx] = pos
             self.index_map[pos:pos + n, 0] = shard_idx
             self.index_map[pos:pos + n, 1] = np.arange(n, dtype=np.int32)
             pos += n
@@ -119,13 +135,21 @@ class NPYShardDataset(Dataset):
         from collections import OrderedDict
         self._shard_cache: "OrderedDict[int, Tuple[np.ndarray, np.ndarray]]" = OrderedDict()
 
+        n_false = sum(1 for s in self.shard_labels if s == 0)
+        n_true = sum(1 for s in self.shard_labels if s == 1)
+        n_mixed = sum(1 for s in self.shard_labels if s < 0)
+
         print(
             f"Initialized NPYShardDataset from {self.root_dir}: "
             f"{len(self.x_paths)} shards, {total} samples total. "
             f"shape per sample = (6, {self.H}, {self.W}), "
-            f"max_cached_shards={self.max_cached_shards}"
+            f"max_cached_shards={self.max_cached_shards}. "
+            f"Shard label summary: false={n_false}, true={n_true}, mixed/unknown={n_mixed}"
         )
 
+    # ─────────────────────────────────────────────────
+    # Basic Dataset API
+    # ─────────────────────────────────────────────────
     def __len__(self) -> int:
         return self.index_map.shape[0]
 
@@ -178,7 +202,137 @@ class NPYShardDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────
-#  get_data_loader (same API as your original)
+#  ShardWindowSampler
+# ─────────────────────────────────────────────────────────────
+
+class ShardWindowSampler(Sampler[int]):
+    """
+    Sample indices by *windows of shards* to:
+
+      • Keep only a limited number of shard files “hot” at a time.
+      • Enforce a class-imbalance-aware schedule over shards.
+
+    Assumptions:
+      • NPYShardDataset.shard_labels are:
+          0 = all-false shard
+          1 = all-true shard
+         -1 = mixed/unknown (these are ignored by this sampler).
+      • All shards have equal (or similar) sample counts (e.g. 4096).
+    """
+
+    def __init__(
+        self,
+        dataset: NPYShardDataset,
+        false_shards_per_window: int,
+        true_shards_per_window: int,
+        shuffle_within_window: bool = True,
+        seed: int = 1234,
+    ):
+        if not isinstance(dataset, NPYShardDataset):
+            raise TypeError("ShardWindowSampler requires an NPYShardDataset.")
+
+        self.dataset = dataset
+        self.false_shards_per_window = max(1, int(false_shards_per_window))
+        self.true_shards_per_window = max(1, int(true_shards_per_window))
+        self.shuffle_within_window = shuffle_within_window
+        self.seed = int(seed)
+        self._epoch = 0
+
+        # Split shards by label
+        self.false_shards = [i for i, l in enumerate(dataset.shard_labels) if l == 0]
+        self.true_shards = [i for i, l in enumerate(dataset.shard_labels) if l == 1]
+
+        if len(self.false_shards) == 0 or len(self.true_shards) == 0:
+            raise ValueError(
+                "ShardWindowSampler needs at least one all-false shard and one all-true shard.\n"
+                "Check that shard_labels were correctly inferred."
+            )
+
+        # Precompute windows:
+        #   window k uses:
+        #     • contiguous chunk of false_shards
+        #     • tail of true_shards: last K shards, where K grows with k
+        nF = len(self.false_shards)
+        nT = len(self.true_shards)
+        wF = self.false_shards_per_window
+        wT = self.true_shards_per_window
+
+        self.windows: List[Tuple[List[int], List[int]]] = []
+        num_windows = (nF + wF - 1) // wF  # ceil
+
+        for w in range(num_windows):
+            f_start = w * wF
+            f_end = min(f_start + wF, nF)
+            if f_start >= f_end:
+                break
+            false_window = self.false_shards[f_start:f_end]
+
+            # Expand tail of true shards with window index (like your example)
+            k_true = min((w + 1) * wT, nT)
+            true_window = self.true_shards[-k_true:] if k_true > 0 else []
+
+            self.windows.append((false_window, true_window))
+
+        if not self.windows:
+            raise ValueError("ShardWindowSampler constructed zero windows; check configuration.")
+
+        # Precompute length in samples (may be > len(dataset) due to positive oversampling)
+        self._epoch_length = 0
+        for false_window, true_window in self.windows:
+            for shard_idx in list(false_window) + list(true_window):
+                self._epoch_length += int(self.dataset.shard_sizes[shard_idx])
+
+        # For convenience, keep shard_offsets as Python list
+        self.shard_offsets = self.dataset.shard_offsets.tolist()
+
+        print(
+            f"[ShardWindowSampler] {len(self.windows)} windows | "
+            f"false_shards_per_window={self.false_shards_per_window}, "
+            f"true_shards_per_window={self.true_shards_per_window} | "
+            f"epoch_length={self._epoch_length} samples"
+        )
+
+    def __len__(self) -> int:
+        return self._epoch_length
+
+    def __iter__(self):
+        # Different seed each epoch for reproducible but changing shuffles
+        g = torch.Generator()
+        g.manual_seed(self.seed + self._epoch)
+        self._epoch += 1
+
+        for (false_window, true_window) in self.windows:
+            shard_list = list(false_window) + list(true_window)
+            if not shard_list:
+                continue
+
+            # Collect all global indices for shards in this window
+            all_indices = []
+            for shard_idx in shard_list:
+                offset = self.shard_offsets[shard_idx]
+                n = int(self.dataset.shard_sizes[shard_idx])
+                if n <= 0:
+                    continue
+                shard_indices = torch.arange(offset, offset + n, dtype=torch.long)
+                all_indices.append(shard_indices)
+
+            if not all_indices:
+                continue
+
+            all_indices = torch.cat(all_indices, dim=0)
+
+            # Shuffle within the window
+            if self.shuffle_within_window:
+                perm = torch.randperm(all_indices.numel(), generator=g)
+                all_indices = all_indices[perm]
+
+            # Yield indices for this window
+            for idx in all_indices.tolist():
+                yield int(idx)
+
+
+# ─────────────────────────────────────────────────────────────
+#  get_data_loader (unchanged API)
 # ─────────────────────────────────────────────────────────────
 
 def _to_list(x):
@@ -203,12 +357,12 @@ def get_data_loader(
     Layout per root:
         root/
           train/
-            shard_00000_x.npy
-            shard_00000_y.npy
+            shard_train_000_x.npy
+            shard_train_000_y.npy
             ...
           val/
-            shard_00000_x.npy
-            shard_00000_y.npy
+            shard_val_000_x.npy
+            shard_val_000_y.npy
             ...
 
     Supports:
@@ -220,11 +374,10 @@ def get_data_loader(
     if (
         isinstance(data_dir, (list, tuple))
         and len(data_dir) == 2
-        and isinstance(data_dir[0], (str, list, tuple))
-        and isinstance(data_dir[1], (str, list, tuple))
+        and (isinstance(data_dir[0], (str, list, tuple)) and isinstance(data_dir[1], (str, list, tuple)))
     ):
         roots = _to_list(data_dir[0] if dataset_type == "train" else data_dir[1])
-        subfolders = ["train", "val"]  # matches your original behavior
+        subfolders = ["train", "val"]  # original behavior
     else:
         roots = _to_list(data_dir)
         subfolders = [dataset_type]
@@ -267,7 +420,7 @@ def get_data_loader(
             root_dir=d,
             transform=transform,
             return_paths=return_paths,
-            max_cached_shards=16,
+            max_cached_shards=16,   # adjust if you want more/less hot shards
         )
         datasets.append(ds)
 
@@ -287,10 +440,7 @@ def get_data_loader(
     return loader, GENOTYPE_MAP
 
 
-# ─────────────────────────────────────────────────────────────
-#  Simple smoke test
-# ─────────────────────────────────────────────────────────────
-
+# Simple smoke test
 if __name__ == "__main__":
     data_root = "/path/to/your_6channel_npy_sharded_dataset"  # contains train/ and val/
     batch_size = 16
