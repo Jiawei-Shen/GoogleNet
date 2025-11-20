@@ -105,7 +105,6 @@ def train_model(data_path, output_path, num_epochs=70, learning_rate=1e-4, batch
 
     print_and_log(f"Device: {device} | Epochs: {num_epochs} | Strategy: Just-In-Time RAM Loading", log_file)
 
-    # Fix defaults if None (argparse defaults handle this, but just in case)
     if depths is None: depths = [3, 3, 27, 3]
     if dims is None: dims = [192, 384, 768, 1536]
 
@@ -176,7 +175,6 @@ def train_model(data_path, output_path, num_epochs=70, learning_rate=1e-4, batch
 
         pbar = tqdm(total=total_batches, desc=f"Ep {epoch + 1}", disable=not IS_MAIN_PROCESS)
 
-        # --- JUST-IN-TIME SHARD LOADING LOOP ---
         for i, shard_idx in enumerate(perm):
             shard_path = train_shard_paths[shard_idx]
 
@@ -298,7 +296,6 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=70)
 
-    # Missing args added back
     parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3])
     parser.add_argument("--dims", type=int, nargs='+', default=[192, 384, 768, 1536])
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -319,8 +316,12 @@ if __name__ == "__main__":
         data_in = args.data_paths
 
     if args.ddp:
-        torch.cuda.set_device(args.local_rank)
+        # --- CRITICAL FIX FOR DDP ---
+        # Read LOCAL_RANK from Environment Variable provided by torchrun
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl")
+        args.local_rank = local_rank  # Update args so train_model gets the right rank
         IS_MAIN_PROCESS = (dist.get_rank() == 0)
         if IS_MAIN_PROCESS: print(f"DDP Init: Size={dist.get_world_size()}")
 
@@ -330,7 +331,6 @@ if __name__ == "__main__":
         epochs=args.epochs,
         ddp=args.ddp,
         local_rank=args.local_rank,
-        # Pass explicit args to fix "NoneType" error
         depths=args.depths,
         dims=args.dims,
         learning_rate=args.lr,
