@@ -226,9 +226,13 @@ def _iter_sharded_batches(
     shuffle_shards: bool = True,
     shuffle_within_shard: bool = True,
     drop_last: bool = False,
+    training_data_ratio: float = 1.0,
 ):
     """
-    Non-DDP iterator over all shards (for this process).
+    Non-DDP iterator over shards for this process.
+    - Shuffle shard indices.
+    - Keep only training_data_ratio fraction of shards.
+    - Iterate through all batches in each kept shard.
     Uses ShardPrefetcher to overlap 'np.load' of next shard with training on current shard.
     """
     num_shards = len(shards)
@@ -239,6 +243,10 @@ def _iter_sharded_batches(
     if shuffle_shards:
         rng = np.random.default_rng(1234 + epoch)
         rng.shuffle(shard_indices)
+
+    if training_data_ratio < 1.0:
+        num_keep = max(1, int(num_shards * training_data_ratio))
+        shard_indices = shard_indices[:num_keep]
 
     ordered_shards = [shards[i] for i in shard_indices]
     prefetcher = ShardPrefetcher(ordered_shards, max_prefetch=2)
@@ -274,7 +282,7 @@ def _iter_sharded_batches(
                 batch_y = batch_y.to(device, non_blocking=True)
 
                 # --- optional normalization on-GPU ---
-                if True:  # change to True to enable normalization
+                if True:  # change to False to disable normalization
                     mean = torch.tensor(
                         [18.41781616, 12.64912987, -0.54525274,
                          24.72385406, 4.69061136, 0.28135515],
@@ -306,11 +314,13 @@ def _iter_sharded_batches_ddp(
     shuffle_shards: bool = True,
     shuffle_within_shard: bool = True,
     drop_last: bool = False,
+    training_data_ratio: float = 1.0,
 ):
     """
     DDP-aware shard iterator.
     - Global shard order is the same across ranks.
-    - Each rank gets a disjoint subset by striding.
+    - Apply training_data_ratio at the shard level (same subset of shards for all ranks).
+    - Each rank gets a disjoint subset of these shards by striding.
     - ShardPrefetcher preloads shards for that rank.
     """
     num_shards = len(shards)
@@ -321,6 +331,10 @@ def _iter_sharded_batches_ddp(
     if shuffle_shards:
         rng = np.random.default_rng(4321 + epoch)
         rng.shuffle(shard_indices)
+
+    if training_data_ratio < 1.0:
+        num_keep = max(1, int(num_shards * training_data_ratio))
+        shard_indices = shard_indices[:num_keep]
 
     local_indices = shard_indices[rank::world_size]
     if len(local_indices) == 0:
@@ -495,7 +509,7 @@ def train_model_sharded(train_shards,
                         weight_decay=0.05,
                         depths=None,
                         dims=None,
-                        training_data_ratio=1.0,  # currently unused, but kept for CLI compat
+                        training_data_ratio=1.0,
                         ddp=False,
                         world_size=1,
                         rank=0,
@@ -509,6 +523,10 @@ def train_model_sharded(train_shards,
 
     MIN_SAVE_EPOCH = 5
 
+    # ---- Validate training_data_ratio ----
+    if not (0 < training_data_ratio <= 1.0):
+        raise ValueError(f"--training_data_ratio must be in (0,1], got {training_data_ratio}")
+
     if genotype_map is None:
         genotype_map = {"false": 0, "true": 1}
     num_classes = len(genotype_map)
@@ -516,6 +534,7 @@ def train_model_sharded(train_shards,
     print_and_log(f"Using device: {device}", log_file)
     print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
     print_and_log(f"[Sharded NPY mode] #train_shards={len(train_shards)}, #val_shards={len(val_shards)}", log_file)
+
     if train_shards:
         approx_train_samples = sum(int(s["num_samples"]) for s in train_shards)
         approx_batches = approx_train_samples // (batch_size * max(1, world_size))
@@ -524,6 +543,15 @@ def train_model_sharded(train_shards,
             f"({approx_batches:,} global batches @ batch_size={batch_size})",
             log_file
         )
+        if training_data_ratio < 1.0:
+            approx_used_samples = int(approx_train_samples * training_data_ratio)
+            approx_used_batches = approx_used_samples // (batch_size * max(1, world_size))
+            print_and_log(
+                f"  training_data_ratio={training_data_ratio:.3f} -> "
+                f"~{approx_used_samples:,} samples, ~{approx_used_batches:,} global batches per epoch "
+                f"(assuming shards are similar size)",
+                log_file
+            )
 
     print_and_log(f"Number of classes: {num_classes}", log_file)
     print_and_log(f"depths={depths}, dims={dims}. \n", log_file)
@@ -621,6 +649,7 @@ def train_model_sharded(train_shards,
                 shuffle_shards=True,
                 shuffle_within_shard=True,
                 drop_last=False,
+                training_data_ratio=training_data_ratio,
             )
         else:
             train_iter = _iter_sharded_batches(
@@ -630,6 +659,7 @@ def train_model_sharded(train_shards,
                 shuffle_shards=True,
                 shuffle_within_shard=True,
                 drop_last=False,
+                training_data_ratio=training_data_ratio,
             )
 
         progress_bar = tqdm(
@@ -694,6 +724,7 @@ def train_model_sharded(train_shards,
                     shuffle_shards=False,
                     shuffle_within_shard=False,
                     drop_last=False,
+                    training_data_ratio=1.0,  # always use all val shards
                 )
             else:
                 val_iter = _iter_sharded_batches(
@@ -703,6 +734,7 @@ def train_model_sharded(train_shards,
                     shuffle_shards=False,
                     shuffle_within_shard=False,
                     drop_last=False,
+                    training_data_ratio=1.0,  # always use all val shards
                 )
 
             val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = evaluate_model(
@@ -858,7 +890,7 @@ if __name__ == "__main__":
     parser.add_argument("--loss_type", type=str, default="weighted_ce",
                         choices=["combined", "weighted_ce"])
 
-    # Subsample (currently not implemented in shard mode)
+    # Subsample: fraction of training SHARDS per epoch
     parser.add_argument("--training_data_ratio", type=float, default=1.0)
 
     # Parallel
@@ -909,8 +941,8 @@ if __name__ == "__main__":
     if IS_MAIN_PROCESS:
         print(f"[Sharded NPY mode] roots={roots}")
         print(f"  Train shards: {len(train_shards)} | Val shards: {len(val_shards)}")
-        approx_train_samples = sum(int(s["num_samples"]) for s in train_shards)
-        approx_batches = approx_train_samples // (args.batch_size * max(1, world_size))
+        approx_train_samples = sum(int(s["num_samples"]) for s in train_shards) if train_shards else 0
+        approx_batches = (approx_train_samples // (args.batch_size * max(1, world_size))) if approx_train_samples > 0 else 0
         print(
             f"  Approx total train samples: {approx_train_samples:,} "
             f"({approx_batches:,} global batches @ batch_size={args.batch_size})"
