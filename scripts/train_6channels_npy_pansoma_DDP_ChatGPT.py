@@ -536,6 +536,9 @@ def train_model_sharded(train_shards,
     print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
     print_and_log(f"[Sharded NPY mode] #train_shards={len(train_shards)}, #val_shards={len(val_shards)}", log_file)
 
+    # define this so it's visible in the epoch loop
+    approx_used_global_batches = None
+
     if train_shards:
         approx_train_samples = sum(int(s["num_samples"]) for s in train_shards)
         approx_batches = approx_train_samples // (batch_size * max(1, world_size))
@@ -544,15 +547,23 @@ def train_model_sharded(train_shards,
             f"({approx_batches:,} global batches @ batch_size={batch_size})",
             log_file
         )
+
+        # default: if you use 100% of data, used == total
+        approx_used_global_batches = max(1, approx_batches)
+
         if training_data_ratio < 1.0:
             approx_used_samples = int(approx_train_samples * training_data_ratio)
-            approx_used_batches = approx_used_samples // (batch_size * max(1, world_size))
+            approx_used_global_batches = max(
+                1, approx_used_samples // (batch_size * max(1, world_size))
+            )
             print_and_log(
                 f"  training_data_ratio={training_data_ratio:.3f} -> "
-                f"~{approx_used_samples:,} samples, ~{approx_used_batches:,} global batches per epoch "
+                f"~{approx_used_samples:,} samples, ~{approx_used_global_batches:,} global batches per epoch "
                 f"(assuming shards are similar size)",
                 log_file
             )
+    else:
+        approx_used_global_batches = None
 
     print_and_log(f"Number of classes: {num_classes}", log_file)
     print_and_log(f"depths={depths}, dims={dims}. \n", log_file)
