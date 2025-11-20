@@ -26,7 +26,7 @@ torch.backends.cudnn.benchmark = True
 # local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from mynet import ConvNeXtCBAMClassifier
-from dataset_pansoma_npy_6ch import get_data_loader  # legacy non-sharded loader
+from dataset_pansoma_npy_sharded_6ch_DDP_Gemini import get_data_loader  # legacy non-sharded loader
 
 # Globals updated in __main__ with DDP
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
