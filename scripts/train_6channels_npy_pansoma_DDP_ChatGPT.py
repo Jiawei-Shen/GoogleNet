@@ -696,7 +696,7 @@ def train_model(data_path, output_path, save_val_results=False, num_epochs=100, 
         if use_sharded_mode:
             if ddp:
                 train_iter = _iter_sharded_batches_ddp(
-                    train_shards=train_shards,
+                    train_shards,  # <-- positional 'shards' argument
                     batch_size=batch_size,
                     device=device,
                     epoch=epoch,
