@@ -4,24 +4,31 @@ import sys
 import argparse
 import numpy as np
 import random
-from multiprocessing import Pool, cpu_count
-from functools import partial
+import datetime
+from multiprocessing import Pool
+
+
+def log(msg):
+    """Helper to print with timestamp"""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {msg}", flush=True)
 
 
 def list_samples(split_dir):
-    """Scans for .npy files and assigns labels (true=1, false=0)."""
     classes = []
     paths = []
 
     if not os.path.exists(split_dir):
         return [], np.array([])
 
+    # Walk through true/false folders
     for cls in os.listdir(split_dir):
         p = os.path.join(split_dir, cls)
         if not os.path.isdir(p): continue
 
         lab = 1 if cls.lower() == "true" else 0
 
+        # Walk through subdirectories
         for root, _, files in os.walk(p):
             for f in files:
                 if f.endswith(".npy"):
@@ -38,8 +45,8 @@ def infer_shape(first_path):
 
 def write_single_shard(shard_info):
     """
-    Worker function to write one shard.
-    shard_info contains: (shard_id, outdir, split, file_paths, labels, shape, dtype)
+    Worker function.
+    Returns (True/False, shard_id) so the main process knows which one finished.
     """
     shard_id, outdir, split, paths, labels, shape, dtype = shard_info
     n_samples = len(paths)
@@ -47,30 +54,28 @@ def write_single_shard(shard_info):
     X_path = os.path.join(outdir, f"X_{split}_{shard_id:03d}.npy")
     y_path = os.path.join(outdir, f"y_{split}_{shard_id:03d}.npy")
 
-    # Create memmaps
     try:
+        # Create memmaps
         X_mmap = np.memmap(X_path, mode='w+', dtype=dtype, shape=(n_samples, *shape))
         y_mmap = np.memmap(y_path, mode='w+', dtype=np.int64, shape=(n_samples,))
 
         for i, p in enumerate(paths):
             arr = np.load(p)
             if arr.shape != shape:
-                print(f"Error: Shape mismatch at {p}")
-                return False
+                return (False, shard_id, f"Shape mismatch at {p}")
             X_mmap[i] = arr
 
         y_mmap[:] = labels
 
-        # Flush and close
-        X_mmap.flush()
-        y_mmap.flush()
+        X_mmap.flush();
         del X_mmap
+        y_mmap.flush();
         del y_mmap
-        return True
+
+        return (True, shard_id, None)
 
     except Exception as e:
-        print(f"Failed writing shard {shard_id}: {e}")
-        return False
+        return (False, shard_id, str(e))
 
 
 def main():
@@ -80,7 +85,7 @@ def main():
     ap.add_argument("--split", choices=["train", "val"], default=None)
     ap.add_argument("--shard_size", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--threads", type=int, default=4, help="Number of parallel workers")
+    ap.add_argument("--threads", type=int, default=4)
 
     args = ap.parse_args()
 
@@ -93,18 +98,24 @@ def main():
 
     splits = [args.split] if args.split else ["train", "val"]
 
+    log(f"Starting job with {args.threads} threads.")
+    log(f"Root: {root}")
+    log(f"Output: {outdir}")
+
     for split in splits:
         split_dir = os.path.join(root, split)
-        print(f"--- Processing: {split} ---")
+        log(f"--- Processing Split: {split} ---")
 
-        # 1. Gather and Shuffle (Single Threaded for safety)
-        print("Scanning files...")
+        # 1. Scanning
+        log(f"Scanning for files in {split_dir}...")
         paths, labels = list_samples(split_dir)
         if len(paths) == 0:
-            print(f"[skip] No .npy files in {split_dir}")
+            log(f"[skip] No .npy files found in {split_dir}")
             continue
 
-        print("Shuffling...")
+        log(f"Found {len(paths)} samples. Starting shuffle...")
+
+        # 2. Shuffling
         num_samples = len(paths)
         indices = np.arange(num_samples)
         np.random.shuffle(indices)
@@ -112,32 +123,45 @@ def main():
         labels = labels[indices]
 
         shape, dtype = infer_shape(paths[0])
-        print(f"[{split}] N={num_samples}, Shape={shape}, Dtype={dtype}")
+        log(f"Data Shape: {shape}, Dtype: {dtype}")
+        log("Shuffle complete. Preparing tasks...")
 
-        # 2. Prepare Tasks
+        # 3. Preparing Tasks
         tasks = []
         shard_id = 0
         for start in range(0, num_samples, args.shard_size):
             end = min(start + args.shard_size, num_samples)
-
-            # Slice the data for this specific shard
             shard_paths = paths[start:end]
             shard_labels = labels[start:end]
-
             tasks.append((shard_id, outdir, split, shard_paths, shard_labels, shape, dtype))
             shard_id += 1
 
-        # 3. Execute Parallel Writing
-        print(f"Starting {args.threads} workers for {len(tasks)} shards...")
+        total_shards = len(tasks)
+        log(f"Created {total_shards} shard tasks. Launching workers...")
 
-        # Use 'spawn' or 'fork' context if needed, but standard Pool usually works on Linux
+        # 4. Parallel Execution with Monitoring
+        completed_count = 0
+        errors = []
+
+        # imap_unordered yields results as soon as they finish
         with Pool(processes=args.threads) as pool:
-            results = pool.map(write_single_shard, tasks)
+            for success, sid, err_msg in pool.imap_unordered(write_single_shard, tasks):
+                completed_count += 1
 
-        if all(results):
-            print(f"Successfully wrote all {len(results)} shards for {split}.")
+                # Log progress every 5 shards (or whatever frequency you prefer)
+                if completed_count % 5 == 0 or completed_count == total_shards:
+                    log(f"Progress: {completed_count}/{total_shards} shards written ({split}).")
+
+                if not success:
+                    log(f"ERROR: Shard {sid} failed: {err_msg}")
+                    errors.append(sid)
+
+        if len(errors) == 0:
+            log(f"SUCCESS: All {total_shards} shards for '{split}' created successfully.")
         else:
-            print(f"Warning: Some shards failed for {split}.")
+            log(f"WARNING: {len(errors)} shards failed for '{split}'. IDs: {errors}")
+
+    log("Job Complete.")
 
 
 if __name__ == "__main__":
