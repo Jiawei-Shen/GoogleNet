@@ -373,6 +373,21 @@ def _iter_sharded_batches_ddp(
                 batch_x = batch_x.to(device, non_blocking=True)
                 batch_y = batch_y.to(device, non_blocking=True)
 
+                # --- optional normalization on-GPU ---
+                if True:  # change to False to disable normalization
+                    mean = torch.tensor(
+                        [18.41781616, 12.64912987, -0.54525274,
+                         24.72385406, 4.69061136, 0.28135515],
+                        device=device
+                    ).view(1, 6, 1, 1)
+                    std = torch.tensor(
+                        [25.02832222, 14.80963230, 0.61813378,
+                         29.97283554, 7.92317915, 0.76590837],
+                        device=device
+                    ).view(1, 6, 1, 1)
+                    batch_x = (batch_x - mean) / std
+                # --------------------------------------
+
                 yield batch_x, batch_y
                 start = end
 
