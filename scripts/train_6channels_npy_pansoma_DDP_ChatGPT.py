@@ -266,7 +266,8 @@ def _iter_sharded_batches(
                 batch_x_np = x_np[batch_idx]
                 batch_y_np = y_np[batch_idx].astype(np.int64, copy=False)
 
-                batch_x = torch.from_numpy(batch_x_np).pin_memory()
+                # cast to float32 before pinning
+                batch_x = torch.from_numpy(batch_x_np).float().pin_memory()
                 batch_y = torch.from_numpy(batch_y_np).pin_memory()
 
                 batch_x = batch_x.to(device, non_blocking=True)
@@ -336,7 +337,7 @@ def _iter_sharded_batches_ddp(
                 batch_x_np = x_np[batch_idx]
                 batch_y_np = y_np[batch_idx].astype(np.int64, copy=False)
 
-                batch_x = torch.from_numpy(batch_x_np).pin_memory()
+                batch_x = torch.from_numpy(batch_x_np).float().pin_memory()
                 batch_y = torch.from_numpy(batch_y_np).pin_memory()
 
                 batch_x = batch_x.to(device, non_blocking=True)
