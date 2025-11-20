@@ -7,6 +7,7 @@ import gc
 import queue
 import threading
 from collections import defaultdict
+import math
 
 import numpy as np
 import torch
@@ -639,6 +640,7 @@ def train_model_sharded(train_shards,
         else:
             desc = f"Epoch {epoch + 1}/{num_epochs} LR: {current_lr:.1e}"
 
+        # Build iterators (unchanged)
         if ddp and world_size > 1:
             train_iter = _iter_sharded_batches_ddp(
                 shards=train_shards,
@@ -662,9 +664,17 @@ def train_model_sharded(train_shards,
                 training_data_ratio=training_data_ratio,
             )
 
+        # NEW: per-rank total for tqdm
+        if approx_used_global_batches is not None:
+            # each rank roughly gets global_batches / world_size
+            total_local = math.ceil(approx_used_global_batches / max(1, world_size))
+        else:
+            total_local = None
+
         progress_bar = tqdm(
             train_iter,
             desc=desc,
+            total=total_local,  # <--- key line
             leave=True,
             disable=not IS_MAIN_PROCESS
         )
