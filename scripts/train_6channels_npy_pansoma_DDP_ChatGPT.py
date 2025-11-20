@@ -321,6 +321,7 @@ def _iter_sharded_batches_ddp(
     DDP-aware shard iterator.
     - Global shard order is the same across ranks.
     - Apply training_data_ratio at the shard level (same subset of shards for all ranks).
+    - Ensure #kept shards is divisible by world_size.
     - Each rank gets a disjoint subset of these shards by striding.
     - ShardPrefetcher preloads shards for that rank.
     """
@@ -333,9 +334,19 @@ def _iter_sharded_batches_ddp(
         rng = np.random.default_rng(4321 + epoch)
         rng.shuffle(shard_indices)
 
+    # ----- apply training_data_ratio & enforce multiple of world_size -----
     if training_data_ratio < 1.0:
-        num_keep = max(1, int(num_shards * training_data_ratio))
-        shard_indices = shard_indices[:num_keep]
+        num_keep = max(world_size, int(round(num_shards * training_data_ratio)))
+    else:
+        num_keep = num_shards
+
+    # trim so that kept shards count is divisible by world_size
+    num_keep = (num_keep // world_size) * world_size
+    if num_keep == 0:
+        return
+
+    shard_indices = shard_indices[:num_keep]
+    # ----------------------------------------------------------------------
 
     local_indices = shard_indices[rank::world_size]
     if len(local_indices) == 0:
@@ -666,7 +677,7 @@ def train_model_sharded(train_shards,
         else:
             desc = f"Epoch {epoch + 1}/{num_epochs} LR: {current_lr:.1e}"
 
-        # Build iterators (unchanged)
+        # Build iterators
         if ddp and world_size > 1:
             train_iter = _iter_sharded_batches_ddp(
                 shards=train_shards,
@@ -690,22 +701,28 @@ def train_model_sharded(train_shards,
                 training_data_ratio=training_data_ratio,
             )
 
-        # NEW: per-rank total for tqdm
+        # NEW: per-rank total for tqdm and hard cap on steps
         if approx_used_global_batches is not None:
-            # each rank roughly gets global_batches / world_size
-            total_local = math.ceil(approx_used_global_batches / max(1, world_size))
+            steps_per_rank = math.ceil(approx_used_global_batches / max(1, world_size))
+            total_local = steps_per_rank
         else:
+            steps_per_rank = None
             total_local = None
+
+        local_step = 0
 
         progress_bar = tqdm(
             train_iter,
             desc=desc,
-            total=total_local,  # <--- key line
+            total=total_local,
             leave=True,
             disable=not IS_MAIN_PROCESS
         )
 
         for images, labels in progress_bar:
+            if steps_per_rank is not None and local_step >= steps_per_rank:
+                break  # ensure same #steps per rank
+
             optimizer.zero_grad(set_to_none=True)
             outputs = model(images)
 
@@ -733,6 +750,7 @@ def train_model_sharded(train_shards,
             loss.backward()
             optimizer.step()
 
+            local_step += 1
             running_loss += loss.item()
             batch_count += 1
             _, predicted = torch.max(outputs_for_acc, 1)
