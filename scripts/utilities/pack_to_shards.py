@@ -5,7 +5,8 @@ import argparse
 import numpy as np
 import random
 import datetime
-from multiprocessing import Pool
+from multiprocessing import Pool as ProcessPool
+from multiprocessing.pool import ThreadPool
 
 
 def log(msg):
@@ -21,20 +22,15 @@ def list_samples(split_dir):
     if not os.path.exists(split_dir):
         return [], np.array([])
 
-    # Walk through true/false folders
     for cls in os.listdir(split_dir):
         p = os.path.join(split_dir, cls)
         if not os.path.isdir(p): continue
-
         lab = 1 if cls.lower() == "true" else 0
-
-        # Walk through subdirectories
         for root, _, files in os.walk(p):
             for f in files:
                 if f.endswith(".npy"):
                     paths.append(os.path.join(root, f))
                     classes.append(lab)
-
     return paths, np.asarray(classes, dtype=np.int64)
 
 
@@ -46,11 +42,9 @@ def infer_shape(first_path):
 def write_single_shard(shard_info):
     """
     Worker function.
-    Returns (True/False, shard_id) so the main process knows which one finished.
     """
     shard_id, outdir, split, paths, labels, shape, dtype = shard_info
     n_samples = len(paths)
-
     X_path = os.path.join(outdir, f"X_{split}_{shard_id:03d}.npy")
     y_path = os.path.join(outdir, f"y_{split}_{shard_id:03d}.npy")
 
@@ -71,7 +65,6 @@ def write_single_shard(shard_info):
         del X_mmap
         y_mmap.flush();
         del y_mmap
-
         return (True, shard_id, None)
 
     except Exception as e:
@@ -86,6 +79,8 @@ def main():
     ap.add_argument("--shard_size", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--worker_type", choices=["thread", "process"], default="thread",
+                    help="Use 'thread' for shared memory (low RAM) or 'process' for max CPU speed.")
 
     args = ap.parse_args()
 
@@ -96,26 +91,27 @@ def main():
     outdir = os.path.abspath(args.outdir or root)
     os.makedirs(outdir, exist_ok=True)
 
-    splits = [args.split] if args.split else ["train", "val"]
+    # Select the Pool Type
+    if args.worker_type == "thread":
+        PoolClass = ThreadPool
+        log(f"Using MULTI-THREADING (Low RAM mode) with {args.threads} threads.")
+    else:
+        PoolClass = ProcessPool
+        log(f"Using MULTI-PROCESSING (High Speed mode) with {args.threads} processes.")
 
-    log(f"Starting job with {args.threads} threads.")
-    log(f"Root: {root}")
-    log(f"Output: {outdir}")
+    splits = [args.split] if args.split else ["train", "val"]
 
     for split in splits:
         split_dir = os.path.join(root, split)
         log(f"--- Processing Split: {split} ---")
 
-        # 1. Scanning
-        log(f"Scanning for files in {split_dir}...")
+        log(f"Scanning files in {split_dir}...")
         paths, labels = list_samples(split_dir)
         if len(paths) == 0:
-            log(f"[skip] No .npy files found in {split_dir}")
+            log(f"[skip] No .npy files found.")
             continue
 
-        log(f"Found {len(paths)} samples. Starting shuffle...")
-
-        # 2. Shuffling
+        # Shuffle
         num_samples = len(paths)
         indices = np.arange(num_samples)
         np.random.shuffle(indices)
@@ -123,43 +119,35 @@ def main():
         labels = labels[indices]
 
         shape, dtype = infer_shape(paths[0])
-        log(f"Data Shape: {shape}, Dtype: {dtype}")
-        log("Shuffle complete. Preparing tasks...")
+        log(f"Found {num_samples} samples. Shape: {shape}")
 
-        # 3. Preparing Tasks
+        # Prepare Tasks
         tasks = []
         shard_id = 0
         for start in range(0, num_samples, args.shard_size):
             end = min(start + args.shard_size, num_samples)
-            shard_paths = paths[start:end]
-            shard_labels = labels[start:end]
-            tasks.append((shard_id, outdir, split, shard_paths, shard_labels, shape, dtype))
+            tasks.append((shard_id, outdir, split, paths[start:end], labels[start:end], shape, dtype))
             shard_id += 1
 
         total_shards = len(tasks)
-        log(f"Created {total_shards} shard tasks. Launching workers...")
+        log(f"Launching {total_shards} tasks...")
 
-        # 4. Parallel Execution with Monitoring
+        # Execute with the chosen Pool Class
         completed_count = 0
         errors = []
-
-        # imap_unordered yields results as soon as they finish
-        with Pool(processes=args.threads) as pool:
+        with PoolClass(processes=args.threads) as pool:
             for success, sid, err_msg in pool.imap_unordered(write_single_shard, tasks):
                 completed_count += 1
-
-                # Log progress every 5 shards (or whatever frequency you prefer)
                 if completed_count % 5 == 0 or completed_count == total_shards:
-                    log(f"Progress: {completed_count}/{total_shards} shards written ({split}).")
-
+                    log(f"Progress: {completed_count}/{total_shards} shards written.")
                 if not success:
                     log(f"ERROR: Shard {sid} failed: {err_msg}")
                     errors.append(sid)
 
-        if len(errors) == 0:
-            log(f"SUCCESS: All {total_shards} shards for '{split}' created successfully.")
+        if not errors:
+            log(f"SUCCESS: {split} complete.")
         else:
-            log(f"WARNING: {len(errors)} shards failed for '{split}'. IDs: {errors}")
+            log(f"WARNING: Failures in {split}: {errors}")
 
     log("Job Complete.")
 
