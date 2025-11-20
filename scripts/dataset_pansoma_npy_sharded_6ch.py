@@ -1,7 +1,7 @@
+#!/usr/bin/env python3
 import os
 import glob
 from typing import List, Tuple, Dict, Union
-from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -9,7 +9,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
 # ─────────────────────────────────────────────────────────────
-#  Sharded NPY dataset with LRU memmap cache (fixes open-FD blowup)
+#  Label map (same as before)
 # ─────────────────────────────────────────────────────────────
 
 GENOTYPE_MAP: Dict[str, int] = {
@@ -18,18 +18,22 @@ GENOTYPE_MAP: Dict[str, int] = {
 }
 
 
+# ─────────────────────────────────────────────────────────────
+#  Sharded NPY dataset with LRU memmap cache + index_map
+# ─────────────────────────────────────────────────────────────
+
 class NPYShardDataset(Dataset):
     """
     Dataset for sharded .npy files written as:
 
-        shard_x: (N, 6, H, W)   e.g.  shard_train_000_x.npy
-        shard_y: (N,)           e.g.  shard_train_000_y.npy
+        shard_x: (N, 6, H, W)   e.g.  shard_00000_x.npy
+        shard_y: (N,)           e.g.  shard_00000_y.npy
 
     This version:
 
-      • Only stores shard paths + sizes in __init__.
-      • Precomputes an index_map[global_idx] = (shard_idx, local_idx).
-      • Lazily opens shards with np.load(..., mmap_mode="r") via a small LRU cache.
+      • Stores only shard paths + sizes in __init__.
+      • Precomputes index_map[global_idx] = (shard_idx, local_idx).
+      • Lazily opens shards with np.load(..., mmap_mode="r") via an LRU cache.
       • No _locate() / cumulative scan in the hot path.
     """
 
@@ -38,7 +42,7 @@ class NPYShardDataset(Dataset):
         root_dir: str,
         transform=None,
         return_paths: bool = False,
-        max_cached_shards: int = 2,
+        max_cached_shards: int = 16,
     ):
         self.root_dir = os.path.abspath(os.path.expanduser(root_dir))
         self.transform = transform
@@ -67,7 +71,7 @@ class NPYShardDataset(Dataset):
         self.H = None
         self.W = None
 
-        # ── Scan each shard once to get N and shape, then immediately close ──
+        # ── Scan each shard once to get N and shape ──
         total = 0
         for x_path, y_path in zip(self.x_paths, self.y_paths):
             x_arr = np.load(x_path, mmap_mode="r")  # (N, 6, H, W)
@@ -107,7 +111,6 @@ class NPYShardDataset(Dataset):
         self.index_map = np.empty((total, 2), dtype=np.int32)
         pos = 0
         for shard_idx, n in enumerate(self.shard_sizes):
-            # [pos : pos + n) all come from this shard
             self.index_map[pos:pos + n, 0] = shard_idx
             self.index_map[pos:pos + n, 1] = np.arange(n, dtype=np.int32)
             pos += n
@@ -123,9 +126,6 @@ class NPYShardDataset(Dataset):
             f"max_cached_shards={self.max_cached_shards}"
         )
 
-    # ─────────────────────────────────────────────────
-    # Basic Dataset API
-    # ─────────────────────────────────────────────────
     def __len__(self) -> int:
         return self.index_map.shape[0]
 
@@ -177,15 +177,9 @@ class NPYShardDataset(Dataset):
             return x_tensor, y_tensor
 
 
-
 # ─────────────────────────────────────────────────────────────
-#  Genotype map & get_data_loader (unchanged API)
+#  get_data_loader (same API as your original)
 # ─────────────────────────────────────────────────────────────
-
-GENOTYPE_MAP: Dict[str, int] = {
-    "false": 0,
-    "true": 1,
-}
 
 def _to_list(x):
     if x is None:
@@ -193,6 +187,7 @@ def _to_list(x):
     if isinstance(x, (list, tuple)):
         return list(x)
     return [x]
+
 
 def get_data_loader(
     data_dir: Union[str, List[str], Tuple],
@@ -208,12 +203,12 @@ def get_data_loader(
     Layout per root:
         root/
           train/
-            shard_train_000_x.npy
-            shard_train_000_y.npy
+            shard_00000_x.npy
+            shard_00000_y.npy
             ...
           val/
-            shard_val_000_x.npy
-            shard_val_000_y.npy
+            shard_00000_x.npy
+            shard_00000_y.npy
             ...
 
     Supports:
@@ -225,10 +220,11 @@ def get_data_loader(
     if (
         isinstance(data_dir, (list, tuple))
         and len(data_dir) == 2
-        and (isinstance(data_dir[0], (str, list, tuple)) and isinstance(data_dir[1], (str, list, tuple)))
+        and isinstance(data_dir[0], (str, list, tuple))
+        and isinstance(data_dir[1], (str, list, tuple))
     ):
         roots = _to_list(data_dir[0] if dataset_type == "train" else data_dir[1])
-        subfolders = ["train", "val"]  # your original slightly-unusual behavior
+        subfolders = ["train", "val"]  # matches your original behavior
     else:
         roots = _to_list(data_dir)
         subfolders = [dataset_type]
@@ -271,7 +267,7 @@ def get_data_loader(
             root_dir=d,
             transform=transform,
             return_paths=return_paths,
-            max_cached_shards=16,   # <- keep this small to avoid too many open files
+            max_cached_shards=16,
         )
         datasets.append(ds)
 
@@ -291,7 +287,10 @@ def get_data_loader(
     return loader, GENOTYPE_MAP
 
 
-# (Optional) simple main for quick smoke test
+# ─────────────────────────────────────────────────────────────
+#  Simple smoke test
+# ─────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     data_root = "/path/to/your_6channel_npy_sharded_dataset"  # contains train/ and val/
     batch_size = 16
