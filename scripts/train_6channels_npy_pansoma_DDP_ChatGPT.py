@@ -31,6 +31,10 @@ from mynet import ConvNeXtCBAMClassifier  # noqa: E402
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IS_MAIN_PROCESS = True  # rank-0 logging only
 
+# Normalization tensors (created once after device is set)
+NORM_MEAN = None
+NORM_STD = None
+
 
 # ---------------- Losses ----------------
 class MultiClassFocalLoss(nn.Module):
@@ -136,15 +140,10 @@ def _discover_shards_for_root(root):
             lp = dp.replace("_data.npy", "_labels.npy")
             if not os.path.exists(lp):
                 continue
-            # Get num_samples from labels (cheap even with mmap)
             y_tmp = np.load(lp, mmap_mode="r")
             n = int(y_tmp.shape[0])
             del y_tmp
-            shards.append({
-                "x_path": dp,
-                "y_path": lp,
-                "num_samples": n,
-            })
+            shards.append({"x_path": dp, "y_path": lp, "num_samples": n})
         return shards
 
     train_shards = _discover_in_dir(train_dir)
@@ -164,7 +163,6 @@ def _discover_all_shards(roots):
         all_train.extend(tr)
         all_val.extend(va)
 
-    # Simple fixed genotype_map for binary {false, true}
     genotype_map = {"false": 0, "true": 1}
     return all_train, all_val, genotype_map
 
@@ -173,7 +171,6 @@ def _discover_all_shards(roots):
 class ShardPrefetcher:
     """
     Background prefetcher:
-      - Takes a list of shard specs (dicts with 'x_path', 'y_path', 'num_samples').
       - Loads each shard fully into RAM in a background thread.
       - Main thread consumes (local_idx, shard_dict, x_np, y_np).
     """
@@ -193,14 +190,11 @@ class ShardPrefetcher:
                     break
                 x_path = shard["x_path"]
                 y_path = shard["y_path"]
-                # Load entire shard into RAM
                 x_np = np.load(x_path, mmap_mode=None)
                 y_np = np.load(y_path, mmap_mode=None)
                 self._queue.put((local_order_idx, shard, x_np, y_np))
-            # Signal normal end
             self._queue.put(None)
         except Exception as e:
-            # Surface exceptions to consumer
             self._queue.put(e)
 
     def __iter__(self):
@@ -220,6 +214,14 @@ class ShardPrefetcher:
             pass
 
 
+def _maybe_normalize(batch_x, do_norm: bool):
+    global NORM_MEAN, NORM_STD
+    if not do_norm:
+        return batch_x
+    # NORM_MEAN / NORM_STD are created once after device is set
+    return (batch_x - NORM_MEAN) / NORM_STD
+
+
 def _iter_sharded_batches(
     shards,
     batch_size: int,
@@ -228,13 +230,16 @@ def _iter_sharded_batches(
     shuffle_within_shard: bool = True,
     drop_last: bool = False,
     training_data_ratio: float = 1.0,
+    max_steps: int | None = None,         # NEW
+    do_normalize: bool = True,            # NEW
 ):
     """
     Non-DDP iterator over shards for this process.
-    - Shuffle shard indices.
-    - Keep only training_data_ratio fraction of shards.
-    - Iterate through all batches in each kept shard.
     Uses ShardPrefetcher to overlap 'np.load' of next shard with training on current shard.
+
+    NEW:
+      - max_steps: stop yielding after max_steps batches (so generator closes cleanly).
+      - do_normalize: apply on-GPU normalization using cached tensors.
     """
     num_shards = len(shards)
     if num_shards == 0:
@@ -252,10 +257,12 @@ def _iter_sharded_batches(
     ordered_shards = [shards[i] for i in shard_indices]
     prefetcher = ShardPrefetcher(ordered_shards, max_prefetch=2)
 
+    yielded = 0
     try:
         for local_order_idx, shard, x_np, y_np in prefetcher:
             n = int(shard["num_samples"])
             if n <= 0:
+                del x_np, y_np
                 continue
 
             idx = np.arange(n)
@@ -265,6 +272,9 @@ def _iter_sharded_batches(
 
             start = 0
             while start < n:
+                if max_steps is not None and yielded >= max_steps:
+                    return  # IMPORTANT: ends generator -> finally runs -> prefetch stops
+
                 end = start + batch_size
                 if end > n:
                     if drop_last:
@@ -275,29 +285,17 @@ def _iter_sharded_batches(
                 batch_x_np = x_np[batch_idx]
                 batch_y_np = y_np[batch_idx].astype(np.int64, copy=False)
 
-                # cast to float32 before pinning
                 batch_x = torch.from_numpy(batch_x_np).float().pin_memory()
                 batch_y = torch.from_numpy(batch_y_np).pin_memory()
 
                 batch_x = batch_x.to(device, non_blocking=True)
                 batch_y = batch_y.to(device, non_blocking=True)
 
-                # --- optional normalization on-GPU ---
-                if True:  # change to False to disable normalization
-                    mean = torch.tensor(
-                        [18.41781616, 12.64912987, -0.54525274,
-                         24.72385406, 4.69061136, 0.28135515],
-                        device=device
-                    ).view(1, 6, 1, 1)
-                    std = torch.tensor(
-                        [25.02832222, 14.80963230, 0.61813378,
-                         29.97283554, 7.92317915, 0.76590837],
-                        device=device
-                    ).view(1, 6, 1, 1)
-                    batch_x = (batch_x - mean) / std
-                # --------------------------------------
+                batch_x = _maybe_normalize(batch_x, do_normalize)
 
                 yield batch_x, batch_y
+                yielded += 1
+
                 start = end
 
             del x_np, y_np
@@ -316,14 +314,15 @@ def _iter_sharded_batches_ddp(
     shuffle_within_shard: bool = True,
     drop_last: bool = False,
     training_data_ratio: float = 1.0,
+    max_steps: int | None = None,         # NEW
+    do_normalize: bool = True,            # NEW
 ):
     """
     DDP-aware shard iterator.
-    - Global shard order is the same across ranks.
-    - Apply training_data_ratio at the shard level (same subset of shards for all ranks).
-    - Ensure #kept shards is divisible by world_size.
-    - Each rank gets a disjoint subset of these shards by striding.
-    - ShardPrefetcher preloads shards for that rank.
+
+    NEW:
+      - max_steps: stop yielding after max_steps batches (so generator closes cleanly).
+      - do_normalize: apply on-GPU normalization using cached tensors.
     """
     num_shards = len(shards)
     if num_shards == 0:
@@ -334,20 +333,16 @@ def _iter_sharded_batches_ddp(
         rng = np.random.default_rng(4321 + epoch)
         rng.shuffle(shard_indices)
 
-    # ----- apply training_data_ratio & enforce multiple of world_size -----
     if training_data_ratio < 1.0:
         num_keep = max(world_size, int(round(num_shards * training_data_ratio)))
     else:
         num_keep = num_shards
 
-    # trim so that kept shards count is divisible by world_size
     num_keep = (num_keep // world_size) * world_size
     if num_keep == 0:
         return
 
     shard_indices = shard_indices[:num_keep]
-    # ----------------------------------------------------------------------
-
     local_indices = shard_indices[rank::world_size]
     if len(local_indices) == 0:
         return
@@ -355,10 +350,12 @@ def _iter_sharded_batches_ddp(
     local_shards = [shards[i] for i in local_indices]
     prefetcher = ShardPrefetcher(local_shards, max_prefetch=2)
 
+    yielded = 0
     try:
         for local_order_idx, shard, x_np, y_np in prefetcher:
             n = int(shard["num_samples"])
             if n <= 0:
+                del x_np, y_np
                 continue
 
             idx = np.arange(n)
@@ -368,6 +365,9 @@ def _iter_sharded_batches_ddp(
 
             start = 0
             while start < n:
+                if max_steps is not None and yielded >= max_steps:
+                    return  # IMPORTANT: ends generator -> finally runs -> prefetch stops
+
                 end = start + batch_size
                 if end > n:
                     if drop_last:
@@ -384,22 +384,11 @@ def _iter_sharded_batches_ddp(
                 batch_x = batch_x.to(device, non_blocking=True)
                 batch_y = batch_y.to(device, non_blocking=True)
 
-                # --- optional normalization on-GPU ---
-                if True:  # change to False to disable normalization
-                    mean = torch.tensor(
-                        [18.41781616, 12.64912987, -0.54525274,
-                         24.72385406, 4.69061136, 0.28135515],
-                        device=device
-                    ).view(1, 6, 1, 1)
-                    std = torch.tensor(
-                        [25.02832222, 14.80963230, 0.61813378,
-                         29.97283554, 7.92317915, 0.76590837],
-                        device=device
-                    ).view(1, 6, 1, 1)
-                    batch_x = (batch_x - mean) / std
-                # --------------------------------------
+                batch_x = _maybe_normalize(batch_x, do_normalize)
 
                 yield batch_x, batch_y
+                yielded += 1
+
                 start = end
 
             del x_np, y_np
@@ -432,7 +421,7 @@ def evaluate_model(model,
     class_total_counts = torch.zeros(num_classes, device=device, dtype=torch.long)
 
     batch_count_eval = 0
-    inference_results = defaultdict(list)  # kept for compatibility; left empty
+    inference_results = defaultdict(list)
     idx_to_class = {v: k for k, v in genotype_map.items()} if genotype_map else {}
 
     with torch.no_grad():
@@ -469,8 +458,6 @@ def evaluate_model(model,
                         fp[pred_idx] += 1
                     fn[true_idx] += 1
 
-                # No file paths here; we leave inference_results empty.
-
     if ddp and world_size > 1 and dist.is_initialized():
         dist.all_reduce(correct_eval, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_eval, op=dist.ReduceOp.SUM)
@@ -496,7 +483,6 @@ def evaluate_model(model,
                 'acc': acc_c, 'correct': correct_c, 'total': total_c, 'idx': class_idx
             }
 
-    # Choose positive class index
     pos_idx = None
     if genotype_map:
         for name, idx in genotype_map.items():
@@ -550,7 +536,6 @@ def train_model_sharded(train_shards,
 
     MIN_SAVE_EPOCH = 5
 
-    # ---- Validate training_data_ratio ----
     if not (0 < training_data_ratio <= 1.0):
         raise ValueError(f"--training_data_ratio must be in (0,1], got {training_data_ratio}")
 
@@ -562,7 +547,6 @@ def train_model_sharded(train_shards,
     print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
     print_and_log(f"[Sharded NPY mode] #train_shards={len(train_shards)}, #val_shards={len(val_shards)}", log_file)
 
-    # define this so it's visible in the epoch loop
     approx_used_global_batches = None
 
     if train_shards:
@@ -574,7 +558,6 @@ def train_model_sharded(train_shards,
             log_file
         )
 
-        # default: if you use 100% of data, used == total
         approx_used_global_batches = max(1, approx_batches)
 
         if training_data_ratio < 1.0:
@@ -677,7 +660,15 @@ def train_model_sharded(train_shards,
         else:
             desc = f"Epoch {epoch + 1}/{num_epochs} LR: {current_lr:.1e}"
 
-        # Build iterators
+        # NEW: per-rank total for tqdm and step-cap
+        if approx_used_global_batches is not None:
+            steps_per_rank = math.ceil(approx_used_global_batches / max(1, world_size))
+            total_local = steps_per_rank
+        else:
+            steps_per_rank = None
+            total_local = None
+
+        # Build iterators (NEW: pass max_steps so iterator ends cleanly)
         if ddp and world_size > 1:
             train_iter = _iter_sharded_batches_ddp(
                 shards=train_shards,
@@ -689,6 +680,8 @@ def train_model_sharded(train_shards,
                 shuffle_within_shard=True,
                 drop_last=False,
                 training_data_ratio=training_data_ratio,
+                max_steps=steps_per_rank,     # NEW
+                do_normalize=True,            # keep behavior
             )
         else:
             train_iter = _iter_sharded_batches(
@@ -699,17 +692,9 @@ def train_model_sharded(train_shards,
                 shuffle_within_shard=True,
                 drop_last=False,
                 training_data_ratio=training_data_ratio,
+                max_steps=steps_per_rank,     # NEW
+                do_normalize=True,            # keep behavior
             )
-
-        # NEW: per-rank total for tqdm and hard cap on steps
-        if approx_used_global_batches is not None:
-            steps_per_rank = math.ceil(approx_used_global_batches / max(1, world_size))
-            total_local = steps_per_rank
-        else:
-            steps_per_rank = None
-            total_local = None
-
-        local_step = 0
 
         progress_bar = tqdm(
             train_iter,
@@ -719,10 +704,8 @@ def train_model_sharded(train_shards,
             disable=not IS_MAIN_PROCESS
         )
 
+        # NOTE: no manual break needed now; iterator stops itself.
         for images, labels in progress_bar:
-            if steps_per_rank is not None and local_step >= steps_per_rank:
-                break  # ensure same #steps per rank
-
             optimizer.zero_grad(set_to_none=True)
             outputs = model(images)
 
@@ -750,7 +733,6 @@ def train_model_sharded(train_shards,
             loss.backward()
             optimizer.step()
 
-            local_step += 1
             running_loss += loss.item()
             batch_count += 1
             _, predicted = torch.max(outputs_for_acc, 1)
@@ -778,7 +760,9 @@ def train_model_sharded(train_shards,
                     shuffle_shards=False,
                     shuffle_within_shard=False,
                     drop_last=False,
-                    training_data_ratio=1.0,  # always use all val shards
+                    training_data_ratio=1.0,
+                    max_steps=None,        # use all val
+                    do_normalize=True,
                 )
             else:
                 val_iter = _iter_sharded_batches(
@@ -788,7 +772,9 @@ def train_model_sharded(train_shards,
                     shuffle_shards=False,
                     shuffle_within_shard=False,
                     drop_last=False,
-                    training_data_ratio=1.0,  # always use all val shards
+                    training_data_ratio=1.0,
+                    max_steps=None,        # use all val
+                    do_normalize=True,
                 )
 
             val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = evaluate_model(
@@ -915,11 +901,9 @@ if __name__ == "__main__":
         description="Train ConvNeXtCBAM on 6-channel sharded .npy dataset (DDP-friendly, shard prefetching)."
     )
 
-    # Sharded roots
     parser.add_argument("--data_paths", type=str, nargs='+', default=None,
                         help="Sharded NPY roots. Each should contain 'train/' and 'val/' with shard_*_data.npy/labels.npy.")
 
-    # Model / train
     parser.add_argument("-o", "--output_path", default="./saved_models_6channel_sharded", type=str,
                         help="Path to save model")
     parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3])
@@ -928,7 +912,6 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=32)
 
-    # Kept for CLI compat (not really used in shard mode)
     parser.add_argument("--num_workers", type=int, default=0,
                         help="Unused in sharded mode; present for compatibility.")
     parser.add_argument("--prefetch_factor", type=int, default=4,
@@ -937,24 +920,20 @@ if __name__ == "__main__":
                         choices=[None, "fork", "forkserver", "spawn"],
                         help="Unused in sharded mode; present for compatibility.")
 
-    # Optimizer / scheduler
     parser.add_argument("--warmup_epochs", type=int, default=3)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--save_val_results", action='store_true')
     parser.add_argument("--loss_type", type=str, default="weighted_ce",
                         choices=["combined", "weighted_ce"])
 
-    # Subsample: fraction of training SHARDS per epoch
     parser.add_argument("--training_data_ratio", type=float, default=1.0)
 
-    # Parallel
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--data_parallel", action="store_true",
                         help="Ignored in shard mode; use --ddp instead.")
     parser.add_argument("--local_rank", type=int, default=None,
                         help="Torch launcher may pass this, but we mostly use LOCAL_RANK env.")
 
-    # Resume / weights
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--pos_weight", type=float, default=88.0)
 
@@ -971,7 +950,6 @@ if __name__ == "__main__":
             raise RuntimeError("DDP requires CUDA available.")
         local_rank_env = os.environ.get("LOCAL_RANK", None)
         if local_rank_env is None:
-            # Fallback to arg if set
             local_rank = 0 if args.local_rank is None else int(args.local_rank)
         else:
             local_rank = int(local_rank_env)
@@ -989,6 +967,16 @@ if __name__ == "__main__":
         world_size = 1
         rank = 0
         IS_MAIN_PROCESS = True
+
+    # Create normalization tensors ONCE (per process, after device is set)
+    NORM_MEAN = torch.tensor(
+        [18.41781616, 12.64912987, -0.54525274, 24.72385406, 4.69061136, 0.28135515],
+        device=device, dtype=torch.float32
+    ).view(1, 6, 1, 1)
+    NORM_STD = torch.tensor(
+        [25.02832222, 14.80963230, 0.61813378, 29.97283554, 7.92317915, 0.76590837],
+        device=device, dtype=torch.float32
+    ).view(1, 6, 1, 1)
 
     # Discover shards
     train_shards, val_shards, genotype_map = _discover_all_shards(roots)
