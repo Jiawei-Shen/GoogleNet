@@ -905,24 +905,23 @@ def run_inference_and_build_vcfs(
     min_true_prob: Optional[float],
     refcall_prob: Optional[float],
     pos_is_1based: bool,
-    want_probs: bool,
-    write_pred_json: Optional[str],
-    write_pred_csv: Optional[str],
-) -> Tuple[List[Tuple[str,int,str,str,str,str,str,str]], List[dict], int, int, int]:
+) -> Tuple[List[Tuple[str,int,str,str,str,str,str,str]], int, int, int]:
     """
     Returns:
-      node_vcf_records_all, pred_records (optional content), total_inferred, kept, missing_meta
+      node_vcf_records_all, total_inferred, kept, missing_meta
     """
     node_records: List[Tuple[str,int,str,str,str,str,str,str]] = []
-    pred_out: List[dict] = []
 
     total_inferred = 0
     kept = 0
     missing_meta = 0
 
-    # For CSV header planning, we need to know if we want probs.
-    # We'll just write after the fact (pred_out might be large).
-    collect_preds = bool(write_pred_json or write_pred_csv)
+    # Determine index of "true" class if present
+    true_idx = None
+    for i, n in enumerate(class_names):
+        if str(n).strip().lower() == "true":
+            true_idx = i
+            break
 
     t0 = time.time()
     with tqdm(total=total_samples, desc="Infer", unit="sample", dynamic_ncols=True, leave=True) as bar:
@@ -934,16 +933,23 @@ def run_inference_and_build_vcfs(
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
 
+                # probs for decision only
                 probs = torch.softmax(outputs, dim=1)
                 top_prob, top_idx = probs.max(dim=1)
-                probs_cpu = probs.detach().cpu().numpy() if want_probs else None
+
+                # prob_true: prefer explicit "true" column if available, else fallback to top_prob
+                if true_idx is not None and true_idx < probs.shape[1]:
+                    prob_true_vec = probs[:, true_idx]
+                else:
+                    prob_true_vec = top_prob  # fallback; not ideal but matches old behavior when no mapping
 
                 bs = images.shape[0]
                 for i in range(bs):
                     total_inferred += 1
 
                     sp = str(shard_paths[i])
-                    # prefer shard_index from dataset, else parse
+
+                    # shard index
                     si_val = shard_index[i]
                     if hasattr(si_val, "item"):
                         si_val = si_val.item()
@@ -954,6 +960,7 @@ def run_inference_and_build_vcfs(
                     except Exception:
                         sidx = None
 
+                    # index within shard
                     try:
                         iws = int(index_in_shard[i])
                     except Exception:
@@ -962,24 +969,13 @@ def run_inference_and_build_vcfs(
                     pred_idx = int(top_idx[i])
                     pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
 
-                    probs_dict = None
-                    if want_probs and probs_cpu is not None:
-                        probs_dict = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
+                    # scalar prob_true
+                    try:
+                        prob_true = float(prob_true_vec[i].item())
+                    except Exception:
+                        prob_true = None
 
-                    prob_true = true_prob_from_probs_or_predprob(probs_dict, float(top_prob[i]))
                     keep, filt = decide_keep_and_filter(pred_name, prob_true, min_true_prob, refcall_prob)
-
-                    # prediction record (optional)
-                    if collect_preds:
-                        recp = {
-                            "shard_path": sp,
-                            "index_in_shard": int(iws) if iws is not None else None,
-                            "pred_class": pred_name,
-                            "pred_prob": float(top_prob[i]),
-                        }
-                        if want_probs and probs_dict is not None:
-                            recp["probs"] = probs_dict
-                        pred_out.append(recp)
 
                     if not keep:
                         continue
@@ -1010,34 +1006,12 @@ def run_inference_and_build_vcfs(
                 elapsed = time.time() - t0
                 speed = total_inferred / max(1e-9, elapsed)
                 eta = (total_samples - bar.n) / max(1e-9, speed)
-                bar.set_postfix_str(f"kept={kept} miss_meta={missing_meta} speed={speed:.1f} samp/s ETA={_format_eta(eta)}")
+                bar.set_postfix_str(
+                    f"kept={kept} miss_meta={missing_meta} speed={speed:.1f} samp/s ETA={_format_eta(eta)}"
+                )
 
-    # Write optional predictions outputs
-    if write_pred_json:
-        with open(write_pred_json, "w") as f:
-            json.dump(pred_out, f, indent=2)
-        print(f"Wrote JSON predictions: {write_pred_json}")
+    return node_records, total_inferred, kept, missing_meta
 
-    if write_pred_csv:
-        any_probs = want_probs and any(("probs" in r) for r in pred_out)
-        header = ["shard_path", "index_in_shard", "pred_class", "pred_prob"]
-        class_cols: List[str] = []
-        if any_probs:
-            class_cols = class_names[:]  # keep model class order
-            header += class_cols
-
-        with open(write_pred_csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(header)
-            for r in pred_out:
-                row = [r.get("shard_path", ""), r.get("index_in_shard", ""), r.get("pred_class", ""), f"{float(r.get('pred_prob', 0.0)):.6f}"]
-                if any_probs:
-                    pd = r.get("probs", {}) if isinstance(r.get("probs"), dict) else {}
-                    row.extend([f"{float(pd.get(c, 0.0)):.6f}" for c in class_cols])
-                w.writerow(row)
-        print(f"Wrote CSV predictions: {write_pred_csv}")
-
-    return node_records, pred_out, total_inferred, kept, missing_meta
 
 
 # ----------------------------- Main ----------------------------------------- #
@@ -1099,9 +1073,9 @@ def main():
                    help="Node starts in --map_json are 1-based (default: true).")
 
     # Optional prediction dumps
-    p.add_argument("--output_json", default=None, help="Optional: write predictions JSON (array).")
-    p.add_argument("--output_csv", default=None, help="Optional: write predictions CSV.")
-    p.add_argument("--no_probs", action="store_true", help="Do not store per-class probs in prediction outputs.")
+    # p.add_argument("--output_json", default=None, help="Optional: write predictions JSON (array).")
+    # p.add_argument("--output_csv", default=None, help="Optional: write predictions CSV.")
+    # p.add_argument("--no_probs", action="store_true", help="Do not store per-class probs in prediction outputs.")
 
     args = p.parse_args()
 
@@ -1227,7 +1201,7 @@ def main():
 
     # Infer + build node records
     t0 = time.time()
-    node_records_all, _preds, total_inferred, kept, miss_meta = run_inference_and_build_vcfs(
+    node_records_all, total_inferred, kept, miss_meta = run_inference_and_build_vcfs(
         model=model,
         dl=dl,
         device=device,
@@ -1237,10 +1211,8 @@ def main():
         min_true_prob=args.min_true_prob,
         refcall_prob=args.refcall_prob,
         pos_is_1based=args.pos_is_1based,
-        want_probs=(not args.no_probs),
-        write_pred_json=args.output_json,
-        write_pred_csv=args.output_csv,
     )
+
     elapsed = time.time() - t0
     print(f"\nFinished inference: total={total_inferred} kept={kept} missing_meta={miss_meta} time={elapsed:.2f}s")
 
