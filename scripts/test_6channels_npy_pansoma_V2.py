@@ -5,6 +5,11 @@ Fast batch inference over a directory of .npy files (recursively), supporting:
 1) SINGLE mode: each .npy is one tensor of shape (6, H, W) or (H, W, 6)
 2) SHARD  mode: each .npy is a shard array of shape (N, 6, H, W) or (N, H, W, 6)
 
+Key fixes for shard mode:
+- Force mmap for shard arrays (prevents loading multi-GB shard per sample).
+- Per-worker LRU cache of opened memmaps (prevents reopening files per sample).
+- Safer DataLoader settings (persistent_workers, prefetch).
+
 Optional:
 - Join predictions with a variant summary NDJSON produced by your data generator
   (expects fields: shard_index, index_within_shard, plus any meta fields).
@@ -15,7 +20,7 @@ import os
 import sys
 import json
 import time
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -61,6 +66,7 @@ def _scan_tree(start_dir: str) -> List[str]:
             continue
     return out
 
+
 def _format_eta(seconds: float) -> str:
     seconds = int(max(0, seconds))
     h, rem = divmod(seconds, 3600)
@@ -71,6 +77,7 @@ def _format_eta(seconds: float) -> str:
         return f"{m:d}m{s:02d}s"
     else:
         return f"{s:d}s"
+
 
 def list_npy_files_parallel(root: str, workers: int) -> List[str]:
     """Parallel file discovery with tqdm bar."""
@@ -110,6 +117,7 @@ def list_npy_files_parallel(root: str, workers: int) -> List[str]:
 
     return sorted(set(files))
 
+
 def read_file_list(txt_path: str) -> List[str]:
     """Read one path per line."""
     with open(txt_path, "rb") as f:
@@ -119,6 +127,7 @@ def read_file_list(txt_path: str) -> List[str]:
     except UnicodeDecodeError:
         return [ln.strip() for ln in lines if ln.strip()]
 
+
 def save_file_list(paths: List[str], txt_path: str) -> None:
     """Write one absolute path per line."""
     txt_path = os.path.abspath(os.path.expanduser(txt_path))
@@ -127,6 +136,7 @@ def save_file_list(paths: List[str], txt_path: str) -> None:
         for p in paths:
             f.write(p + "\n")
     print(f"Saved {len(paths)} paths to {txt_path}")
+
 
 def print_data_info(files: List[str], mmap: bool, k: int) -> None:
     print("\n=== Data Information ===")
@@ -138,6 +148,7 @@ def print_data_info(files: List[str], mmap: bool, k: int) -> None:
         except Exception as e:
             print(f"  [{i+1}] {p} | <error: {e}>")
     print("=" * 26)
+
 
 def detect_input_mode(files: List[str], mmap: bool) -> str:
     """
@@ -154,8 +165,8 @@ def detect_input_mode(files: List[str], mmap: bool) -> str:
                 return "single"
         except Exception:
             continue
-    # fallback
     return "single"
+
 
 def to_chw_float32(x: np.ndarray, channels: int) -> np.ndarray:
     """
@@ -173,12 +184,15 @@ def to_chw_float32(x: np.ndarray, channels: int) -> np.ndarray:
         raise ValueError(f"Unexpected shape {x.shape}; expected channels={channels}")
     return chw.astype(np.float32, copy=False)
 
+
 # ------------------------- Optional meta join ------------------------------- #
 
 def load_summary_ndjson(path: str) -> Dict[Tuple[int, int], Dict[str, Any]]:
     """
     Load NDJSON keyed by (shard_index, index_within_shard).
-    WARNING: This can be large. If it's huge, consider filtering upstream.
+
+    WARNING: This can be large. If it's huge, prefer a streaming join:
+    write predictions per-shard and stream NDJSON in shard order.
     """
     mp: Dict[Tuple[int, int], Dict[str, Any]] = {}
     with open(path, "r") as f:
@@ -201,15 +215,15 @@ def load_summary_ndjson(path: str) -> Dict[Tuple[int, int], Dict[str, Any]]:
             mp[key] = obj
     return mp
 
+
 def parse_shard_index_from_filename(path: str) -> Optional[int]:
     """
     Expect filenames like shard_00012_data.npy.
     Returns 12.
     """
     base = os.path.basename(path)
-    # try common pattern: <prefix>_<5digits>_data.npy
-    # e.g., shard_00007_data.npy
     parts = base.split("_")
+    # shard_00012_data.npy -> ["shard","00012","data.npy"]
     if len(parts) >= 3:
         try:
             return int(parts[1])
@@ -217,54 +231,63 @@ def parse_shard_index_from_filename(path: str) -> Optional[int]:
             return None
     return None
 
+
 # ---------------------------- Dataset ---------------------------------------- #
 
 class NpyShardsDataset(Dataset):
     """
-    A dataset over shards, exposing *samples inside shards*.
+    Dataset over shards, exposing samples inside shards.
 
-    Each item returns:
+    Returns per item:
       - tensor: Float32 CHW (6,H,W)
       - shard_path: str
       - index_in_shard: int
-      - shard_index: Optional[int] (parsed from filename)
+      - shard_index: Optional[int] parsed from filename
+
+    IMPORTANT:
+      - In shard mode, we FORCE mmap to avoid loading multi-GB shard arrays per sample.
+      - Each worker keeps a small LRU cache of opened memmaps.
     """
-    def __init__(self, files: List[str], channels: int, mmap: bool = False, transform=None,
-                 input_mode: str = "shard"):
+    def __init__(
+        self,
+        files: List[str],
+        channels: int,
+        mmap: bool = False,
+        transform=None,
+        input_mode: str = "shard",   # "single" or "shard"
+        cache_size: int = 2,         # per-worker open-shard cache
+    ):
         self.files = files
         self.channels = channels
         self.mmap = mmap
         self.transform = transform
-        self.input_mode = input_mode  # "single" or "shard"
+        self.input_mode = input_mode
+        self.cache_size = max(1, int(cache_size))
 
         if self.channels != 6:
             raise ValueError(f"Expected 6 channels, got {channels}")
 
-        # Build a lightweight index: global_sample_idx -> (file_idx, local_idx)
-        # For "single", each file contributes 1 sample.
-        # For "shard", each file contributes N samples.
+        # Per-process cache (each DataLoader worker has its own dataset copy)
+        self._arr_cache: Dict[str, np.ndarray] = {}
+        self._arr_cache_order: List[str] = []
+
+        # Build an index: global_sample_idx -> (file_idx, local_idx)
+        # Use mmap while indexing so we don't load full arrays just to read shapes.
         self._offsets: List[int] = [0]
         self._counts: List[int] = []
 
         for fp in tqdm(self.files, desc="Index", unit="file", dynamic_ncols=True, leave=False):
             try:
-                arr = np.load(fp, mmap_mode="r" if self.mmap else None)
+                arr = np.load(fp, mmap_mode="r")
             except Exception:
                 self._counts.append(0)
                 self._offsets.append(self._offsets[-1])
                 continue
 
             if self.input_mode == "single":
-                if arr.ndim != 3:
-                    self._counts.append(0)
-                else:
-                    self._counts.append(1)
+                self._counts.append(1 if arr.ndim == 3 else 0)
             else:
-                # shard mode
-                if arr.ndim != 4:
-                    self._counts.append(0)
-                else:
-                    self._counts.append(int(arr.shape[0]))
+                self._counts.append(int(arr.shape[0]) if arr.ndim == 4 else 0)
 
             self._offsets.append(self._offsets[-1] + self._counts[-1])
 
@@ -288,18 +311,43 @@ class NpyShardsDataset(Dataset):
         local_idx = global_idx - self._offsets[file_idx]
         return file_idx, local_idx
 
+    def _get_array(self, path: str) -> np.ndarray:
+        """
+        Return an ndarray for this path.
+
+        In shard mode: ALWAYS mmap (safety).
+        In single mode: honor --mmap.
+        Cache a few open arrays per worker process (LRU).
+        """
+        if path in self._arr_cache:
+            return self._arr_cache[path]
+
+        if self.input_mode == "shard":
+            arr = np.load(path, mmap_mode="r")
+        else:
+            arr = np.load(path, mmap_mode="r" if self.mmap else None)
+
+        self._arr_cache[path] = arr
+        self._arr_cache_order.append(path)
+
+        if len(self._arr_cache_order) > self.cache_size:
+            evict = self._arr_cache_order.pop(0)
+            self._arr_cache.pop(evict, None)
+
+        return arr
+
     def __getitem__(self, idx: int):
         file_idx, local_idx = self._locate(idx)
         shard_path = self.files[file_idx]
         shard_index = parse_shard_index_from_filename(shard_path)
 
-        arr = np.load(shard_path, mmap_mode="r" if self.mmap else None)
+        arr = self._get_array(shard_path)
 
         if self.input_mode == "single":
-            x = arr  # (6,H,W) or (H,W,6)
+            x = arr
             index_in_shard = 0
         else:
-            x = arr[local_idx]  # (6,H,W) or (H,W,6)
+            x = arr[local_idx]
             index_in_shard = int(local_idx)
 
         chw = to_chw_float32(x, self.channels)
@@ -309,6 +357,7 @@ class NpyShardsDataset(Dataset):
             t = self.transform(t)
 
         return t, shard_path, index_in_shard, shard_index
+
 
 # --------------------------- Model Loading ---------------------------------- #
 
@@ -322,19 +371,29 @@ def build_and_load_model(ckpt_path: str, device: torch.device,
     in_channels = int(checkpoint.get("in_channels", 6))
 
     model = ConvNeXtCBAMClassifier(
-        in_channels=in_channels, class_num=len(genotype_map) or 2,
-        depths=depths, dims=dims).to(device)
+        in_channels=in_channels,
+        class_num=len(genotype_map) or 2,
+        depths=depths,
+        dims=dims
+    ).to(device)
 
     state = checkpoint.get("model_state_dict", checkpoint)
     model.load_state_dict(state, strict=True)
     model.eval()
     return model, genotype_map, in_channels
 
+
 # --------------------------- Inference Core --------------------------------- #
 
-def run_inference(model, dl, device, class_names: List[str],
-                  total_samples: int, no_probs: bool = False,
-                  summary_map: Optional[Dict[Tuple[int, int], Dict[str, Any]]] = None):
+def run_inference(
+    model,
+    dl,
+    device,
+    class_names: List[str],
+    total_samples: int,
+    no_probs: bool = False,
+    summary_map: Optional[Dict[Tuple[int, int], Dict[str, Any]]] = None
+):
     results = []
     processed, t0 = 0, time.time()
 
@@ -342,6 +401,7 @@ def run_inference(model, dl, device, class_names: List[str],
         with torch.no_grad():
             for images, shard_paths, index_in_shard, shard_index in dl:
                 images = images.to(device, non_blocking=True)
+
                 outputs = model(images)
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
@@ -358,23 +418,27 @@ def run_inference(model, dl, device, class_names: List[str],
                     pred_idx = int(top_idx[i])
                     pred_name = class_names[pred_idx] if pred_idx < len(class_names) else str(pred_idx)
 
-                    rec = {
+                    rec: Dict[str, Any] = {
                         "shard_path": str(shard_paths[i]),
                         "index_in_shard": int(index_in_shard[i]),
                         "pred_class": pred_name,
                         "pred_prob": float(top_prob[i]),
                     }
 
-                    # Optional join with variant_summary.ndjson (needs shard_index)
-                    si = shard_index[i].item() if hasattr(shard_index[i], "item") else shard_index[i]
-                    if si is not None and summary_map is not None:
-                        try:
-                            key = (int(si), int(index_in_shard[i]))
-                            meta = summary_map.get(key)
-                            if meta:
-                                rec["meta"] = meta
-                        except Exception:
-                            pass
+                    # Optional join with summary map
+                    if summary_map is not None:
+                        si_val = shard_index[i]
+                        # si_val may be a Python int or torch scalar
+                        if hasattr(si_val, "item"):
+                            si_val = si_val.item()
+                        if si_val is not None:
+                            try:
+                                key = (int(si_val), int(index_in_shard[i]))
+                                meta = summary_map.get(key)
+                                if meta:
+                                    rec["meta"] = meta
+                            except Exception:
+                                pass
 
                     if not no_probs and probs_cpu is not None:
                         rec["probs"] = {class_names[j]: float(probs_cpu[i, j]) for j in range(len(class_names))}
@@ -390,6 +454,7 @@ def run_inference(model, dl, device, class_names: List[str],
 
     return results
 
+
 def write_outputs(results, csv_path: str, json_path: str):
     if json_path:
         with open(json_path, "w") as f:
@@ -402,7 +467,7 @@ def write_outputs(results, csv_path: str, json_path: str):
         any_meta = any("meta" in r for r in results)
 
         header = ["shard_path", "index_in_shard", "pred_class", "pred_prob"]
-        class_cols = []
+        class_cols: List[str] = []
         if any_probs:
             all_classes = set()
             for r in results:
@@ -411,12 +476,12 @@ def write_outputs(results, csv_path: str, json_path: str):
             class_cols = sorted(all_classes)
             header += class_cols
 
-        # If meta exists, we’ll flatten a few common fields if present; otherwise keep json only.
-        meta_cols = []
+        meta_cols: List[str] = []
         if any_meta:
-            # pick a small stable subset if present
-            preferred = ["node_id", "variant_key", "v_pos", "v_type", "v_ref", "v_alt",
-                         "alt_allele_frequency", "coverage_at_locus"]
+            preferred = [
+                "node_id", "variant_key", "v_pos", "v_type", "v_ref", "v_alt",
+                "alt_allele_frequency", "coverage_at_locus"
+            ]
             meta_cols = preferred
             header += [f"meta.{k}" for k in meta_cols]
 
@@ -434,10 +499,11 @@ def write_outputs(results, csv_path: str, json_path: str):
 
         print(f"Wrote CSV predictions: {csv_path}")
 
+
 # ----------------------------- Main ----------------------------------------- #
 
 def main():
-    p = argparse.ArgumentParser(description="Infer over .npy files (single or shard).")
+    p = argparse.ArgumentParser(description="Infer over .npy files (single or shard) with shard-safe mmap caching.")
     p.add_argument("--input_dir", required=False, help="Directory to scan for .npy files (recursive).")
     p.add_argument("--file_list", required=False, help="Text file with one .npy path per line (skips scanning).")
     p.add_argument("--save_file_list", required=False, help="Write discovered .npy paths to this text file.")
@@ -452,15 +518,17 @@ def main():
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--no_probs", action="store_true")
-    p.add_argument("--mmap", action="store_true")
+
+    # Still allow mmap flag; shard mode will force mmap regardless (safety).
+    p.add_argument("--mmap", action="store_true", help="Use mmap for single mode; shard mode always uses mmap.")
+    p.add_argument("--cache_size", type=int, default=2, help="Per-worker LRU cache size for opened shard memmaps.")
 
     p.add_argument("--depths", type=int, nargs="+", default=[3, 3, 27, 3])
     p.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536])
     p.add_argument("--sample_info_k", type=int, default=3)
 
-    # NEW:
     p.add_argument("--input_mode", choices=["auto", "single", "shard"], default="auto",
-                   help="auto: detect by first readable file. single: each .npy is one sample. shard: each .npy contains (N,6,H,W).")
+                   help="auto: detect. single: each .npy is one sample. shard: each .npy contains (N,6,H,W).")
     p.add_argument("--summary_ndjson", default=None,
                    help="Optional variant_summary.ndjson to join by (shard_index, index_in_shard). "
                         "Requires shard filename like shard_00012_data.npy.")
@@ -479,6 +547,7 @@ def main():
 
     # Build model
     print(f"Loading Model from {args.ckpt}")
+    print(f"depths={args.depths}, dims={args.dims}.")
     model, genotype_map, in_channels = build_and_load_model(args.ckpt, device, args.depths, args.dims)
     if in_channels != 6:
         raise ValueError(f"Expected 6-channel input, got {in_channels}")
@@ -533,33 +602,55 @@ def main():
         print(f"Loaded {len(summary_map)} summary records keyed by (shard_index, index_in_shard)")
 
     # Dataset & Loader
-    print(f"Building Data Loader...")
+    print("Building Data Loader...")
     from torchvision import transforms
     norm_transform = transforms.Normalize(mean=VAL_MEAN.tolist(), std=VAL_STD.tolist())
 
-    ds = NpyShardsDataset(files, channels=in_channels, mmap=args.mmap, transform=norm_transform,
-                          input_mode=mode)
+    ds = NpyShardsDataset(
+        files,
+        channels=in_channels,
+        mmap=args.mmap,
+        transform=norm_transform,
+        input_mode=mode,
+        cache_size=args.cache_size,
+    )
+
+    # DataLoader knobs that reduce stalls on large memmaps
+    pin_memory = (device.type == "cuda")
+    persistent_workers = (args.num_workers > 0)
+    prefetch_factor = 2 if args.num_workers > 0 else None
 
     dl = DataLoader(
         ds,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=pin_memory,
         shuffle=False,
-        persistent_workers=(args.num_workers > 0),
-        prefetch_factor=2 if args.num_workers > 0 else None,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
 
     # Run
     t0 = time.time()
-    results = run_inference(model, dl, device, class_names, len(ds), args.no_probs, summary_map=summary_map)
+    results = run_inference(
+        model,
+        dl,
+        device,
+        class_names,
+        total_samples=len(ds),
+        no_probs=args.no_probs,
+        summary_map=summary_map,
+    )
     elapsed = time.time() - t0
     print(f"\nFinished {len(ds)} samples in {elapsed:.2f}s ({len(ds)/elapsed:.2f} samp/s)")
 
     # Save
-    write_outputs(results,
-                  csv_path=args.output_csv if args.output_csv else None,
-                  json_path=args.output_json if args.output_json else None)
+    write_outputs(
+        results,
+        csv_path=args.output_csv if args.output_csv else None,
+        json_path=args.output_json if args.output_json else None,
+    )
+
 
 if __name__ == "__main__":
     main()
