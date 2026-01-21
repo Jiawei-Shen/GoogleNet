@@ -230,7 +230,7 @@ def _iter_sharded_batches(
     shuffle_within_shard: bool = True,
     drop_last: bool = False,
     training_data_ratio: float = 1.0,
-    max_steps: int | None = None,         # NEW
+    max_steps: Optional[int] = None,         # NEW
     do_normalize: bool = True,            # NEW
 ):
     """
