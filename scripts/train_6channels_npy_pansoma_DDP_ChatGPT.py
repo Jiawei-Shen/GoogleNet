@@ -171,7 +171,7 @@ def _discover_all_shards(roots):
 class ShardPrefetcher:
     """
     Background prefetcher:
-      - Loads each shard fully into RAM in a background thread.
+      - Loads each shard into memory (mmap) in a background thread.
       - Main thread consumes (local_idx, shard_dict, x_np, y_np).
     """
 
@@ -190,8 +190,9 @@ class ShardPrefetcher:
                     break
                 x_path = shard["x_path"]
                 y_path = shard["y_path"]
-                x_np = np.load(x_path, mmap_mode=None)
-                y_np = np.load(y_path, mmap_mode=None)
+                # IMPORTANT: use mmap to avoid loading full shards into RAM
+                x_np = np.load(x_path, mmap_mode="r")
+                y_np = np.load(y_path, mmap_mode="r")
                 self._queue.put((local_order_idx, shard, x_np, y_np))
             self._queue.put(None)
         except Exception as e:
@@ -255,7 +256,7 @@ def _iter_sharded_batches(
         shard_indices = shard_indices[:num_keep]
 
     ordered_shards = [shards[i] for i in shard_indices]
-    prefetcher = ShardPrefetcher(ordered_shards, max_prefetch=2)
+    prefetcher = ShardPrefetcher(ordered_shards, max_prefetch=1)  # reduced prefetch
 
     yielded = 0
     try:
@@ -348,7 +349,7 @@ def _iter_sharded_batches_ddp(
         return
 
     local_shards = [shards[i] for i in local_indices]
-    prefetcher = ShardPrefetcher(local_shards, max_prefetch=2)
+    prefetcher = ShardPrefetcher(local_shards, max_prefetch=1)  # reduced prefetch
 
     yielded = 0
     try:
@@ -406,7 +407,8 @@ def evaluate_model(model,
                    loss_type,
                    current_lr,
                    ddp=False,
-                   world_size=1):
+                   world_size=1,
+                   collect_infer=False):
     model.eval()
     num_classes = len(genotype_map) if genotype_map else 0
 
@@ -421,7 +423,7 @@ def evaluate_model(model,
     class_total_counts = torch.zeros(num_classes, device=device, dtype=torch.long)
 
     batch_count_eval = 0
-    inference_results = defaultdict(list)
+    inference_results = defaultdict(list) if collect_infer else {}
     idx_to_class = {v: k for k, v in genotype_map.items()} if genotype_map else {}
 
     with torch.no_grad():
@@ -457,6 +459,11 @@ def evaluate_model(model,
                     if pred_idx < num_classes:
                         fp[pred_idx] += 1
                     fn[true_idx] += 1
+
+                if collect_infer and genotype_map:
+                    # Minimal structure placeholder; keep behavior disabled unless requested
+                    # inference_results[idx_to_class[true_idx]].append(...)
+                    pass
 
     if ddp and world_size > 1 and dist.is_initialized():
         dist.all_reduce(correct_eval, op=dist.ReduceOp.SUM)
@@ -696,54 +703,53 @@ def train_model_sharded(train_shards,
                 do_normalize=True,            # keep behavior
             )
 
-        progress_bar = tqdm(
+        # Ensure tqdm closes promptly
+        with tqdm(
             train_iter,
             desc=desc,
             total=total_local,
             leave=True,
             disable=not IS_MAIN_PROCESS
-        )
+        ) as progress_bar:
+            for images, labels in progress_bar:
+                optimizer.zero_grad(set_to_none=True)
+                outputs = model(images)
 
-        # NOTE: no manual break needed now; iterator stops itself.
-        for images, labels in progress_bar:
-            optimizer.zero_grad(set_to_none=True)
-            outputs = model(images)
-
-            if loss_type == "combined":
-                if isinstance(outputs, tuple) and len(outputs) == 3:
-                    main_output, aux1, aux2 = outputs
-                    loss = (criterion(main_output, labels, current_lr)
-                            + 0.3 * criterion(aux1, labels, current_lr)
-                            + 0.3 * criterion(aux2, labels, current_lr))
-                    outputs_for_acc = main_output
+                if loss_type == "combined":
+                    if isinstance(outputs, tuple) and len(outputs) == 3:
+                        main_output, aux1, aux2 = outputs
+                        loss = (criterion(main_output, labels, current_lr)
+                                + 0.3 * criterion(aux1, labels, current_lr)
+                                + 0.3 * criterion(aux2, labels, current_lr))
+                        outputs_for_acc = main_output
+                    else:
+                        loss = criterion(outputs, labels, current_lr)
+                        outputs_for_acc = outputs
                 else:
-                    loss = criterion(outputs, labels, current_lr)
-                    outputs_for_acc = outputs
-            else:
-                if isinstance(outputs, tuple) and len(outputs) == 3:
-                    main_output, aux1, aux2 = outputs
-                    loss = (criterion(main_output, labels)
-                            + 0.3 * criterion(aux1, labels)
-                            + 0.3 * criterion(aux2, labels))
-                    outputs_for_acc = main_output
-                else:
-                    loss = criterion(outputs, labels)
-                    outputs_for_acc = outputs
+                    if isinstance(outputs, tuple) and len(outputs) == 3:
+                        main_output, aux1, aux2 = outputs
+                        loss = (criterion(main_output, labels)
+                                + 0.3 * criterion(aux1, labels)
+                                + 0.3 * criterion(aux2, labels))
+                        outputs_for_acc = main_output
+                    else:
+                        loss = criterion(outputs, labels)
+                        outputs_for_acc = outputs
 
-            loss.backward()
-            optimizer.step()
+                loss.backward()
+                optimizer.step()
 
-            running_loss += loss.item()
-            batch_count += 1
-            _, predicted = torch.max(outputs_for_acc, 1)
-            correct_train += (predicted == labels).sum().item()
-            total_train += labels.size(0)
+                running_loss += loss.item()
+                batch_count += 1
+                _, predicted = torch.max(outputs_for_acc, 1)
+                correct_train += (predicted == labels).sum().item()
+                total_train += labels.size(0)
 
-            if IS_MAIN_PROCESS and total_train > 0 and batch_count > 0:
-                avg_loss_train = running_loss / batch_count
-                avg_acc_train = (correct_train / total_train) * 100.0
-                progress_bar.set_postfix(loss=f"{avg_loss_train:.4f}",
-                                         acc=f"{avg_acc_train:.2f}%")
+                if IS_MAIN_PROCESS and total_train > 0 and batch_count > 0:
+                    avg_loss_train = running_loss / batch_count
+                    avg_acc_train = (correct_train / total_train) * 100.0
+                    progress_bar.set_postfix(loss=f"{avg_loss_train:.4f}",
+                                             acc=f"{avg_acc_train:.2f}%")
 
         epoch_train_loss = (running_loss / batch_count) if batch_count > 0 else 0.0
         epoch_train_acc = (correct_train / max(1, total_train)) * 100.0
@@ -779,7 +785,8 @@ def train_model_sharded(train_shards,
 
             val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = evaluate_model(
                 model, val_iter, criterion, genotype_map, log_file, loss_type, current_lr,
-                ddp=ddp, world_size=world_size
+                ddp=ddp, world_size=world_size,
+                collect_infer=save_val_results
             )
         else:
             val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = (
@@ -885,6 +892,12 @@ def train_model_sharded(train_shards,
 
         scheduler.step()
         print_and_log("-" * 30, log_file)
+
+        # Explicitly drop iterators (helps release refs promptly)
+        del train_iter
+        if val_shards:
+            del val_iter
+        gc.collect()
 
     final_msg = (
         f"Training complete. Best epoch: {best_epoch} "
