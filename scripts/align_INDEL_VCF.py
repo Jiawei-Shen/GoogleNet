@@ -10,6 +10,7 @@ Your requested behavior (exact):
        - If ALT is missing the anchor prefix: ALT = REF + ALT
        - If ALT == REF (lost inserted bases): ALT = REF + REF  (e.g., A->AA)
        - POS does NOT change
+       - IMPORTANT: Every TYPE=I is considered "fixed" (processed), even if already OK.
 
   2) TYPE=D (deletion):
        - Add exactly ONE left-flanking base to BOTH REF and ALT
@@ -17,13 +18,12 @@ Your requested behavior (exact):
        - NEW_REF = left_base + deleted_seq
        - NEW_ALT = left_base
        - deleted_seq is fetched from FASTA at POS with length = len(original REF)
-         (this is robust when input REF may be incomplete / not trusted)
+       - IMPORTANT: Every TYPE=D is considered "fixed" (processed).
 
 Other:
   - Do NOT merge anything. One input record => one output record (for I/D).
   - Preserve INFO; fix single-valued INFO/AD (e.g. AD=59) by moving it to INFO/ADALT.
-    (Avoids pysam error when header defines AD as Number=R.)
-  - Adds INFO/FIXED + INFO/FIXNOTE for modified records.
+  - Adds INFO/FIXED + INFO/FIXNOTE for ALL TYPE=I and TYPE=D records (even if unchanged).
   - Writes bgzip VCF + tabix index unless --no-index.
 
 Example:
@@ -40,8 +40,6 @@ from typing import Dict, List, Any
 import pysam
 
 
-# -------------------------- contig + FASTA helpers ---------------------------
-
 def build_contig_mapper(vcf_contigs: List[str], fasta_contigs: List[str]) -> Dict[str, str]:
     """Map VCF contig names to FASTA contigs using exact/chr conversions."""
     fasta_set = set(fasta_contigs)
@@ -54,7 +52,7 @@ def build_contig_mapper(vcf_contigs: List[str], fasta_contigs: List[str]) -> Dic
         elif ("chr" + c) in fasta_set:
             m[c] = "chr" + c
         else:
-            m[c] = c  # may fail later if FASTA doesn't have it
+            m[c] = c
     return m
 
 
@@ -66,18 +64,14 @@ def fetch_ref(fa: pysam.FastaFile, contig: str, pos_1based: int, length: int) ->
     return fa.fetch(contig, start0, start0 + length).upper()
 
 
-# -------------------------- header + INFO sanitizing --------------------------
-
 def make_header(in_header: pysam.VariantHeader) -> pysam.VariantHeader:
     out = in_header.copy()
 
-    # record fix metadata
     if "FIXED" not in out.info:
-        out.add_line('##INFO=<ID=FIXED,Number=0,Type=Flag,Description="Record fixed against FASTA by align_INDEL_VCF.py">')
+        out.add_line('##INFO=<ID=FIXED,Number=0,Type=Flag,Description="Record processed/fixed against FASTA by align_INDEL_VCF.py">')
     if "FIXNOTE" not in out.info:
-        out.add_line('##INFO=<ID=FIXNOTE,Number=1,Type=String,Description="Fix note">')
+        out.add_line('##INFO=<ID=FIXNOTE,Number=1,Type=String,Description="Fix/process note">')
 
-    # preserve single-valued allele depth safely
     if "ADALT" not in out.info:
         out.add_line('##INFO=<ID=ADALT,Number=1,Type=Integer,Description="Alt allele depth (from original INFO/AD when AD was single-valued)">')
 
@@ -104,9 +98,7 @@ def _as_list_of_ints(x: Any) -> List[int]:
 
 
 def sanitize_info(rec: pysam.VariantRecord) -> Dict[str, Any]:
-    """
-    Copy INFO safely for output header, and fix single-valued INFO/AD by moving to ADALT.
-    """
+    """Copy INFO safely; move single-valued INFO/AD to INFO/ADALT."""
     info: Dict[str, Any] = {}
     for k in rec.info.keys():
         try:
@@ -116,16 +108,12 @@ def sanitize_info(rec: pysam.VariantRecord) -> Dict[str, Any]:
 
     if "AD" in info:
         ad_list = _as_list_of_ints(info["AD"])
-        # If AD has a single value (your case), don't write it under AD
-        # because many headers define AD as Number=R, which pysam enforces.
         if len(ad_list) == 1:
             info["ADALT"] = int(ad_list[0])
             info.pop("AD", None)
 
     return info
 
-
-# -------------------------- main logic ---------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(description="Anchor Pansoma INDEL VCF against FASTA (strict rules).")
@@ -134,13 +122,10 @@ def main():
     ap.add_argument("--out", required=True, help="Output VCF.GZ")
     ap.add_argument("--log", default=None, help="TSV log (default: <out>.fix_log.tsv)")
     ap.add_argument("--no-index", action="store_true", help="Do not create .tbi index")
-
-    # Optional safety: force REF to match FASTA for insertions (recommended if your REF can be wrong)
     ap.add_argument("--force-ref-from-fasta", action="store_true",
                     help="For TYPE=I, overwrite REF with FASTA at POS (len=original REF).")
 
     args = ap.parse_args()
-
     log_path = args.log if args.log else (args.out + ".fix_log.tsv")
 
     invcf = pysam.VariantFile(args.vcf)
@@ -162,7 +147,6 @@ def main():
             if fasta_chrom not in fa.references:
                 raise SystemExit(f"ERROR: contig '{chrom}' not in FASTA (tried '{fasta_chrom}')")
 
-            # Must be biallelic for this fixer
             if rec.alts is None or len(rec.alts) != 1:
                 dropped += 1
                 logf.write(f"{chrom}\t{rec.pos}\t{rec.ref}\t{rec.alts}\t.\t.\t.\tDROP\tmissing_or_multiallelic\n")
@@ -171,7 +155,6 @@ def main():
             alt_in = rec.alts[0]
             ref_in = rec.ref
             vtype = str(rec.info.get("TYPE", "")).upper()
-
             info = sanitize_info(rec)
 
             # ---------------- TYPE=I: insertion ----------------
@@ -179,30 +162,23 @@ def main():
                 ref = ref_in.upper()
                 alt = alt_in.upper()
 
-                # Optional: force REF to FASTA at POS
                 if args.force_ref_from_fasta:
                     try:
                         ref = fetch_ref(fa, fasta_chrom, rec.pos, len(ref))
                     except Exception as e:
-                        # If FASTA fetch fails, keep original REF but log
+                        # keep original but note it
                         logf.write(f"{chrom}\t{rec.pos}\t{ref_in}\t{alt_in}\t.\t.\t.\tWARN\tforce_ref_failed:{e}\n")
 
+                # Apply your rules
                 note = "ins_ok"
-                fixed_flag = False
-
-                # Rule 1: ALT must start with REF
                 if not alt.startswith(ref):
                     alt = ref + alt
                     note = "ins_prefix_ref_to_alt"
-                    fixed_flag = True
                 else:
-                    # Rule 2: if ALT==REF (lost insertion), make ALT=REF+REF (A->AA)
                     if len(alt) == len(ref):
                         alt = ref + alt
                         note = "ins_alt_eq_ref_make_refref"
-                        fixed_flag = True
 
-                # Create record; POS unchanged
                 new = outvcf.new_record(
                     contig=rec.contig,
                     start=rec.start,
@@ -216,16 +192,14 @@ def main():
                 for s in rec.samples:
                     new.samples[s].update(rec.samples[s])
 
-                if fixed_flag:
-                    new.info["FIXED"] = True
-                    new.info["FIXNOTE"] = note
-                    fixed += 1
-                    logf.write(f"{chrom}\t{rec.pos}\t{ref_in}\t{alt_in}\t{rec.pos}\t{ref}\t{alt}\tFIX_INS\t{note}\n")
-                else:
-                    logf.write(f"{chrom}\t{rec.pos}\t{ref_in}\t{alt_in}\t{rec.pos}\t{ref}\t{alt}\tKEEP\t{note}\n")
-
-                outvcf.write(new)
+                # IMPORTANT: Always mark as FIXED for TYPE=I
+                new.info["FIXED"] = True
+                new.info["FIXNOTE"] = note
+                fixed += 1
                 kept += 1
+                outvcf.write(new)
+
+                logf.write(f"{chrom}\t{rec.pos}\t{ref_in}\t{alt_in}\t{rec.pos}\t{ref}\t{alt}\tFIX_INS\t{note}\n")
                 continue
 
             # ---------------- TYPE=D: deletion ----------------
@@ -236,7 +210,6 @@ def main():
                     logf.write(f"{chrom}\t{pos}\t{ref_in}\t{alt_in}\t.\t.\t.\tDROP\tDEL_no_left_anchor\n")
                     continue
 
-                # EXACT: add ONE left base, and deleted seq of length len(original REF) from FASTA
                 try:
                     left_base = fetch_ref(fa, fasta_chrom, pos - 1, 1)
                     del_len = len(ref_in)
@@ -269,15 +242,14 @@ def main():
                 new.info["FIXED"] = True
                 new.info["FIXNOTE"] = "del_add_left_base"
 
-                outvcf.write(new)
-                kept += 1
                 fixed += 1
+                kept += 1
+                outvcf.write(new)
 
                 logf.write(f"{chrom}\t{pos}\t{ref_in}\t{alt_in}\t{new_pos}\t{new_ref}\t{new_alt}\tFIX_DEL\tdel_add_left_base\n")
                 continue
 
-            # ---------------- Other types: keep as-is (sanitized INFO) ----------------
-            # (We do not drop REF==ALT here; only your I/D are explicitly handled.)
+            # ---------------- Other types: pass through ----------------
             new = outvcf.new_record(
                 contig=rec.contig,
                 start=rec.start,
