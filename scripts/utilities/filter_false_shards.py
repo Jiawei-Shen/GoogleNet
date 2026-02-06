@@ -50,7 +50,7 @@ def write_filtered_shard(
     unknown_label: int,
     seed: int,
     keep_order: bool,
-    save_indices_path: str | None,
+    save_indices_path: str,
 ) -> Tuple[int, int, int]:
     """
     Returns: (N_in, N_out, N_false_removed)
