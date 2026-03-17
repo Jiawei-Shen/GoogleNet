@@ -759,19 +759,40 @@ def train_model_sharded(train_shards,
         # ---- Validation ----
         if val_shards:
             if ddp and world_size > 1:
-                val_iter = _iter_sharded_batches_ddp(
-                    shards=val_shards,
-                    batch_size=batch_size,
-                    epoch=epoch,
-                    world_size=world_size,
-                    rank=rank,
-                    shuffle_shards=False,
-                    shuffle_within_shard=False,
-                    drop_last=False,
-                    training_data_ratio=1.0,
-                    max_steps=None,
-                    do_normalize=True,
-                )
+                if IS_MAIN_PROCESS:
+                    val_iter = _iter_sharded_batches(
+                        shards=val_shards,
+                        batch_size=batch_size,
+                        epoch=epoch,
+                        shuffle_shards=False,
+                        shuffle_within_shard=False,
+                        drop_last=False,
+                        training_data_ratio=1.0,
+                        max_steps=None,
+                        do_normalize=True,
+                    )
+
+                    val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = evaluate_model(
+                        model,
+                        val_iter,
+                        criterion,
+                        genotype_map,
+                        log_file,
+                        loss_type,
+                        current_lr,
+                        ddp=False,
+                        world_size=1,
+                        collect_infer=save_val_results
+                    )
+                else:
+                    val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = (
+                        0.0, 0.0, {}, {}, {
+                            'precision_true': 0.0,
+                            'recall_true': 0.0,
+                            'f1_true': 0.0,
+                            'pos_class_idx': None
+                        }
+                    )
             else:
                 val_iter = _iter_sharded_batches(
                     shards=val_shards,
@@ -785,18 +806,18 @@ def train_model_sharded(train_shards,
                     do_normalize=True,
                 )
 
-            val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = evaluate_model(
-                model,
-                val_iter,
-                criterion,
-                genotype_map,
-                log_file,
-                loss_type,
-                current_lr,
-                ddp=ddp,
-                world_size=world_size,
-                collect_infer=save_val_results
-            )
+                val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = evaluate_model(
+                    model,
+                    val_iter,
+                    criterion,
+                    genotype_map,
+                    log_file,
+                    loss_type,
+                    current_lr,
+                    ddp=False,
+                    world_size=1,
+                    collect_infer=save_val_results
+                )
         else:
             val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = (
                 0.0, 0.0, {}, {}, {
@@ -903,7 +924,7 @@ def train_model_sharded(train_shards,
         print_and_log("-" * 30, log_file)
 
         del train_iter
-        if val_shards:
+        if val_shards and (not ddp or world_size == 1 or IS_MAIN_PROCESS):
             del val_iter
         gc.collect()
 
