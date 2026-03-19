@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
-ONE-STOP pipeline (5-channel) — inference -> shard-join (variant_summary) -> VCF(s)
+ONE-STOP pipeline (optimized, 5-channel version)
 
-Revisions:
-1) 5-channel input throughout.
-2) Linear/ref classification is based only on map_json:
-   - if a node has "grch38_position_start" -> eligible for linear conversion
-   - if a node does NOT have "grch38_position_start" -> treated as ref
-3) Added --chr:
-   - default: all
-   - if set like --chr chr1, force all eligible nodes in this map_json to use that chromosome
-   - otherwise chromosome is taken from record chrom fields if present, else inferred from map_json filename
-4) linear VCF header is rebuilt from linear contigs (no stale node contigs).
-5) AD is written only when both ref/alt counts are valid integers.
+Main speedups vs your original:
+1) Vectorized keep-mask on GPU (loop only over kept indices, not every sample).
+2) Faster variant_summary lookup: store as per-shard list (O(1) index), avoids (sidx,iws) tuple hashing.
+3) Avoid per-sample shard_index parsing in the hot path: precompute per-file shard_index once in Dataset.
+4) Move normalization to GPU (optional, enabled by default) to reduce DataLoader worker CPU load.
+5) Use torch.inference_mode() + optional AMP autocast for faster inference on CUDA.
 
-Behavior otherwise unchanged:
-  inference -> join(variant_summary) -> emit all/ref/linear VCF(s)
+Behavior/outputs remain the same (no PoN filtering here; only inference->join->VCF outputs).
+
+5-channel update:
+- population AF channel removed
+- normalization uses the original first 5 channel stats only
 """
 
 import argparse
@@ -25,7 +23,7 @@ import os
 import re
 import sys
 import time
-from typing import Dict, List, Tuple, Optional, Iterator, Iterable, Set
+from typing import Dict, List, Tuple, Optional, Any, Iterator, Iterable, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -33,17 +31,19 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
+# Import your model the same way as in training
 THIS_DIR = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(os.path.abspath(os.path.join(THIS_DIR, "..")))
 from mynet import ConvNeXtCBAMClassifier  # noqa: E402
 
+# pysam for bgzip + tabix
 try:
     import pysam
 except Exception:
     pysam = None
 
 
-# Replace with recomputed 5-channel stats if available
+# --- EXACT SAME NORMALIZATION AS VAL (5-channel; AF channel removed) ---
 VAL_MEAN = torch.tensor([
     18.417816162109375,
     12.649129867553711,
@@ -84,7 +84,8 @@ def escape_info(v) -> str:
     )
 
 
-def _scan_tree(start_dir: str, include_all_npy: bool) -> List[str]:
+def _scan_tree(start_dir: str) -> List[str]:
+    """Iteratively scan one subtree with os.scandir (fast)."""
     stack = [start_dir]
     out: List[str] = []
     while stack:
@@ -96,14 +97,8 @@ def _scan_tree(start_dir: str, include_all_npy: bool) -> List[str]:
                         if e.is_dir(follow_symlinks=False):
                             stack.append(e.path)
                         else:
-                            name = e.name.lower()
-                            if not name.endswith(".npy"):
-                                continue
-                            if include_all_npy:
+                            if e.name.lower().endswith(".npy"):
                                 out.append(os.path.abspath(e.path))
-                            else:
-                                if name.endswith("_data.npy"):
-                                    out.append(os.path.abspath(e.path))
                     except OSError:
                         continue
         except (PermissionError, FileNotFoundError):
@@ -117,12 +112,14 @@ def _format_eta(seconds: float) -> str:
     m, s = divmod(rem, 60)
     if h > 0:
         return f"{h:d}h{m:02d}m{s:02d}s"
-    if m > 0:
+    elif m > 0:
         return f"{m:d}m{s:02d}s"
-    return f"{s:d}s"
+    else:
+        return f"{s:d}s"
 
 
-def list_npy_files_parallel(root: str, workers: int, include_all_npy: bool) -> List[str]:
+def list_npy_files_parallel(root: str, workers: int) -> List[str]:
+    """Parallel file discovery with tqdm bar."""
     root = os.path.abspath(os.path.expanduser(root))
     top_dirs, files = [], []
 
@@ -132,15 +129,8 @@ def list_npy_files_parallel(root: str, workers: int, include_all_npy: bool) -> L
                 try:
                     if e.is_dir(follow_symlinks=False):
                         top_dirs.append(e.path)
-                    else:
-                        name = e.name.lower()
-                        if not name.endswith(".npy"):
-                            continue
-                        if include_all_npy:
-                            files.append(os.path.abspath(e.path))
-                        else:
-                            if name.endswith("_data.npy"):
-                                files.append(os.path.abspath(e.path))
+                    elif e.name.lower().endswith(".npy"):
+                        files.append(os.path.abspath(e.path))
                 except OSError:
                     continue
     except FileNotFoundError:
@@ -148,13 +138,13 @@ def list_npy_files_parallel(root: str, workers: int, include_all_npy: bool) -> L
 
     if workers <= 1 or not top_dirs:
         for d in top_dirs:
-            files.extend(_scan_tree(d, include_all_npy=include_all_npy))
+            files.extend(_scan_tree(d))
         return sorted(set(files))
 
     start = time.time()
     with ThreadPoolExecutor(max_workers=workers) as ex, \
          tqdm(total=len(top_dirs), desc="Scan", unit="dir", leave=False, dynamic_ncols=True) as bar:
-        futures = [ex.submit(_scan_tree, d, include_all_npy) for d in top_dirs]
+        futures = [ex.submit(_scan_tree, d) for d in top_dirs]
         for fut in as_completed(futures):
             files.extend(fut.result())
             bar.update(1)
@@ -168,6 +158,7 @@ def list_npy_files_parallel(root: str, workers: int, include_all_npy: bool) -> L
 
 
 def read_file_list(txt_path: str) -> List[str]:
+    """Read one path per line."""
     with open(txt_path, "rb") as f:
         lines = f.read().splitlines()
     try:
@@ -177,6 +168,7 @@ def read_file_list(txt_path: str) -> List[str]:
 
 
 def save_file_list(paths: List[str], txt_path: str) -> None:
+    """Write one absolute path per line."""
     txt_path = os.path.abspath(os.path.expanduser(txt_path))
     os.makedirs(os.path.dirname(txt_path) or ".", exist_ok=True)
     with open(txt_path, "w") as f:
@@ -198,6 +190,11 @@ def print_data_info(files: List[str], mmap: bool, k: int) -> None:
 
 
 def detect_input_mode(files: List[str], mmap: bool) -> str:
+    """
+    Auto-detect by inspecting the first readable file:
+      - if ndim==4 -> shard
+      - if ndim==3 -> single
+    """
     for p in files:
         try:
             arr = np.load(p, mmap_mode="r" if mmap else None)
@@ -211,6 +208,11 @@ def detect_input_mode(files: List[str], mmap: bool) -> str:
 
 
 def to_chw_float32(x: np.ndarray, channels: int) -> np.ndarray:
+    """
+    Convert numpy array to float32 CHW:
+      - CHW if already (C,H,W)
+      - HWC if (H,W,C)
+    """
     if x.ndim != 3:
         raise ValueError(f"Expected 3D tensor, got shape={x.shape}")
     if x.shape[0] == channels:
@@ -222,38 +224,7 @@ def to_chw_float32(x: np.ndarray, channels: int) -> np.ndarray:
     return chw.astype(np.float32, copy=False)
 
 
-def normalize_chr_name(chrom: Optional[str]) -> Optional[str]:
-    if chrom is None:
-        return None
-    c = str(chrom).strip()
-    if not c:
-        return None
-    cl = c.lower()
-    if cl == "all":
-        return "all"
-    if cl.startswith("chr"):
-        suffix = c[3:]
-        if suffix.upper() == "MT":
-            return "chrM"
-        if suffix.upper() in ("X", "Y", "M"):
-            return "chr" + suffix.upper()
-        return "chr" + suffix
-    if cl in ("x", "y", "m", "mt"):
-        return "chr" + cl.upper().replace("MT", "M")
-    if cl.isdigit():
-        return "chr" + cl
-    return c
-
-
-def infer_chrom_from_filename(path: str) -> Optional[str]:
-    bn = os.path.basename(path)
-    m = re.search(r"(chr(?:[0-9]+|X|Y|M|MT))", bn, flags=re.IGNORECASE)
-    if not m:
-        return None
-    return normalize_chr_name(m.group(1))
-
-
-# ---------------------------- Variant summary -------------------------------- #
+# ---------------------------- Variant summary (latest shards) ---------------- #
 
 def iter_variant_summary_ndjson(path: str) -> Iterator[dict]:
     with open(path, "r", encoding="utf-8") as f:
@@ -270,6 +241,12 @@ def iter_variant_summary_ndjson(path: str) -> Iterator[dict]:
 
 
 def load_variant_summary_by_shard_list(ndjson_path: str) -> Dict[int, List[Optional[dict]]]:
+    """
+    Faster lookup structure:
+      vs_by_shard[sidx][iws] -> meta dict (or None)
+
+    This avoids (sidx,iws) tuple hashing overhead in the hot loop.
+    """
     vs_by_shard: Dict[int, List[Optional[dict]]] = {}
     missing = 0
     total = 0
@@ -300,37 +277,72 @@ def load_variant_summary_by_shard_list(ndjson_path: str) -> Dict[int, List[Optio
     return vs_by_shard
 
 
-# ------------------------ Robust shard_index parsing ------------------------ #
+# ------------------------ TSV (ALT->REF) mapping ------------------------ #
 
-_SHARD_CLASSIC_RE = re.compile(r"^(?:shard[_-]?)?(?P<idx>\d+)(?:_data)?\.npy$", re.IGNORECASE)
-_TRAILING_ID_RE = re.compile(r"_(?P<idx>\d+)(?:_(?:data|labels))\.npy$", re.IGNORECASE)
+_SHARD_BASENAME_RE = re.compile(r"(?:^|/)(?:shard_)?(?P<idx>\d+)(?:_data)?\.npy$", re.IGNORECASE)
 
 def shard_index_from_path(shard_path: str) -> Optional[int]:
     if not shard_path:
         return None
     bn = os.path.basename(str(shard_path))
-
-    m = _SHARD_CLASSIC_RE.match(bn)
-    if m:
+    m = _SHARD_BASENAME_RE.search(bn)
+    if not m:
+        m2 = re.search(r"(\d+)", bn)
+        if not m2:
+            return None
         try:
-            return int(m.group("idx"))
+            return int(m2.group(1))
         except Exception:
             return None
+    try:
+        return int(m.group("idx"))
+    except Exception:
+        return None
 
-    m = _TRAILING_ID_RE.search(bn)
-    if m:
-        try:
-            return int(m.group("idx"))
-        except Exception:
-            return None
 
-    nums = re.findall(r"(\d+)", bn)
-    if nums:
+def load_alt_to_ref_tsv(tsv_path: Optional[str]) -> Tuple[Dict[int, int], Set[int], Set[int]]:
+    if not tsv_path:
+        return {}, set(), set()
+
+    alt_to_ref: Dict[int, int] = {}
+    tsv_ref_nodes: Set[int] = set()
+    tsv_alt_nodes: Set[int] = set()
+
+    with open(tsv_path, "r", encoding="utf-8") as f:
         try:
-            return int(nums[-1])
-        except Exception:
-            return None
-    return None
+            csv.field_size_limit(sys.maxsize)
+        except OverflowError:
+            csv.field_size_limit(2**31 - 1)
+        reader = csv.DictReader(f, delimiter="\t")
+        hdr = [c.strip() for c in (reader.fieldnames or [])]
+        ref_node_key = None
+        alt_nodes_key = None
+        for k in hdr:
+            lk = k.lower()
+            if ref_node_key is None and lk in ("ref_node", "refnode", "ref"):
+                ref_node_key = k
+            if alt_nodes_key is None and lk in ("alt_node(s)", "alt_nodes", "altnodes", "alt"):
+                alt_nodes_key = k
+        if ref_node_key is None or alt_nodes_key is None:
+            raise ValueError("TSV must have REF_NODE and ALT_NODE(S) columns (case-insensitive).")
+
+        for row in reader:
+            try:
+                ref_node = int(str(row[ref_node_key]).strip())
+                tsv_ref_nodes.add(ref_node)
+            except Exception:
+                continue
+
+            alts_raw = str(row[alt_nodes_key]).strip()
+            for token in re.findall(r"\d+", alts_raw):
+                try:
+                    alt_node = int(token)
+                except Exception:
+                    continue
+                alt_to_ref[alt_node] = ref_node
+                tsv_alt_nodes.add(alt_node)
+
+    return alt_to_ref, tsv_ref_nodes, tsv_alt_nodes
 
 
 # ------------------------ Node map (JSON/JSONL) ------------------------ #
@@ -365,51 +377,44 @@ def iter_node_map_records(json_path: str, jsonl: bool) -> Iterable[dict]:
     else:
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-
         if isinstance(data, list):
             for obj in data:
                 if isinstance(obj, dict):
                     yield obj
         elif isinstance(data, dict):
-            if "nodes" in data:
-                nodes = data["nodes"]
-                if isinstance(nodes, list):
-                    for obj in nodes:
-                        if isinstance(obj, dict):
-                            yield obj
-                elif isinstance(nodes, dict):
-                    for obj in nodes.values():
-                        if isinstance(obj, dict):
-                            yield obj
-            else:
-                for _, v in data.items():
-                    if isinstance(v, dict):
-                        yield v
+            for _, v in data.items():
+                if isinstance(v, dict):
+                    yield v
         else:
             raise ValueError("Unsupported JSON structure for node map.")
+
+
+def _has_key_case_insensitive(obj: dict, key_name: str) -> bool:
+    kn = key_name.lower()
+    for k, v in obj.items():
+        if str(k).lower() == kn:
+            return True
+        if isinstance(v, dict) and _has_key_case_insensitive(v, key_name):
+            return True
+        if isinstance(v, (list, tuple)):
+            for elt in v:
+                if isinstance(elt, dict) and _has_key_case_insensitive(elt, key_name):
+                    return True
+    return False
 
 
 def load_node_map(
     json_path: str,
     jsonl: bool,
-    forced_chr: str = "all",
+    node_start_is_1_based: bool = True
 ) -> Tuple[
     Dict[int, Tuple[str, int, str, int]],
     Set[int],
     Set[int],
 ]:
-    """
-    Returns:
-      anchors_with_pos: node_id -> (chrom, start0, strand, length)
-      nodes_seen: all node_ids observed
-      ref_nodes_no_pos: nodes lacking grch38_position_start
-    """
-    anchors_with_pos: Dict[int, Tuple[str, int, str, int]] = {}
+    anchors: Dict[int, Tuple[str, int, str, int]] = {}
     nodes_seen: Set[int] = set()
-    ref_nodes_no_pos: Set[int] = set()
-
-    forced_chr = normalize_chr_name(forced_chr)
-    inferred_chrom = infer_chrom_from_filename(json_path)
+    nodes_with_genomead_af: Set[int] = set()
 
     for rec in iter_node_map_records(json_path, jsonl):
         nid = _first_present(rec, ["node_id", "node", "id", "nid"])
@@ -418,51 +423,52 @@ def load_node_map(
             continue
         nodes_seen.add(node_id)
 
-        pos1 = _first_present(rec, ["grch38_position_start"], None)
-        if pos1 is None:
-            ref_nodes_no_pos.add(node_id)
-            continue
+        if _has_key_case_insensitive(rec, "genomead_af"):
+            nodes_with_genomead_af.add(node_id)
 
-        pos1 = _to_int(pos1)
-        if pos1 is None:
-            ref_nodes_no_pos.add(node_id)
-            continue
-
-        rec_chrom = _first_present(rec, ["chrom", "chr", "chromosome", "contig"])
-        rec_chrom = normalize_chr_name(rec_chrom)
-        if forced_chr is not None and forced_chr != "all":
-            chrom = forced_chr
-        else:
-            chrom = rec_chrom if rec_chrom is not None else inferred_chrom
-
+        chrom = _first_present(rec, ["chrom", "chr", "chromosome", "contig"])
+        start1 = _first_present(rec, ["grch38_position_start", "start_1based", "pos1"])
+        start0 = _first_present(rec, ["start_0based", "pos0"])
         strand = str(_first_present(rec, ["strand_in_path", "strand"], "+") or "+")
-        if strand not in ("+", "-"):
-            strand = "+"
-
         length = _to_int(_first_present(rec, ["length", "len", "node_length"]))
-        if length is None:
-            seq = rec.get("sequence")
-            if isinstance(seq, str):
-                length = len(seq)
 
-        if chrom is None or length is None:
-            continue
+        if start0 is not None:
+            s0 = _to_int(start0)
+        elif start1 is not None:
+            s1 = _to_int(start1)
+            s0 = (s1 - 1) if s1 is not None else None
+        else:
+            generic = _first_present(rec, ["start", "pos", "start_pos"])
+            if generic is not None:
+                sg = _to_int(generic)
+                if sg is not None:
+                    s0 = (sg - 1) if node_start_is_1_based else sg
+                else:
+                    s0 = None
+            else:
+                s0 = None
 
-        start0 = pos1 - 1
-        anchors_with_pos[node_id] = (str(chrom), int(start0), strand, int(length))
+        if chrom is not None and s0 is not None and length is not None:
+            anchors[node_id] = (str(chrom), int(s0), strand if strand in ("+", "-") else "+", int(length))
 
-    return anchors_with_pos, nodes_seen, ref_nodes_no_pos
+    return anchors, nodes_seen, nodes_with_genomead_af
 
 
 # ---------------------------- Dataset ---------------------------------------- #
 
 class NpyShardsDataset(Dataset):
+    """
+    Optimized:
+      - precompute per-file shard_index once
+      - return (tensor, index_in_shard, shard_index_int)
+      - shard mode always mmap
+    """
     def __init__(
         self,
         files: List[str],
         channels: int,
         mmap: bool = False,
-        input_mode: str = "shard",
+        input_mode: str = "shard",   # "single" or "shard"
         cache_size: int = 2,
     ):
         self.files = files
@@ -474,11 +480,14 @@ class NpyShardsDataset(Dataset):
         if self.channels != 5:
             raise ValueError(f"Expected 5 channels, got {channels}")
 
+        # Precompute shard_index per file once (no regex in hot path)
         self._file_shard_index: List[Optional[int]] = [shard_index_from_path(p) for p in self.files]
 
+        # Per-process cache (each DataLoader worker has its own dataset copy)
         self._arr_cache: Dict[str, np.ndarray] = {}
         self._arr_cache_order: List[str] = []
 
+        # Build an index: global_sample_idx -> (file_idx, local_idx)
         self._offsets: List[int] = [0]
         self._counts: List[int] = []
 
@@ -500,10 +509,6 @@ class NpyShardsDataset(Dataset):
         self.total_samples = self._offsets[-1]
         if self.total_samples == 0:
             raise RuntimeError("No valid samples found in provided .npy files.")
-
-        bad = sum(1 for x in self._file_shard_index if x is None)
-        if bad:
-            tqdm.write(f"WARNING: {bad}/{len(self._file_shard_index)} files have shard_index=None (cannot join meta).")
 
     def __len__(self):
         return self.total_samples
@@ -553,8 +558,9 @@ class NpyShardsDataset(Dataset):
             index_in_shard = int(local_idx)
 
         chw = to_chw_float32(x, self.channels)
-        t = torch.from_numpy(chw)
+        t = torch.from_numpy(chw)  # float32 tensor (CPU)
 
+        # return fewer objects (no shard_path)
         return t, index_in_shard, (-1 if shard_index is None else int(shard_index))
 
 
@@ -600,35 +606,14 @@ def decide_keep_and_filter(pred_is_true: bool,
 
 # --------------------------- VCF builders/writers ---------------------------- #
 
-def chrom_key_linear(c: str):
-    c = str(c)
-    m = re.fullmatch(r"(?:chr)?(\d+)", c, flags=re.IGNORECASE)
-    if m:
-        return (0, int(m.group(1)))
-    cl = c.lower()
-    if cl in ("chrx", "x"):
-        return (1, 23)
-    if cl in ("chry", "y"):
-        return (1, 24)
-    if cl in ("chrm", "chrmt", "m", "mt"):
-        return (1, 25)
-    return (2, cl)
-
-
-def chrom_key_node(c: str):
-    try:
-        return (0, int(c))
-    except Exception:
-        return (1, str(c))
-
-
 def write_vcf_bgzip(
     records: List[Tuple[str, int, str, str, str, str, str, str]],
     out_vcfgz: str,
     meta_id: str,
+    extra_header_lines: Optional[List[str]] = None,
     do_index: bool = True,
     sort_records: bool = True,
-    chrom_sort_mode: str = "node",
+    chrom_sort_mode: str = "node",  # "node" or "linear"
 ):
     ensure_pysam_or_die()
 
@@ -640,12 +625,26 @@ def write_vcf_bgzip(
 
     out_vcfgz = os.path.abspath(out_vcfgz)
     os.makedirs(os.path.dirname(out_vcfgz) or ".", exist_ok=True)
-    tmp_vcf = out_vcfgz[:-3]
+    tmp_vcf = out_vcfgz[:-3]  # strip ".gz" -> ".vcf"
 
     if sort_records or do_index:
         if chrom_sort_mode == "linear":
+            def chrom_key_linear(c: str):
+                m = re.fullmatch(r"(?:chr)?(\d+)", c, flags=re.IGNORECASE)
+                if m:
+                    return (0, int(m.group(1)))
+                cl = c.lower()
+                if cl in ("chrx", "x"): return (1, 23)
+                if cl in ("chry", "y"): return (1, 24)
+                if cl in ("chrm", "chrmt", "m", "mt"): return (1, 25)
+                return (2, cl)
             records.sort(key=lambda r: (chrom_key_linear(r[0]), int(r[1])))
         else:
+            def chrom_key_node(c: str):
+                try:
+                    return (0, int(c))
+                except Exception:
+                    return (1, c)
             records.sort(key=lambda r: (chrom_key_node(r[0]), int(r[1])))
 
     contigs: List[str] = []
@@ -657,6 +656,11 @@ def write_vcf_bgzip(
 
     with open(tmp_vcf, "w", encoding="utf-8") as out:
         out.write("##fileformat=VCFv4.2\n")
+        if extra_header_lines:
+            for h in extra_header_lines:
+                if h and h.startswith("##") and not h.lower().startswith("##fileformat"):
+                    out.write(h.rstrip("\n") + "\n")
+
         out.write(f'##META=<ID={meta_id},Description="Pipeline: inference -> shard-join (variant_summary) -> VCF output.">\n')
         out.write("##INFO=<ID=PROB,Number=1,Type=Float,Description=\"Model probability for positive/'true' class\">\n")
         out.write("##INFO=<ID=AF,Number=1,Type=Float,Description=\"Alt allele frequency from variant_summary\">\n")
@@ -693,30 +697,21 @@ def write_vcf_bgzip(
             if os.path.exists(produced_tbi):
                 os.replace(produced_tbi, out_vcfgz + ".tbi")
         return out_vcfgz, out_vcfgz + ".tbi"
-
-    try:
-        if os.path.exists(out_vcfgz):
-            os.remove(out_vcfgz)
-    except Exception:
-        pass
-    try:
-        pysam.tabix_compress(tmp_vcf, out_vcfgz, force=True)
-    except TypeError:
-        pysam.tabix_compress(tmp_vcf, out_vcfgz)
-    try:
-        os.remove(tmp_vcf)
-    except Exception:
-        pass
-    return out_vcfgz, None
-
-
-def _safe_int(x) -> Optional[int]:
-    try:
-        if x is None or x == ".":
-            return None
-        return int(x)
-    except Exception:
-        return None
+    else:
+        try:
+            if os.path.exists(out_vcfgz):
+                os.remove(out_vcfgz)
+        except Exception:
+            pass
+        try:
+            pysam.tabix_compress(tmp_vcf, out_vcfgz, force=True)
+        except TypeError:
+            pysam.tabix_compress(tmp_vcf, out_vcfgz)
+        try:
+            os.remove(tmp_vcf)
+        except Exception:
+            pass
+        return out_vcfgz, None
 
 
 def build_node_vcf_record_from_meta(
@@ -761,30 +756,34 @@ def build_node_vcf_record_from_meta(
 
     af = meta.get("alt_allele_frequency")
     cov = meta.get("coverage_at_locus")
-    rc = meta.get("ref_allele_count_at_locus")
-    ac = meta.get("alt_allele_count")
-    oc = meta.get("other_allele_count_at_locus")
-    bq = meta.get("mean_alt_allele_base_quality")
+    rc  = meta.get("ref_allele_count_at_locus")
+    ac  = meta.get("alt_allele_count")
+    oc  = meta.get("other_allele_count_at_locus")
+    bq  = meta.get("mean_alt_allele_base_quality")
 
     if af is not None:
         try:
             info["AF"] = f"{float(af):.6g}"
         except Exception:
             info["AF"] = escape_info(af)
-
-    cov_i = _safe_int(cov)
-    if cov_i is not None:
-        info["DP"] = str(cov_i)
-
-    rc_i = _safe_int(rc)
-    ac_i = _safe_int(ac)
-    if rc_i is not None and ac_i is not None:
-        info["AD"] = f"{rc_i},{ac_i}"
-
-    oc_i = _safe_int(oc)
-    if oc_i is not None:
-        info["OTHER"] = str(oc_i)
-
+    if cov is not None:
+        if isinstance(cov, (int, float)):
+            try:
+                info["DP"] = str(int(cov))
+            except Exception:
+                info["DP"] = escape_info(cov)
+        else:
+            info["DP"] = escape_info(cov)
+    if rc is not None and ac is not None:
+        try:
+            info["AD"] = f"{int(rc)},{int(ac)}"
+        except Exception:
+            info["AD"] = f"{rc},{ac}"
+    if oc is not None:
+        try:
+            info["OTHER"] = str(int(oc))
+        except Exception:
+            info["OTHER"] = escape_info(oc)
     if bq is not None:
         try:
             info["BQ"] = f"{float(bq):.3f}"
@@ -797,7 +796,8 @@ def build_node_vcf_record_from_meta(
 
 def convert_node_record_to_linear(
     node_rec: Tuple[str, int, str, str, str, str, str, str],
-    anchors_with_pos: Dict[int, Tuple[str, int, str, int]],
+    anchors: Dict[int, Tuple[str, int, str, int]],
+    alt_to_ref: Dict[int, int],
     offset_is_0_based: bool,
 ) -> Optional[Tuple[str, int, str, str, str, str, str, str]]:
     chrom_node = node_rec[0]
@@ -808,10 +808,6 @@ def convert_node_record_to_linear(
     except Exception:
         return None
 
-    anchor = anchors_with_pos.get(node_id)
-    if anchor is None:
-        return None
-
     nso = None
     for field in info.split(";"):
         if field.startswith("NSO="):
@@ -819,17 +815,21 @@ def convert_node_record_to_linear(
             break
     if nso is None:
         return None
-
     try:
         offset = int(nso)
     except Exception:
         return None
 
-    chrom_lin, start0, strand, length = anchor
-    off0 = offset if offset_is_0_based else (offset - 1)
-    if off0 < 0:
+    base_node = node_id
+    ref_node_candidate = alt_to_ref.get(base_node)
+    anchor = anchors.get(ref_node_candidate) if ref_node_candidate is not None else None
+    if anchor is None:
+        anchor = anchors.get(base_node)
+    if anchor is None:
         return None
 
+    chrom_lin, start0, strand, length = anchor
+    off0 = offset if offset_is_0_based else (offset - 1)
     if strand == "+":
         pos_lin = start0 + off0 + 1
     else:
@@ -838,7 +838,7 @@ def convert_node_record_to_linear(
     return (chrom_lin, int(pos_lin), node_rec[2], node_rec[3], node_rec[4], node_rec[5], node_rec[6], node_rec[7])
 
 
-# --------------------------- Inference Core ---------------------------------- #
+# --------------------------- Inference Core (optimized) ---------------------- #
 
 def run_inference_and_build_vcfs(
     model,
@@ -852,14 +852,16 @@ def run_inference_and_build_vcfs(
     pos_is_1based: bool,
     gpu_normalize: bool,
     use_amp: bool,
-    dedup_by_shard_idx: bool,
-) -> Tuple[List[Tuple[str, int, str, str, str, str, str, str]], int, int, int]:
-    node_records: List[Tuple[str, int, str, str, str, str, str, str]] = []
+) -> Tuple[List[Tuple[str,int,str,str,str,str,str,str]], int, int, int]:
+    """
+    Returns:
+      node_vcf_records_all, total_inferred, kept, missing_meta
+    """
+    node_records: List[Tuple[str,int,str,str,str,str,str,str]] = []
 
     total_inferred = 0
     kept = 0
     missing_meta = 0
-    seen_pairs: Set[Tuple[int, int]] = set()
 
     mean_dev = std_dev = None
     if gpu_normalize and device.type == "cuda":
@@ -877,6 +879,7 @@ def run_inference_and_build_vcfs(
                 if mean_dev is not None and std_dev is not None:
                     images = (images - mean_dev) / std_dev
 
+                # forward + probs (AMP optional)
                 if device.type == "cuda" and use_amp:
                     with torch.cuda.amp.autocast(dtype=torch.float16):
                         outputs = model(images)
@@ -889,13 +892,16 @@ def run_inference_and_build_vcfs(
                         outputs = outputs[0]
                     probs = torch.softmax(outputs, dim=1)
 
-                if true_idx is not None and 0 <= true_idx < probs.shape[1]:
+                # prob_true (prefer explicit "true" class if known)
+                if true_idx is not None and true_idx >= 0 and true_idx < probs.shape[1]:
                     prob_true_vec = probs[:, true_idx]
                     pred_is_true_vec = (probs.argmax(dim=1) == true_idx)
                 else:
+                    # fallback: treat top prob as "prob_true" and all as "true-like"
                     prob_true_vec, _ = probs.max(dim=1)
                     pred_is_true_vec = torch.ones((bs,), device=probs.device, dtype=torch.bool)
 
+                # vectorized keep mask
                 keep_true = pred_is_true_vec
                 if (min_true_prob is not None) and (true_idx is not None):
                     keep_true = keep_true & (prob_true_vec >= min_true_prob)
@@ -907,6 +913,7 @@ def run_inference_and_build_vcfs(
                 keep_mask = keep_true | keep_refcall
                 keep_idx = torch.nonzero(keep_mask, as_tuple=False).squeeze(1)
 
+                # move just what we need to CPU
                 keep_idx_cpu = keep_idx.detach().cpu().numpy()
                 prob_true_cpu = prob_true_vec.detach().cpu().numpy()
                 pred_is_true_cpu = pred_is_true_vec.detach().cpu().numpy()
@@ -920,16 +927,9 @@ def run_inference_and_build_vcfs(
                         missing_meta += 1
                         continue
                     iws = int(iws_cpu[j])
-
-                    if dedup_by_shard_idx:
-                        key = (sidx, iws)
-                        if key in seen_pairs:
-                            continue
-                        seen_pairs.add(key)
-
                     prob_true = float(prob_true_cpu[j])
-                    pred_is_true = bool(pred_is_true_cpu[j])
 
+                    pred_is_true = bool(pred_is_true_cpu[j])
                     keep, filt = decide_keep_and_filter(pred_is_true, prob_true, min_true_prob, refcall_prob)
                     if not keep:
                         continue
@@ -970,14 +970,14 @@ def run_inference_and_build_vcfs(
 # ----------------------------- Main ----------------------------------------- #
 
 def main():
-    p = argparse.ArgumentParser(description="Infer over 5-channel .npy shards and directly emit VCFs.")
+    p = argparse.ArgumentParser(description="Infer over .npy shards and directly emit VCFs (latest shard format, 5-channel).")
 
+    # Input discovery
     p.add_argument("--input_dir", required=False, help="Directory to scan for .npy files (recursive).")
     p.add_argument("--file_list", required=False, help="Text file with one .npy path per line (skips scanning).")
     p.add_argument("--save_file_list", required=False, help="Write discovered .npy paths to this text file.")
-    p.add_argument("--include_all_npy", action="store_true",
-                   help="If set, scan all .npy. Default scans only *_data.npy (recommended).")
 
+    # Model
     p.add_argument("--ckpt", required=True)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--num_workers", type=int, default=8, help="DataLoader workers.")
@@ -985,6 +985,7 @@ def main():
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--compile", action="store_true")
 
+    # Data
     p.add_argument("--mmap", action="store_true", help="Use mmap for single mode; shard mode always uses mmap.")
     p.add_argument("--cache_size", type=int, default=2, help="Per-worker LRU cache size for opened shard memmaps.")
     p.add_argument("--input_mode", choices=["auto", "single", "shard"], default="auto",
@@ -993,17 +994,21 @@ def main():
     p.add_argument("--depths", type=int, nargs="+", default=[3, 3, 27, 3])
     p.add_argument("--dims", type=int, nargs="+", default=[192, 384, 768, 1536])
 
+    # Latest shard meta join
     p.add_argument("--variant_summary", required=True,
                    help="variant_summary.ndjson (must contain shard_index and index_within_shard).")
 
+    # Keep rules
     p.add_argument("--min_true_prob", type=float, default=None,
                    help="Keep only pred_class==true with prob>=this (if prob present).")
     p.add_argument("--refcall_prob", type=float, default=None,
                    help="Also keep pred_class!=true when prob>=this, FILTER=RefCall.")
 
+    # v_pos convention
     p.add_argument("--pos_is_1based", action="store_true",
                    help="If set, treat meta v_pos as already 1-based; otherwise VCF POS=v_pos+1 (default).")
 
+    # VCF outputs
     p.add_argument("--out_prefix", required=True,
                    help="Output prefix. Files: <prefix>.linear.vcf.gz, <prefix>.all.vcf.gz, <prefix>.ref.vcf.gz")
     p.add_argument("--emit", nargs="+", choices=["linear", "all", "ref"], default=["linear"],
@@ -1011,25 +1016,20 @@ def main():
     p.add_argument("--sort", action="store_true", help="Sort VCF outputs (also enabled automatically for indexing).")
     p.add_argument("--no-index", action="store_true", help="Do not create Tabix indexes (.tbi).")
 
-    p.add_argument("--map_json", default=None,
-                   help="Node map JSON (array or dict) used only for linear/ref classification via grch38_position_start.")
+    # Linear conversion inputs
+    p.add_argument("--map_json", default=None, help="Node map JSON (array or dict) for anchors and reference/ref-alt classification.")
     p.add_argument("--map_jsonl", action="store_true", help="Interpret --map_json as JSONL.")
-    p.add_argument("--chr", default="all",
-                   help="Default: all. If set like chr1, force all eligible nodes in this map_json to use that chromosome.")
+    p.add_argument("--tsv", default=None, help="Optional TSV ALT_NODE(S)->REF_NODE mapping (ALT can borrow REF anchor).")
     p.add_argument("--offset_is_0_based", type=lambda s: str(s).lower() in ("1", "true", "t", "yes", "y"), default=True,
                    help="Offsets used for linear conversion (NSO) are 0-based (default: true). Set false if 1-based.")
+    p.add_argument("--node_start_is_1_based", type=lambda s: str(s).lower() in ("1", "true", "t", "yes", "y"), default=True,
+                   help="Node starts in --map_json are 1-based (default: true).")
 
-    p.add_argument("--gpu-normalize", dest="gpu_normalize", action="store_true",
-                   help="Normalize on GPU (default ON).")
-    p.add_argument("--no-gpu-normalize", dest="gpu_normalize", action="store_false",
-                   help="Disable GPU normalization.")
-    p.set_defaults(gpu_normalize=True)
-
+    # New perf toggles
+    p.add_argument("--gpu-normalize", action="store_true",
+                   help="Normalize on GPU (recommended). If not set, inputs must already be normalized or you accept raw.")
     p.add_argument("--amp", action="store_true",
-                   help="Use CUDA autocast (fp16) during inference.")
-    p.add_argument("--no-dedup", dest="dedup", action="store_false",
-                   help="Disable de-dup by (SHARD,IDX).")
-    p.set_defaults(dedup=True)
+                   help="Use CUDA autocast (fp16) during inference (recommended on H100/A100).")
 
     args = p.parse_args()
 
@@ -1040,6 +1040,7 @@ def main():
     if needs_map and not args.map_json:
         raise SystemExit("ERROR: --emit includes linear/ref, but --map_json was not provided.")
 
+    # Device
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -1049,6 +1050,7 @@ def main():
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
 
+    # Build model
     print(f"Loading Model from {args.ckpt}")
     print(f"depths={args.depths}, dims={args.dims}")
     model, genotype_map, in_channels = build_and_load_model(args.ckpt, device, args.depths, args.dims)
@@ -1061,6 +1063,7 @@ def main():
         except Exception as e:
             print(f"torch.compile not enabled: {e}")
 
+    # Determine true_idx
     true_idx = None
     if len(genotype_map) > 0:
         for cname, cidx in genotype_map.items():
@@ -1068,6 +1071,7 @@ def main():
                 true_idx = int(cidx)
                 break
 
+    # Resolve file list vs directory scan
     if args.file_list:
         files = read_file_list(args.file_list)
         print(f"Loaded {len(files)} paths from --file_list")
@@ -1075,14 +1079,15 @@ def main():
         if not args.input_dir:
             raise SystemExit("Either --file_list or --input_dir must be provided.")
         scan_workers = args.scan_workers if args.scan_workers is not None else args.num_workers
-        files = list_npy_files_parallel(args.input_dir, workers=scan_workers, include_all_npy=args.include_all_npy)
+        files = list_npy_files_parallel(args.input_dir, workers=scan_workers)
         if not files:
-            raise SystemExit(f"No .npy files found in {args.input_dir} (include_all_npy={args.include_all_npy})")
+            raise SystemExit(f"No .npy files found in {args.input_dir}")
         if args.save_file_list:
             save_file_list(files, args.save_file_list)
 
     print_data_info(files, args.mmap, args.sample_info_k)
 
+    # Decide input mode
     if args.input_mode == "auto":
         mode = detect_input_mode(files, mmap=args.mmap)
         print(f"Auto-detected input_mode={mode}")
@@ -1090,25 +1095,30 @@ def main():
         mode = args.input_mode
         print(f"Using input_mode={mode}")
 
+    # Load variant_summary (fast structure)
     if not os.path.isfile(args.variant_summary):
         raise SystemExit(f"variant_summary not found: {args.variant_summary}")
     vs_by_shard = load_variant_summary_by_shard_list(args.variant_summary)
 
-    anchors_with_pos: Dict[int, Tuple[str, int, str, int]] = {}
+    # Load map + TSV (if needed)
+    anchors: Dict[int, Tuple[str, int, str, int]] = {}
     nodes_seen: Set[int] = set()
-    ref_nodes_no_pos: Set[int] = set()
+    ref_nodes_with_af: Set[int] = set()
+    alt_to_ref: Dict[int, int] = {}
 
     if needs_map:
-        anchors_with_pos, nodes_seen, ref_nodes_no_pos = load_node_map(
+        anchors, nodes_seen, ref_nodes_with_af = load_node_map(
             args.map_json,
             jsonl=args.map_jsonl,
-            forced_chr=args.chr,
+            node_start_is_1_based=args.node_start_is_1_based
         )
-        print(
-            f"Node map loaded: anchors_with_pos={len(anchors_with_pos)}, "
-            f"nodes_seen={len(nodes_seen)}, ref_nodes_no_pos={len(ref_nodes_no_pos)}"
-        )
+        print(f"Node map loaded: anchors={len(anchors)}, nodes_seen={len(nodes_seen)}, ref_nodes={len(ref_nodes_with_af)}")
 
+        if args.tsv:
+            alt_to_ref, tsv_ref_nodes, tsv_alt_nodes = load_alt_to_ref_tsv(args.tsv)
+            print(f"TSV loaded: ALT->REF mappings={len(alt_to_ref)} (TSV REF nodes={len(tsv_ref_nodes)}, TSV ALT nodes={len(tsv_alt_nodes)})")
+
+    # Dataset & Loader
     print("Building Data Loader...")
     ds = NpyShardsDataset(
         files,
@@ -1132,6 +1142,7 @@ def main():
         prefetch_factor=prefetch_factor,
     )
 
+    # Infer + build node records
     t0 = time.time()
     node_records_all, total_inferred, kept, miss_meta = run_inference_and_build_vcfs(
         model=model,
@@ -1145,7 +1156,6 @@ def main():
         pos_is_1based=args.pos_is_1based,
         gpu_normalize=args.gpu_normalize,
         use_amp=args.amp,
-        dedup_by_shard_idx=args.dedup,
     )
 
     elapsed = time.time() - t0
@@ -1158,25 +1168,26 @@ def main():
     out_prefix = os.path.abspath(args.out_prefix)
     do_index = (not args.no_index)
 
+    # all (node-form)
     if "all" in args.emit:
         out_all = out_prefix + ".all.vcf.gz"
         gz, tbi = write_vcf_bgzip(
             records=node_records_all,
             out_vcfgz=out_all,
             meta_id="ALL_NODE",
+            extra_header_lines=None,
             do_index=do_index,
             sort_records=want_sort,
             chrom_sort_mode="node",
         )
-        print(f"[all]    {gz}" + (f"  (index: {tbi})" if tbi else ""))
+        print(f"[all]   {gz}" + (f"  (index: {tbi})" if tbi else ""))
 
+    # ref (node-form subset)
     if "ref" in args.emit:
-        if not nodes_seen:
-            print("WARNING: --emit ref requested but nodes_seen is empty (check --map_json).", file=sys.stderr)
-
-        # ref = nodes in map_json but without grch38_position_start
-        ref_set = set(ref_nodes_no_pos)
-        node_records_ref: List[Tuple[str, int, str, str, str, str, str, str]] = []
+        if not ref_nodes_with_af:
+            print("WARNING: --emit ref requested but ref_nodes_with_af is empty (check --map_json).", file=sys.stderr)
+        ref_set = set(ref_nodes_with_af)
+        node_records_ref: List[Tuple[str,int,str,str,str,str,str,str]] = []
         for r in node_records_all:
             try:
                 nid = int(r[0])
@@ -1190,20 +1201,23 @@ def main():
             records=node_records_ref,
             out_vcfgz=out_ref,
             meta_id="REF_NODE_ONLY",
+            extra_header_lines=None,
             do_index=do_index,
             sort_records=want_sort,
             chrom_sort_mode="node",
         )
-        print(f"[ref]    {gz}" + (f"  (index: {tbi})" if tbi else "") + f"  (records={len(node_records_ref)})")
+        print(f"[ref]   {gz}" + (f"  (index: {tbi})" if tbi else "") + f"  (records={len(node_records_ref)})")
 
+    # linear (converted subset)
     if "linear" in args.emit:
-        converted: List[Tuple[str, int, str, str, str, str, str, str]] = []
+        converted: List[Tuple[str,int,str,str,str,str,str,str]] = []
         unconverted_n = 0
 
         for nr in node_records_all:
             lin = convert_node_record_to_linear(
                 node_rec=nr,
-                anchors_with_pos=anchors_with_pos,
+                anchors=anchors,
+                alt_to_ref=alt_to_ref,
                 offset_is_0_based=args.offset_is_0_based,
             )
             if lin is None:
@@ -1219,14 +1233,13 @@ def main():
             records=converted,
             out_vcfgz=out_lin,
             meta_id="LINEAR_CONVERTED",
+            extra_header_lines=None,
             do_index=do_index,
             sort_records=want_sort,
             chrom_sort_mode="linear",
         )
-        print(
-            f"[linear] {gz}" + (f"  (index: {tbi})" if tbi else "") +
-            f"  (records={len(converted)}, dropped_unconverted={unconverted_n})"
-        )
+        print(f"[linear] {gz}" + (f"  (index: {tbi})" if tbi else "") +
+              f"  (records={len(converted)}, dropped_unconverted={unconverted_n})")
 
     print("\nDone.")
 
