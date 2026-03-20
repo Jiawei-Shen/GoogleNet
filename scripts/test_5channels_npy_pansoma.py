@@ -9,7 +9,12 @@ Main speedups vs your original:
 4) Move normalization to GPU (optional, enabled by default) to reduce DataLoader worker CPU load.
 5) Use torch.inference_mode() + optional AMP autocast for faster inference on CUDA.
 
-Behavior/outputs remain the same (no PoN filtering here; only inference->join->VCF outputs).
+Behavior/outputs remain the same (no PoN filtering here; only inference->join->VCF outputs),
+except for the new keep rule:
+
+New keep rule for pred_class == true:
+- nodes WITH anchors use --min_true_prob (default 0.5)
+- nodes WITHOUT anchors use --min_true_prob_no_anchor (default 0.3)
 
 5-channel update:
 - population AF channel removed
@@ -454,6 +459,22 @@ def load_node_map(
     return anchors, nodes_seen, nodes_with_genomead_af
 
 
+def node_has_linear_anchor(
+    node_id: int,
+    anchors: Dict[int, Tuple[str, int, str, int]],
+    alt_to_ref: Dict[int, int],
+) -> bool:
+    """
+    True if node can be converted to linear coordinates:
+      1) via borrowed REF anchor from alt_to_ref, or
+      2) via its own anchor
+    """
+    ref_node_candidate = alt_to_ref.get(node_id)
+    if ref_node_candidate is not None and ref_node_candidate in anchors:
+        return True
+    return node_id in anchors
+
+
 # ---------------------------- Dataset ---------------------------------------- #
 
 class NpyShardsDataset(Dataset):
@@ -590,14 +611,31 @@ def build_and_load_model(ckpt_path: str, device: torch.device,
 
 # --------------------------- Prediction helpers ------------------------------ #
 
-def decide_keep_and_filter(pred_is_true: bool,
-                           prob_true: Optional[float],
-                           min_true_prob: Optional[float],
-                           refcall_prob: Optional[float]) -> Tuple[bool, str]:
+def decide_keep_and_filter(
+    pred_is_true: bool,
+    prob_true: Optional[float],
+    min_true_prob: Optional[float],
+    refcall_prob: Optional[float],
+    has_anchor: Optional[bool] = None,
+    min_true_prob_no_anchor: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """
+    Keep rule:
+      - If pred_is_true:
+          * use min_true_prob for anchored nodes
+          * use min_true_prob_no_anchor for unanchored nodes (if provided)
+      - Else:
+          * keep as RefCall if prob_true >= refcall_prob
+    """
     if pred_is_true:
-        if (min_true_prob is None) or (prob_true is None) or (prob_true >= min_true_prob):
+        threshold = min_true_prob
+        if (has_anchor is False) and (min_true_prob_no_anchor is not None):
+            threshold = min_true_prob_no_anchor
+
+        if (threshold is None) or (prob_true is None) or (prob_true >= threshold):
             return True, "PASS"
         return False, "PASS"
+
     else:
         if (refcall_prob is not None) and (prob_true is not None) and (prob_true >= refcall_prob):
             return True, "RefCall"
@@ -634,9 +672,12 @@ def write_vcf_bgzip(
                 if m:
                     return (0, int(m.group(1)))
                 cl = c.lower()
-                if cl in ("chrx", "x"): return (1, 23)
-                if cl in ("chry", "y"): return (1, 24)
-                if cl in ("chrm", "chrmt", "m", "mt"): return (1, 25)
+                if cl in ("chrx", "x"):
+                    return (1, 23)
+                if cl in ("chry", "y"):
+                    return (1, 24)
+                if cl in ("chrm", "chrmt", "m", "mt"):
+                    return (1, 25)
                 return (2, cl)
             records.sort(key=lambda r: (chrom_key_linear(r[0]), int(r[1])))
         else:
@@ -756,10 +797,10 @@ def build_node_vcf_record_from_meta(
 
     af = meta.get("alt_allele_frequency")
     cov = meta.get("coverage_at_locus")
-    rc  = meta.get("ref_allele_count_at_locus")
-    ac  = meta.get("alt_allele_count")
-    oc  = meta.get("other_allele_count_at_locus")
-    bq  = meta.get("mean_alt_allele_base_quality")
+    rc = meta.get("ref_allele_count_at_locus")
+    ac = meta.get("alt_allele_count")
+    oc = meta.get("other_allele_count_at_locus")
+    bq = meta.get("mean_alt_allele_base_quality")
 
     if af is not None:
         try:
@@ -848,20 +889,26 @@ def run_inference_and_build_vcfs(
     total_samples: int,
     vs_by_shard: Dict[int, List[Optional[dict]]],
     min_true_prob: Optional[float],
+    min_true_prob_no_anchor: Optional[float],
     refcall_prob: Optional[float],
     pos_is_1based: bool,
     gpu_normalize: bool,
     use_amp: bool,
-) -> Tuple[List[Tuple[str,int,str,str,str,str,str,str]], int, int, int]:
+    anchors: Optional[Dict[int, Tuple[str, int, str, int]]] = None,
+    alt_to_ref: Optional[Dict[int, int]] = None,
+) -> Tuple[List[Tuple[str, int, str, str, str, str, str, str]], int, int, int]:
     """
     Returns:
       node_vcf_records_all, total_inferred, kept, missing_meta
     """
-    node_records: List[Tuple[str,int,str,str,str,str,str,str]] = []
+    node_records: List[Tuple[str, int, str, str, str, str, str, str]] = []
 
     total_inferred = 0
     kept = 0
     missing_meta = 0
+
+    if alt_to_ref is None:
+        alt_to_ref = {}
 
     mean_dev = std_dev = None
     if gpu_normalize and device.type == "cuda":
@@ -901,10 +948,11 @@ def run_inference_and_build_vcfs(
                     prob_true_vec, _ = probs.max(dim=1)
                     pred_is_true_vec = torch.ones((bs,), device=probs.device, dtype=torch.bool)
 
-                # vectorized keep mask
+                # IMPORTANT:
+                # Do not apply min_true_prob at the vectorized stage anymore,
+                # because the final threshold now depends on whether the node
+                # has a linear anchor, and that requires meta["node_id"].
                 keep_true = pred_is_true_vec
-                if (min_true_prob is not None) and (true_idx is not None):
-                    keep_true = keep_true & (prob_true_vec >= min_true_prob)
 
                 keep_refcall = torch.zeros_like(keep_true)
                 if (refcall_prob is not None) and (true_idx is not None):
@@ -928,11 +976,7 @@ def run_inference_and_build_vcfs(
                         continue
                     iws = int(iws_cpu[j])
                     prob_true = float(prob_true_cpu[j])
-
                     pred_is_true = bool(pred_is_true_cpu[j])
-                    keep, filt = decide_keep_and_filter(pred_is_true, prob_true, min_true_prob, refcall_prob)
-                    if not keep:
-                        continue
 
                     lst = vs_by_shard.get(sidx)
                     if (lst is None) or (iws < 0) or (iws >= len(lst)):
@@ -941,6 +985,30 @@ def run_inference_and_build_vcfs(
                     meta = lst[iws]
                     if meta is None:
                         missing_meta += 1
+                        continue
+
+                    # Decide whether this node has an anchor
+                    has_anchor = None
+                    if anchors is not None:
+                        try:
+                            node_id_int = int(meta["node_id"])
+                            has_anchor = node_has_linear_anchor(
+                                node_id=node_id_int,
+                                anchors=anchors,
+                                alt_to_ref=alt_to_ref,
+                            )
+                        except Exception:
+                            has_anchor = None
+
+                    keep, filt = decide_keep_and_filter(
+                        pred_is_true=pred_is_true,
+                        prob_true=prob_true,
+                        min_true_prob=min_true_prob,
+                        refcall_prob=refcall_prob,
+                        has_anchor=has_anchor,
+                        min_true_prob_no_anchor=min_true_prob_no_anchor,
+                    )
+                    if not keep:
                         continue
 
                     node_rec = build_node_vcf_record_from_meta(
@@ -999,8 +1067,10 @@ def main():
                    help="variant_summary.ndjson (must contain shard_index and index_within_shard).")
 
     # Keep rules
-    p.add_argument("--min_true_prob", type=float, default=None,
-                   help="Keep only pred_class==true with prob>=this (if prob present).")
+    p.add_argument("--min_true_prob", type=float, default=0.5,
+                   help="Keep pred_class==true with prob>=this for nodes that HAVE anchors. Default: 0.5")
+    p.add_argument("--min_true_prob_no_anchor", type=float, default=0.3,
+                   help="Keep pred_class==true with prob>=this for nodes that DO NOT have anchors. Default: 0.3")
     p.add_argument("--refcall_prob", type=float, default=None,
                    help="Also keep pred_class!=true when prob>=this, FILTER=RefCall.")
 
@@ -1152,10 +1222,13 @@ def main():
         total_samples=len(ds),
         vs_by_shard=vs_by_shard,
         min_true_prob=args.min_true_prob,
+        min_true_prob_no_anchor=args.min_true_prob_no_anchor,
         refcall_prob=args.refcall_prob,
         pos_is_1based=args.pos_is_1based,
         gpu_normalize=args.gpu_normalize,
         use_amp=args.amp,
+        anchors=anchors if needs_map else None,
+        alt_to_ref=alt_to_ref if needs_map else None,
     )
 
     elapsed = time.time() - t0
@@ -1187,7 +1260,7 @@ def main():
         if not ref_nodes_with_af:
             print("WARNING: --emit ref requested but ref_nodes_with_af is empty (check --map_json).", file=sys.stderr)
         ref_set = set(ref_nodes_with_af)
-        node_records_ref: List[Tuple[str,int,str,str,str,str,str,str]] = []
+        node_records_ref: List[Tuple[str, int, str, str, str, str, str, str]] = []
         for r in node_records_all:
             try:
                 nid = int(r[0])
@@ -1210,7 +1283,7 @@ def main():
 
     # linear (converted subset)
     if "linear" in args.emit:
-        converted: List[Tuple[str,int,str,str,str,str,str,str]] = []
+        converted: List[Tuple[str, int, str, str, str, str, str, str]] = []
         unconverted_n = 0
 
         for nr in node_records_all:
