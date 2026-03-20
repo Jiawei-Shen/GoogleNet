@@ -12,9 +12,12 @@ Main speedups vs your original:
 Behavior/outputs remain the same (no PoN filtering here; only inference->join->VCF outputs),
 except for the new keep rule:
 
-New keep rule for pred_class == true:
-- nodes WITH anchors use --min_true_prob (default 0.5)
-- nodes WITHOUT anchors use --min_true_prob_no_anchor (default 0.3)
+New keep rule:
+- nodes WITH anchors use strict true rule:
+    keep only if argmax class is true AND prob_true >= --min_true_prob (default 0.5)
+- nodes WITHOUT anchors use relaxed rule:
+    keep if prob_true >= --min_true_prob_no_anchor (default 0.3),
+    even if argmax class is not true
 
 5-channel update:
 - population AF channel removed
@@ -28,7 +31,7 @@ import os
 import re
 import sys
 import time
-from typing import Dict, List, Tuple, Optional, Any, Iterator, Iterable, Set
+from typing import Dict, List, Tuple, Optional, Iterator, Iterable, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -489,7 +492,7 @@ class NpyShardsDataset(Dataset):
         files: List[str],
         channels: int,
         mmap: bool = False,
-        input_mode: str = "shard",   # "single" or "shard"
+        input_mode: str = "shard",
         cache_size: int = 2,
     ):
         self.files = files
@@ -501,14 +504,11 @@ class NpyShardsDataset(Dataset):
         if self.channels != 5:
             raise ValueError(f"Expected 5 channels, got {channels}")
 
-        # Precompute shard_index per file once (no regex in hot path)
         self._file_shard_index: List[Optional[int]] = [shard_index_from_path(p) for p in self.files]
 
-        # Per-process cache (each DataLoader worker has its own dataset copy)
         self._arr_cache: Dict[str, np.ndarray] = {}
         self._arr_cache_order: List[str] = []
 
-        # Build an index: global_sample_idx -> (file_idx, local_idx)
         self._offsets: List[int] = [0]
         self._counts: List[int] = []
 
@@ -579,9 +579,8 @@ class NpyShardsDataset(Dataset):
             index_in_shard = int(local_idx)
 
         chw = to_chw_float32(x, self.channels)
-        t = torch.from_numpy(chw)  # float32 tensor (CPU)
+        t = torch.from_numpy(chw)
 
-        # return fewer objects (no shard_path)
         return t, index_in_shard, (-1 if shard_index is None else int(shard_index))
 
 
@@ -614,32 +613,43 @@ def build_and_load_model(ckpt_path: str, device: torch.device,
 def decide_keep_and_filter(
     pred_is_true: bool,
     prob_true: Optional[float],
+    has_anchor: Optional[bool],
     min_true_prob: Optional[float],
+    min_true_prob_no_anchor: Optional[float],
     refcall_prob: Optional[float],
-    has_anchor: Optional[bool] = None,
-    min_true_prob_no_anchor: Optional[float] = None,
 ) -> Tuple[bool, str]:
     """
     Keep rule:
-      - If pred_is_true:
-          * use min_true_prob for anchored nodes
-          * use min_true_prob_no_anchor for unanchored nodes (if provided)
-      - Else:
-          * keep as RefCall if prob_true >= refcall_prob
+      - anchored node:
+          keep only when pred_is_true and prob_true >= min_true_prob
+      - unanchored node:
+          keep when prob_true >= min_true_prob_no_anchor,
+          even if pred_is_true is False
+      - otherwise:
+          optional RefCall if prob_true >= refcall_prob
     """
-    if pred_is_true:
-        threshold = min_true_prob
-        if (has_anchor is False) and (min_true_prob_no_anchor is not None):
-            threshold = min_true_prob_no_anchor
+    if prob_true is None:
+        return False, "PASS"
 
-        if (threshold is None) or (prob_true is None) or (prob_true >= threshold):
+    # Unanchored nodes: relaxed rule, do not require argmax=true
+    if has_anchor is False:
+        thr = min_true_prob_no_anchor
+        if (thr is None) or (prob_true >= thr):
+            return True, "PASS"
+        if (refcall_prob is not None) and (prob_true >= refcall_prob):
+            return True, "RefCall"
+        return False, "PASS"
+
+    # Anchored / unknown-anchor nodes: original stricter rule
+    if pred_is_true:
+        thr = min_true_prob
+        if (thr is None) or (prob_true >= thr):
             return True, "PASS"
         return False, "PASS"
 
-    else:
-        if (refcall_prob is not None) and (prob_true is not None) and (prob_true >= refcall_prob):
-            return True, "RefCall"
-        return False, "PASS"
+    if (refcall_prob is not None) and (prob_true >= refcall_prob):
+        return True, "RefCall"
+    return False, "PASS"
 
 
 # --------------------------- VCF builders/writers ---------------------------- #
@@ -651,7 +661,7 @@ def write_vcf_bgzip(
     extra_header_lines: Optional[List[str]] = None,
     do_index: bool = True,
     sort_records: bool = True,
-    chrom_sort_mode: str = "node",  # "node" or "linear"
+    chrom_sort_mode: str = "node",
 ):
     ensure_pysam_or_die()
 
@@ -663,7 +673,7 @@ def write_vcf_bgzip(
 
     out_vcfgz = os.path.abspath(out_vcfgz)
     os.makedirs(os.path.dirname(out_vcfgz) or ".", exist_ok=True)
-    tmp_vcf = out_vcfgz[:-3]  # strip ".gz" -> ".vcf"
+    tmp_vcf = out_vcfgz[:-3]
 
     if sort_records or do_index:
         if chrom_sort_mode == "linear":
@@ -879,7 +889,7 @@ def convert_node_record_to_linear(
     return (chrom_lin, int(pos_lin), node_rec[2], node_rec[3], node_rec[4], node_rec[5], node_rec[6], node_rec[7])
 
 
-# --------------------------- Inference Core (optimized) ---------------------- #
+# --------------------------- Inference Core ---------------------------------- #
 
 def run_inference_and_build_vcfs(
     model,
@@ -926,7 +936,6 @@ def run_inference_and_build_vcfs(
                 if mean_dev is not None and std_dev is not None:
                     images = (images - mean_dev) / std_dev
 
-                # forward + probs (AMP optional)
                 if device.type == "cuda" and use_amp:
                     with torch.cuda.amp.autocast(dtype=torch.float16):
                         outputs = model(images)
@@ -939,29 +948,22 @@ def run_inference_and_build_vcfs(
                         outputs = outputs[0]
                     probs = torch.softmax(outputs, dim=1)
 
-                # prob_true (prefer explicit "true" class if known)
-                if true_idx is not None and true_idx >= 0 and true_idx < probs.shape[1]:
+                if true_idx is not None and 0 <= true_idx < probs.shape[1]:
                     prob_true_vec = probs[:, true_idx]
                     pred_is_true_vec = (probs.argmax(dim=1) == true_idx)
                 else:
-                    # fallback: treat top prob as "prob_true" and all as "true-like"
                     prob_true_vec, _ = probs.max(dim=1)
                     pred_is_true_vec = torch.ones((bs,), device=probs.device, dtype=torch.bool)
 
                 # IMPORTANT:
-                # Do not apply min_true_prob at the vectorized stage anymore,
-                # because the final threshold now depends on whether the node
-                # has a linear anchor, and that requires meta["node_id"].
-                keep_true = pred_is_true_vec
+                # We cannot pre-filter by pred_is_true anymore, because for
+                # nodes without anchors we want to keep samples with
+                # prob_true >= min_true_prob_no_anchor even when argmax != true.
+                #
+                # So consider all samples in the batch here and make
+                # the final keep decision after reading meta["node_id"].
+                keep_idx = torch.arange(bs, device=probs.device)
 
-                keep_refcall = torch.zeros_like(keep_true)
-                if (refcall_prob is not None) and (true_idx is not None):
-                    keep_refcall = (~pred_is_true_vec) & (prob_true_vec >= refcall_prob)
-
-                keep_mask = keep_true | keep_refcall
-                keep_idx = torch.nonzero(keep_mask, as_tuple=False).squeeze(1)
-
-                # move just what we need to CPU
                 keep_idx_cpu = keep_idx.detach().cpu().numpy()
                 prob_true_cpu = prob_true_vec.detach().cpu().numpy()
                 pred_is_true_cpu = pred_is_true_vec.detach().cpu().numpy()
@@ -987,7 +989,6 @@ def run_inference_and_build_vcfs(
                         missing_meta += 1
                         continue
 
-                    # Decide whether this node has an anchor
                     has_anchor = None
                     if anchors is not None:
                         try:
@@ -1003,10 +1004,10 @@ def run_inference_and_build_vcfs(
                     keep, filt = decide_keep_and_filter(
                         pred_is_true=pred_is_true,
                         prob_true=prob_true,
-                        min_true_prob=min_true_prob,
-                        refcall_prob=refcall_prob,
                         has_anchor=has_anchor,
+                        min_true_prob=min_true_prob,
                         min_true_prob_no_anchor=min_true_prob_no_anchor,
+                        refcall_prob=refcall_prob,
                     )
                     if not keep:
                         continue
@@ -1068,11 +1069,11 @@ def main():
 
     # Keep rules
     p.add_argument("--min_true_prob", type=float, default=0.5,
-                   help="Keep pred_class==true with prob>=this for nodes that HAVE anchors. Default: 0.5")
+                   help="Anchored nodes: require argmax=true and prob_true>=this. Default: 0.5")
     p.add_argument("--min_true_prob_no_anchor", type=float, default=0.3,
-                   help="Keep pred_class==true with prob>=this for nodes that DO NOT have anchors. Default: 0.3")
+                   help="Unanchored nodes: require prob_true>=this, even if argmax!=true. Default: 0.3")
     p.add_argument("--refcall_prob", type=float, default=None,
-                   help="Also keep pred_class!=true when prob>=this, FILTER=RefCall.")
+                   help="Optional extra RefCall retention threshold.")
 
     # v_pos convention
     p.add_argument("--pos_is_1based", action="store_true",
@@ -1095,11 +1096,11 @@ def main():
     p.add_argument("--node_start_is_1_based", type=lambda s: str(s).lower() in ("1", "true", "t", "yes", "y"), default=True,
                    help="Node starts in --map_json are 1-based (default: true).")
 
-    # New perf toggles
+    # Perf toggles
     p.add_argument("--gpu-normalize", action="store_true",
-                   help="Normalize on GPU (recommended). If not set, inputs must already be normalized or you accept raw.")
+                   help="Normalize on GPU (recommended). If not set, inputs remain raw.")
     p.add_argument("--amp", action="store_true",
-                   help="Use CUDA autocast (fp16) during inference (recommended on H100/A100).")
+                   help="Use CUDA autocast (fp16) during inference.")
 
     args = p.parse_args()
 
@@ -1110,7 +1111,6 @@ def main():
     if needs_map and not args.map_json:
         raise SystemExit("ERROR: --emit includes linear/ref, but --map_json was not provided.")
 
-    # Device
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -1120,7 +1120,6 @@ def main():
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Build model
     print(f"Loading Model from {args.ckpt}")
     print(f"depths={args.depths}, dims={args.dims}")
     model, genotype_map, in_channels = build_and_load_model(args.ckpt, device, args.depths, args.dims)
@@ -1133,7 +1132,6 @@ def main():
         except Exception as e:
             print(f"torch.compile not enabled: {e}")
 
-    # Determine true_idx
     true_idx = None
     if len(genotype_map) > 0:
         for cname, cidx in genotype_map.items():
@@ -1141,7 +1139,6 @@ def main():
                 true_idx = int(cidx)
                 break
 
-    # Resolve file list vs directory scan
     if args.file_list:
         files = read_file_list(args.file_list)
         print(f"Loaded {len(files)} paths from --file_list")
@@ -1157,7 +1154,6 @@ def main():
 
     print_data_info(files, args.mmap, args.sample_info_k)
 
-    # Decide input mode
     if args.input_mode == "auto":
         mode = detect_input_mode(files, mmap=args.mmap)
         print(f"Auto-detected input_mode={mode}")
@@ -1165,12 +1161,10 @@ def main():
         mode = args.input_mode
         print(f"Using input_mode={mode}")
 
-    # Load variant_summary (fast structure)
     if not os.path.isfile(args.variant_summary):
         raise SystemExit(f"variant_summary not found: {args.variant_summary}")
     vs_by_shard = load_variant_summary_by_shard_list(args.variant_summary)
 
-    # Load map + TSV (if needed)
     anchors: Dict[int, Tuple[str, int, str, int]] = {}
     nodes_seen: Set[int] = set()
     ref_nodes_with_af: Set[int] = set()
@@ -1188,7 +1182,6 @@ def main():
             alt_to_ref, tsv_ref_nodes, tsv_alt_nodes = load_alt_to_ref_tsv(args.tsv)
             print(f"TSV loaded: ALT->REF mappings={len(alt_to_ref)} (TSV REF nodes={len(tsv_ref_nodes)}, TSV ALT nodes={len(tsv_alt_nodes)})")
 
-    # Dataset & Loader
     print("Building Data Loader...")
     ds = NpyShardsDataset(
         files,
@@ -1212,7 +1205,6 @@ def main():
         prefetch_factor=prefetch_factor,
     )
 
-    # Infer + build node records
     t0 = time.time()
     node_records_all, total_inferred, kept, miss_meta = run_inference_and_build_vcfs(
         model=model,
@@ -1241,7 +1233,6 @@ def main():
     out_prefix = os.path.abspath(args.out_prefix)
     do_index = (not args.no_index)
 
-    # all (node-form)
     if "all" in args.emit:
         out_all = out_prefix + ".all.vcf.gz"
         gz, tbi = write_vcf_bgzip(
@@ -1255,7 +1246,6 @@ def main():
         )
         print(f"[all]   {gz}" + (f"  (index: {tbi})" if tbi else ""))
 
-    # ref (node-form subset)
     if "ref" in args.emit:
         if not ref_nodes_with_af:
             print("WARNING: --emit ref requested but ref_nodes_with_af is empty (check --map_json).", file=sys.stderr)
@@ -1281,7 +1271,6 @@ def main():
         )
         print(f"[ref]   {gz}" + (f"  (index: {tbi})" if tbi else "") + f"  (records={len(node_records_ref)})")
 
-    # linear (converted subset)
     if "linear" in args.emit:
         converted: List[Tuple[str, int, str, str, str, str, str, str]] = []
         unconverted_n = 0
