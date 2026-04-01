@@ -1071,7 +1071,7 @@ def main():
     p.add_argument("--min_true_prob", type=float, default=0.5,
                    help="Anchored nodes: require argmax=true and prob_true>=this. Default: 0.5")
     p.add_argument("--min_true_prob_no_anchor", type=float, default=0.1,
-                   help="Unanchored nodes: require prob_true>=this, even if argmax!=true. Default: 0.3")
+                   help="Unanchored nodes: require prob_true>=this, even if argmax!=true. Default: 0.1")
     p.add_argument("--refcall_prob", type=float, default=None,
                    help="Optional extra RefCall retention threshold.")
 
