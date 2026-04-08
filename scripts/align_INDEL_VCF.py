@@ -4,6 +4,12 @@ align_INDEL_VCF.py
 
 Strictly anchor Pansoma-style INDEL VCF against a linear FASTA.
 
+Updated:
+  - Sorts all output records by contig order in VCF header, then by position,
+    BEFORE writing final VCF and creating tabix index.
+  - This prevents index creation failure caused by reordered deletion records
+    (e.g. POS -> POS-1).
+
 Your requested behavior (exact):
   1) TYPE=I (insertion):
        - ALT must start with REF
@@ -115,6 +121,24 @@ def sanitize_info(rec: pysam.VariantRecord) -> Dict[str, Any]:
     return info
 
 
+def serialize_record_fields(rec: pysam.VariantRecord) -> Dict[str, Any]:
+    """Copy a record into plain Python fields so it can be sorted and re-written later."""
+    return {
+        "contig": rec.contig,
+        "start": rec.start,
+        "stop": rec.stop,
+        "id": rec.id,
+        "qual": rec.qual,
+        "alleles": tuple(rec.alleles),
+        "filter": list(rec.filter.keys()),
+        "info": dict(rec.info),
+        "samples": {
+            s: {k: rec.samples[s][k] for k in rec.samples[s].keys()}
+            for s in rec.samples
+        },
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description="Anchor Pansoma INDEL VCF against FASTA (strict rules).")
     ap.add_argument("--vcf", required=True, help="Input VCF(.gz)")
@@ -131,8 +155,13 @@ def main():
     invcf = pysam.VariantFile(args.vcf)
     fa = pysam.FastaFile(args.fasta)
 
+    out_header = make_header(invcf.header)
     contig_map = build_contig_mapper(list(invcf.header.contigs), list(fa.references))
-    outvcf = pysam.VariantFile(args.out, "wz", header=make_header(invcf.header))
+
+    contig_order = {name: i for i, name in enumerate(out_header.contigs)}
+    default_contig_rank = len(contig_order)
+
+    out_records: List[Dict[str, Any]] = []
 
     fixed = 0
     kept = 0
@@ -166,10 +195,8 @@ def main():
                     try:
                         ref = fetch_ref(fa, fasta_chrom, rec.pos, len(ref))
                     except Exception as e:
-                        # keep original but note it
                         logf.write(f"{chrom}\t{rec.pos}\t{ref_in}\t{alt_in}\t.\t.\t.\tWARN\tforce_ref_failed:{e}\n")
 
-                # Apply your rules
                 note = "ins_ok"
                 if not alt.startswith(ref):
                     alt = ref + alt
@@ -179,26 +206,27 @@ def main():
                         alt = ref + alt
                         note = "ins_alt_eq_ref_make_refref"
 
-                new = outvcf.new_record(
-                    contig=rec.contig,
-                    start=rec.start,
-                    stop=rec.start + len(ref),
-                    id=rec.id,
-                    qual=rec.qual,
-                    alleles=(ref, alt),
-                    filter=list(rec.filter.keys()),
-                    info=info,
-                )
-                for s in rec.samples:
-                    new.samples[s].update(rec.samples[s])
+                new = {
+                    "contig": rec.contig,
+                    "start": rec.start,
+                    "stop": rec.start + len(ref),
+                    "id": rec.id,
+                    "qual": rec.qual,
+                    "alleles": (ref, alt),
+                    "filter": list(rec.filter.keys()),
+                    "info": dict(info),
+                    "samples": {
+                        s: {k: rec.samples[s][k] for k in rec.samples[s].keys()}
+                        for s in rec.samples
+                    },
+                }
+                new["info"]["FIXED"] = True
+                new["info"]["FIXNOTE"] = note
 
-                # IMPORTANT: Always mark as FIXED for TYPE=I
-                new.info["FIXED"] = True
-                new.info["FIXNOTE"] = note
+                out_records.append(new)
+
                 fixed += 1
                 kept += 1
-                outvcf.write(new)
-
                 logf.write(f"{chrom}\t{rec.pos}\t{ref_in}\t{alt_in}\t{rec.pos}\t{ref}\t{alt}\tFIX_INS\t{note}\n")
                 continue
 
@@ -226,50 +254,82 @@ def main():
                 start0 = new_pos - 1
                 stop0 = start0 + len(new_ref)
 
-                new = outvcf.new_record(
-                    contig=rec.contig,
-                    start=start0,
-                    stop=stop0,
-                    id=rec.id,
-                    qual=rec.qual,
-                    alleles=(new_ref, new_alt),
-                    filter=list(rec.filter.keys()),
-                    info=info,
-                )
-                for s in rec.samples:
-                    new.samples[s].update(rec.samples[s])
+                new = {
+                    "contig": rec.contig,
+                    "start": start0,
+                    "stop": stop0,
+                    "id": rec.id,
+                    "qual": rec.qual,
+                    "alleles": (new_ref, new_alt),
+                    "filter": list(rec.filter.keys()),
+                    "info": dict(info),
+                    "samples": {
+                        s: {k: rec.samples[s][k] for k in rec.samples[s].keys()}
+                        for s in rec.samples
+                    },
+                }
+                new["info"]["FIXED"] = True
+                new["info"]["FIXNOTE"] = "del_add_left_base"
 
-                new.info["FIXED"] = True
-                new.info["FIXNOTE"] = "del_add_left_base"
+                out_records.append(new)
 
                 fixed += 1
                 kept += 1
-                outvcf.write(new)
-
                 logf.write(f"{chrom}\t{pos}\t{ref_in}\t{alt_in}\t{new_pos}\t{new_ref}\t{new_alt}\tFIX_DEL\tdel_add_left_base\n")
                 continue
 
             # ---------------- Other types: pass through ----------------
-            new = outvcf.new_record(
-                contig=rec.contig,
-                start=rec.start,
-                stop=rec.stop,
-                id=rec.id,
-                qual=rec.qual,
-                alleles=rec.alleles,
-                filter=list(rec.filter.keys()),
-                info=info,
-            )
-            for s in rec.samples:
-                new.samples[s].update(rec.samples[s])
+            new = {
+                "contig": rec.contig,
+                "start": rec.start,
+                "stop": rec.stop,
+                "id": rec.id,
+                "qual": rec.qual,
+                "alleles": tuple(rec.alleles),
+                "filter": list(rec.filter.keys()),
+                "info": dict(info),
+                "samples": {
+                    s: {k: rec.samples[s][k] for k in rec.samples[s].keys()}
+                    for s in rec.samples
+                },
+            }
 
-            outvcf.write(new)
+            out_records.append(new)
             kept += 1
             logf.write(f"{chrom}\t{rec.pos}\t{ref_in}\t{alt_in}\t{rec.pos}\t{rec.ref}\t{alt_in}\tKEEP\tunhandled_type:{vtype}\n")
 
-    outvcf.close()
     invcf.close()
     fa.close()
+
+    # -------- sort before write --------
+    out_records.sort(
+        key=lambda r: (
+            contig_order.get(r["contig"], default_contig_rank),
+            r["start"],
+            r["stop"],
+            r["alleles"][0],
+            r["alleles"][1] if len(r["alleles"]) > 1 else ""
+        )
+    )
+
+    outvcf = pysam.VariantFile(args.out, "wz", header=out_header)
+
+    for r in out_records:
+        new_rec = outvcf.new_record(
+            contig=r["contig"],
+            start=r["start"],
+            stop=r["stop"],
+            id=r["id"],
+            qual=r["qual"],
+            alleles=r["alleles"],
+            filter=r["filter"],
+            info=r["info"],
+        )
+        for s, sample_data in r["samples"].items():
+            new_rec.samples[s].update(sample_data)
+        outvcf.write(new_rec)
+
+    outvcf.close()
 
     if not args.no_index:
         pysam.tabix_index(args.out, preset="vcf", force=True)
