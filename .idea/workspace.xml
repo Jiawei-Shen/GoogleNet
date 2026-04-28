@@ -4,9 +4,8 @@
     <option name="autoReloadType" value="ALL" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="8da3181b-7f23-4ab2-b5ab-9300d9b110e8" name="Changes" comment="">
+    <list default="true" id="8da3181b-7f23-4ab2-b5ab-9300d9b110e8" name="Changes" comment="Update">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/scripts/train_5channels_npy_pansoma.py" beforeDir="false" afterPath="$PROJECT_DIR$/scripts/train_5channels_npy_pansoma.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -79,11 +78,24 @@
       <option name="presentableId" value="Default" />
       <updated>1775764264926</updated>
       <workItem from="1775764265930" duration="3191000" />
-      <workItem from="1777391815675" duration="3522000" />
+      <workItem from="1777391815675" duration="7571000" />
     </task>
+    <task id="LOCAL-00001" summary="Update">
+      <option name="closed" value="true" />
+      <created>1777396021789</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1777396021789</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="Update" />
+    <option name="LAST_COMMIT_MESSAGE" value="Update" />
   </component>
 </project>
