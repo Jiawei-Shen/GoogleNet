@@ -287,25 +287,38 @@ def load_variant_summary_by_shard_list(ndjson_path: str) -> Dict[int, List[Optio
 
 # ------------------------ TSV (ALT->REF) mapping ------------------------ #
 
-_SHARD_BASENAME_RE = re.compile(r"(?:^|/)(?:shard_)?(?P<idx>\d+)(?:_data)?\.npy$", re.IGNORECASE)
+# Classic names: shard_00001_data.npy / 00001_data.npy / 00001.npy
+_SHARD_CLASSIC_RE = re.compile(r"^(?:shard[_-]?)?(?P<idx>\d+)(?:_data)?\.npy$", re.IGNORECASE)
+
+# Prefixed names: HG008T_PacBio_chr1_00001_data.npy
+_TRAILING_ID_RE = re.compile(r"_(?P<idx>\d+)(?:_(?:data|labels))\.npy$", re.IGNORECASE)
 
 def shard_index_from_path(shard_path: str) -> Optional[int]:
     if not shard_path:
         return None
     bn = os.path.basename(str(shard_path))
-    m = _SHARD_BASENAME_RE.search(bn)
-    if not m:
-        m2 = re.search(r"(\d+)", bn)
-        if not m2:
-            return None
+
+    m = _SHARD_CLASSIC_RE.match(bn)
+    if m:
         try:
-            return int(m2.group(1))
+            return int(m.group("idx"))
         except Exception:
             return None
-    try:
-        return int(m.group("idx"))
-    except Exception:
-        return None
+
+    m = _TRAILING_ID_RE.search(bn)
+    if m:
+        try:
+            return int(m.group("idx"))
+        except Exception:
+            return None
+
+    nums = re.findall(r"(\d+)", bn)
+    if nums:
+        try:
+            return int(nums[-1])
+        except Exception:
+            return None
+    return None
 
 
 def load_alt_to_ref_tsv(tsv_path: Optional[str]) -> Tuple[Dict[int, int], Set[int], Set[int]]:
