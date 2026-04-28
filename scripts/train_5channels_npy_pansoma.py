@@ -19,24 +19,19 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from tqdm import tqdm
 
-# ---- env + backend knobs (helps speed) ----
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 torch.backends.cudnn.benchmark = True
 
-# local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from mynet import ConvNeXtCBAMClassifier  # noqa: E402
 
-# Globals updated in __main__ with DDP
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-IS_MAIN_PROCESS = True  # rank-0 logging only
+IS_MAIN_PROCESS = True
 
-# Normalization tensors (created once after device is set)
 NORM_MEAN = None
 NORM_STD = None
 
 
-# ---------------- Losses ----------------
 class MultiClassFocalLoss(nn.Module):
     def __init__(self, gamma=2.0, weight=None, reduction='mean'):
         super().__init__()
@@ -74,7 +69,6 @@ class CombinedFocalWeightedCELoss(nn.Module):
         return focal_weight * self.focal_loss(logits, targets) + wce_weight * self.wce_loss(logits, targets)
 
 
-# ---------------- Utils ----------------
 def init_weights(m):
     if isinstance(m, (nn.Conv2d, nn.Linear)):
         nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -113,18 +107,7 @@ def _unique_path(path: str) -> str:
     return cand
 
 
-# ---------------- Shard discovery ----------------
 def _discover_shards_for_root(root):
-    """
-    root: sharded dataset root
-    Expects:
-      root/train/..._data.npy
-      root/train/..._labels.npy
-      root/val/..._data.npy
-      root/val/..._labels.npy
-    Returns:
-      train_shards, val_shards (lists of dicts)
-    """
     train_dir = os.path.join(root, "train")
     val_dir = os.path.join(root, "val")
 
@@ -152,10 +135,6 @@ def _discover_shards_for_root(root):
 
 
 def _discover_all_shards(roots):
-    """
-    roots: list of sharded_npy roots
-    Returns: all_train_shards, all_val_shards, genotype_map
-    """
     all_train = []
     all_val = []
     for r in roots:
@@ -167,14 +146,7 @@ def _discover_all_shards(roots):
     return all_train, all_val, genotype_map
 
 
-# ---------------- Shard prefetcher & iterators ----------------
 class ShardPrefetcher:
-    """
-    Background prefetcher:
-      - Loads each shard into memory (mmap) in a background thread.
-      - Main thread consumes (local_idx, shard_dict, x_np, y_np).
-    """
-
     def __init__(self, shard_specs, max_prefetch: int = 2):
         self.shard_specs = list(shard_specs)
         self.max_prefetch = max_prefetch
@@ -188,10 +160,8 @@ class ShardPrefetcher:
             for local_order_idx, shard in enumerate(self.shard_specs):
                 if self._stop:
                     break
-                x_path = shard["x_path"]
-                y_path = shard["y_path"]
-                x_np = np.load(x_path, mmap_mode="r")
-                y_np = np.load(y_path, mmap_mode="r")
+                x_np = np.load(shard["x_path"], mmap_mode="r")
+                y_np = np.load(shard["y_path"], mmap_mode="r")
                 self._queue.put((local_order_idx, shard, x_np, y_np))
             self._queue.put(None)
         except Exception as e:
@@ -232,10 +202,6 @@ def _iter_sharded_batches(
     max_steps: int = None,
     do_normalize: bool = True,
 ):
-    """
-    Non-DDP iterator over shards for this process.
-    Uses ShardPrefetcher to overlap np.load of next shard with training on current shard.
-    """
     num_shards = len(shards)
     if num_shards == 0:
         return
@@ -275,6 +241,7 @@ def _iter_sharded_batches(
                     if drop_last:
                         break
                     end = n
+
                 batch_idx = idx[start:end]
 
                 batch_x_np = x_np[batch_idx]
@@ -312,9 +279,6 @@ def _iter_sharded_batches_ddp(
     max_steps: int = None,
     do_normalize: bool = True,
 ):
-    """
-    DDP-aware shard iterator.
-    """
     num_shards = len(shards)
     if num_shards == 0:
         return
@@ -364,6 +328,7 @@ def _iter_sharded_batches_ddp(
                     if drop_last:
                         break
                     end = n
+
                 batch_idx = idx[start:end]
 
                 batch_x_np = x_np[batch_idx]
@@ -388,17 +353,18 @@ def _iter_sharded_batches_ddp(
         prefetcher.close()
 
 
-# ---------------- Eval ----------------
-def evaluate_model(model,
-                   data_iter,
-                   criterion,
-                   genotype_map,
-                   log_file,
-                   loss_type,
-                   current_lr,
-                   ddp=False,
-                   world_size=1,
-                   collect_infer=False):
+def evaluate_model(
+    model,
+    data_iter,
+    criterion,
+    genotype_map,
+    log_file,
+    loss_type,
+    current_lr,
+    ddp=False,
+    world_size=1,
+    collect_infer=False,
+):
     model.eval()
     num_classes = len(genotype_map) if genotype_map else 0
 
@@ -414,7 +380,6 @@ def evaluate_model(model,
 
     batch_count_eval = 0
     inference_results = defaultdict(list) if collect_infer else {}
-    idx_to_class = {v: k for k, v in genotype_map.items()} if genotype_map else {}
 
     with torch.no_grad():
         for batch in data_iter:
@@ -441,7 +406,9 @@ def evaluate_model(model,
             for i in range(labels.size(0)):
                 pred_idx = int(predicted[i])
                 true_idx = int(labels[i])
+
                 class_total_counts[true_idx] += 1
+
                 if pred_idx == true_idx:
                     class_correct_counts[true_idx] += 1
                     tp[true_idx] += 1
@@ -449,9 +416,6 @@ def evaluate_model(model,
                     if pred_idx < num_classes:
                         fp[pred_idx] += 1
                     fn[true_idx] += 1
-
-                if collect_infer and genotype_map:
-                    pass
 
     if ddp and world_size > 1 and dist.is_initialized():
         dist.all_reduce(correct_eval, op=dist.ReduceOp.SUM)
@@ -475,7 +439,10 @@ def evaluate_model(model,
             total_c = int(class_total_counts[class_idx].item())
             acc_c = (correct_c / total_c * 100.0) if total_c > 0 else 0.0
             class_performance_stats[class_name] = {
-                'acc': acc_c, 'correct': correct_c, 'total': total_c, 'idx': class_idx
+                'acc': acc_c,
+                'correct': correct_c,
+                'total': total_c,
+                'idx': class_idx,
             }
 
     pos_idx = None
@@ -484,6 +451,7 @@ def evaluate_model(model,
             if str(name).lower() == "true":
                 pos_idx = idx
                 break
+
     if pos_idx is None:
         pos_idx = 1 if num_classes > 1 else 0
 
@@ -493,7 +461,11 @@ def evaluate_model(model,
 
     precision_true = (tpc / (tpc + fpc)) if (tpc + fpc) > 0 else 0.0
     recall_true = (tpc / (tpc + fnc)) if (tpc + fnc) > 0 else 0.0
-    f1_true = (2 * precision_true * recall_true / (precision_true + recall_true)) if (precision_true + recall_true) > 0 else 0.0
+    f1_true = (
+        2 * precision_true * recall_true / (precision_true + recall_true)
+        if (precision_true + recall_true) > 0
+        else 0.0
+    )
 
     metrics = {
         'precision_true': precision_true,
@@ -501,31 +473,34 @@ def evaluate_model(model,
         'f1_true': f1_true,
         'pos_class_idx': pos_idx,
     }
+
     return avg_loss_eval, overall_accuracy_eval, class_performance_stats, inference_results, metrics
 
 
-# ---------------- Train ----------------
-def train_model_sharded(train_shards,
-                        val_shards,
-                        output_path,
-                        save_val_results=False,
-                        num_epochs=100,
-                        learning_rate=1e-4,
-                        batch_size=32,
-                        loss_type='weighted_ce',
-                        warmup_epochs=10,
-                        weight_decay=0.05,
-                        depths=None,
-                        dims=None,
-                        training_data_ratio=1.0,
-                        ddp=False,
-                        world_size=1,
-                        rank=0,
-                        resume=None,
-                        pos_weight=88.0,
-                        genotype_map=None):
+def train_model_sharded(
+    train_shards,
+    val_shards,
+    output_path,
+    save_val_results=False,
+    num_epochs=100,
+    learning_rate=1e-4,
+    batch_size=32,
+    loss_type='weighted_ce',
+    warmup_epochs=10,
+    weight_decay=0.05,
+    depths=None,
+    dims=None,
+    training_data_ratio=1.0,
+    ddp=False,
+    world_size=1,
+    rank=0,
+    resume=None,
+    pos_weight=88.0,
+    genotype_map=None,
+):
     os.makedirs(output_path, exist_ok=True)
     log_file = os.path.join(output_path, "training_log_5ch_sharded.txt")
+
     if os.path.exists(log_file) and IS_MAIN_PROCESS:
         os.remove(log_file)
 
@@ -536,21 +511,26 @@ def train_model_sharded(train_shards,
 
     if genotype_map is None:
         genotype_map = {"false": 0, "true": 1}
+
     num_classes = len(genotype_map)
 
     print_and_log(f"Using device: {device}", log_file)
     print_and_log(f"Initial Learning Rate: {learning_rate:.1e}", log_file)
-    print_and_log(f"[Sharded NPY mode] #train_shards={len(train_shards)}, #val_shards={len(val_shards)}", log_file)
+    print_and_log(
+        f"[Sharded NPY mode] #train_shards={len(train_shards)}, #val_shards={len(val_shards)}",
+        log_file,
+    )
 
     approx_used_global_batches = None
 
     if train_shards:
         approx_train_samples = sum(int(s["num_samples"]) for s in train_shards)
         approx_batches = approx_train_samples // (batch_size * max(1, world_size))
+
         print_and_log(
             f"  Approx total train samples: {approx_train_samples:,} "
             f"({approx_batches:,} global batches @ batch_size={batch_size})",
-            log_file
+            log_file,
         )
 
         approx_used_global_batches = max(1, approx_batches)
@@ -558,26 +538,25 @@ def train_model_sharded(train_shards,
         if training_data_ratio < 1.0:
             approx_used_samples = int(approx_train_samples * training_data_ratio)
             approx_used_global_batches = max(
-                1, approx_used_samples // (batch_size * max(1, world_size))
+                1,
+                approx_used_samples // (batch_size * max(1, world_size)),
             )
+
             print_and_log(
                 f"  training_data_ratio={training_data_ratio:.3f} -> "
                 f"~{approx_used_samples:,} samples, ~{approx_used_global_batches:,} global batches per epoch "
                 f"(assuming shards are similar size)",
-                log_file
+                log_file,
             )
-    else:
-        approx_used_global_batches = None
 
     print_and_log(f"Number of classes: {num_classes}", log_file)
     print_and_log(f"depths={depths}, dims={dims}. \n", log_file)
 
-    # ---- Model / parallelism ----
     model = ConvNeXtCBAMClassifier(
         in_channels=5,
         class_num=num_classes,
         depths=depths,
-        dims=dims
+        dims=dims,
     ).to(device)
 
     if ddp:
@@ -592,16 +571,22 @@ def train_model_sharded(train_shards,
 
     model.apply(init_weights)
 
-    # ---- Loss / Optim / Sched ----
     pos_weight_value = float(pos_weight)
     class_weights = torch.ones(num_classes, device=device, dtype=torch.float32)
+
     if num_classes >= 2:
         class_weights[1] = pos_weight_value
 
-    print_and_log(f"Class weights: {class_weights.tolist()} (from --pos_weight={pos_weight_value})", log_file)
+    print_and_log(
+        f"Class weights: {class_weights.tolist()} (from --pos_weight={pos_weight_value})",
+        log_file,
+    )
 
     if loss_type == "combined":
-        criterion = CombinedFocalWeightedCELoss(initial_lr=learning_rate, pos_weight=class_weights)
+        criterion = CombinedFocalWeightedCELoss(
+            initial_lr=learning_rate,
+            pos_weight=class_weights,
+        )
         print_and_log("Using Combined(Focal + Weighted CE) Loss.", log_file)
     elif loss_type == "weighted_ce":
         criterion = nn.CrossEntropyLoss(weight=class_weights)
@@ -609,17 +594,32 @@ def train_model_sharded(train_shards,
     else:
         raise ValueError(f"Unsupported loss_type: {loss_type}")
 
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
-    main_scheduler = CosineAnnealingLR(optimizer, T_max=max(1, num_epochs - warmup_epochs), eta_min=0)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=0.01,
+        total_iters=warmup_epochs,
+    )
+
+    main_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, num_epochs - warmup_epochs),
+        eta_min=0,
+    )
+
     scheduler = SequentialLR(
         optimizer,
         schedulers=[warmup_scheduler, main_scheduler],
-        milestones=[warmup_epochs]
+        milestones=[warmup_epochs],
     )
 
-    # ---- Resume ----
     start_epoch = 0
+
     best_epoch = 0
     best_f1_true = float("-inf")
     best_val_acc = float("-inf")
@@ -627,9 +627,17 @@ def train_model_sharded(train_shards,
     best_rec_true = 0.0
     last_best_ckpt_path = None
 
+    best_recall_epoch = 0
+    best_recall_true = float("-inf")
+    best_recall_f1_true = 0.0
+    best_recall_val_acc = float("-inf")
+    best_recall_val_loss = float("inf")
+    last_best_recall_ckpt_path = None
+
     if resume is not None and os.path.isfile(resume):
         try:
             checkpoint = torch.load(resume, map_location=device)
+
             ckpt_in_channels = checkpoint.get("in_channels", None)
             if ckpt_in_channels is not None and int(ckpt_in_channels) != 5:
                 raise ValueError(
@@ -637,25 +645,37 @@ def train_model_sharded(train_shards,
                 )
 
             _load_state_dict(model, checkpoint['model_state_dict'])
+
             if 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
             if 'scheduler_state_dict' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
             start_epoch = int(checkpoint.get('epoch', 0))
+
             best_f1_true = float(checkpoint.get('best_f1_true', best_f1_true))
             best_rec_true = float(checkpoint.get('best_rec_true', best_rec_true))
             best_val_acc = float(checkpoint.get('best_val_acc', best_val_acc))
             best_val_loss = float(checkpoint.get('best_val_loss', best_val_loss))
             best_epoch = int(checkpoint.get('epoch', best_epoch))
+
+            best_recall_true = float(checkpoint.get('best_recall_true', best_recall_true))
+            best_recall_f1_true = float(checkpoint.get('best_recall_f1_true', best_recall_f1_true))
+            best_recall_val_acc = float(checkpoint.get('best_recall_val_acc', best_recall_val_acc))
+            best_recall_val_loss = float(checkpoint.get('best_recall_val_loss', best_recall_val_loss))
+            best_recall_epoch = int(checkpoint.get('best_recall_epoch', best_recall_epoch))
+
             print_and_log(f"Resumed from '{resume}' at epoch {start_epoch}.", log_file)
+
         except Exception as e:
             print_and_log(f"WARNING: Failed to load checkpoint '{resume}': {e}", log_file)
 
     sorted_class_names_from_map = sorted(genotype_map.keys(), key=lambda k: genotype_map[k])
 
-    # ---- Train loop ----
     for epoch in range(start_epoch, num_epochs):
         model.train()
+
         running_loss = 0.0
         correct_train = 0
         total_train = 0
@@ -707,7 +727,7 @@ def train_model_sharded(train_shards,
             desc=desc,
             total=total_local,
             leave=True,
-            disable=not IS_MAIN_PROCESS
+            disable=not IS_MAIN_PROCESS,
         ) as progress_bar:
             for images, labels in progress_bar:
                 optimizer.zero_grad(set_to_none=True)
@@ -743,6 +763,7 @@ def train_model_sharded(train_shards,
 
                 running_loss += loss.item()
                 batch_count += 1
+
                 _, predicted = torch.max(outputs_for_acc, 1)
                 correct_train += (predicted == labels).sum().item()
                 total_train += labels.size(0)
@@ -750,13 +771,14 @@ def train_model_sharded(train_shards,
                 if IS_MAIN_PROCESS and total_train > 0 and batch_count > 0:
                     avg_loss_train = running_loss / batch_count
                     avg_acc_train = (correct_train / total_train) * 100.0
-                    progress_bar.set_postfix(loss=f"{avg_loss_train:.4f}",
-                                             acc=f"{avg_acc_train:.2f}%")
+                    progress_bar.set_postfix(
+                        loss=f"{avg_loss_train:.4f}",
+                        acc=f"{avg_acc_train:.2f}%",
+                    )
 
         epoch_train_loss = (running_loss / batch_count) if batch_count > 0 else 0.0
         epoch_train_acc = (correct_train / max(1, total_train)) * 100.0
 
-        # ---- Validation ----
         if val_shards:
             if ddp and world_size > 1:
                 if IS_MAIN_PROCESS:
@@ -782,16 +804,20 @@ def train_model_sharded(train_shards,
                         current_lr,
                         ddp=False,
                         world_size=1,
-                        collect_infer=save_val_results
+                        collect_infer=save_val_results,
                     )
                 else:
                     val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = (
-                        0.0, 0.0, {}, {}, {
+                        0.0,
+                        0.0,
+                        {},
+                        {},
+                        {
                             'precision_true': 0.0,
                             'recall_true': 0.0,
                             'f1_true': 0.0,
-                            'pos_class_idx': None
-                        }
+                            'pos_class_idx': None,
+                        },
                     )
             else:
                 val_iter = _iter_sharded_batches(
@@ -816,16 +842,20 @@ def train_model_sharded(train_shards,
                     current_lr,
                     ddp=False,
                     world_size=1,
-                    collect_infer=save_val_results
+                    collect_infer=save_val_results,
                 )
         else:
             val_loss, val_acc, class_stats_val, val_infer_lists, val_metrics = (
-                0.0, 0.0, {}, {}, {
+                0.0,
+                0.0,
+                {},
+                {},
+                {
                     'precision_true': 0.0,
                     'recall_true': 0.0,
                     'f1_true': 0.0,
-                    'pos_class_idx': None
-                }
+                    'pos_class_idx': None,
+                },
             )
 
         if IS_MAIN_PROCESS and class_stats_val:
@@ -833,9 +863,9 @@ def train_model_sharded(train_shards,
             for class_name in sorted_class_names_from_map:
                 s = class_stats_val.get(class_name, {})
                 print_and_log(
-                    f"  {class_name} (idx {s.get('idx','N/A')}): "
-                    f"{s.get('acc',0):.2f}% ({s.get('correct',0)}/{s.get('total',0)})",
-                    log_file
+                    f"  {class_name} (idx {s.get('idx', 'N/A')}): "
+                    f"{s.get('acc', 0):.2f}% ({s.get('correct', 0)}/{s.get('total', 0)})",
+                    log_file,
                 )
 
         val_prec_true = val_metrics.get('precision_true', 0.0)
@@ -849,29 +879,50 @@ def train_model_sharded(train_shards,
             f"| Val Loss {val_loss:.4f} Acc {val_acc:.2f}% "
             f"| Prec(true) {val_prec_true*100:.2f}% Rec(true) {val_rec_true*100:.2f}% "
             f"F1(true) {val_f1_true:.4f} "
-            f"(LR {current_lr:.1e}{', pos_idx='+str(pos_idx) if pos_idx is not None else ''})",
-            log_file
+            f"(LR {current_lr:.1e}{', pos_idx=' + str(pos_idx) if pos_idx is not None else ''})",
+            log_file,
         )
 
-        improved = (
-            (val_f1_true > best_f1_true) or
-            (val_f1_true == best_f1_true and val_rec_true > best_rec_true) or
-            (val_f1_true == best_f1_true and val_rec_true == best_rec_true and val_loss < best_val_loss)
+        improved_f1 = (
+            (val_f1_true > best_f1_true)
+            or (val_f1_true == best_f1_true and val_rec_true > best_rec_true)
+            or (
+                val_f1_true == best_f1_true
+                and val_rec_true == best_rec_true
+                and val_loss < best_val_loss
+            )
+        )
+
+        improved_recall = (
+            (val_rec_true > best_recall_true)
+            or (val_rec_true == best_recall_true and val_f1_true > best_recall_f1_true)
+            or (
+                val_rec_true == best_recall_true
+                and val_f1_true == best_recall_f1_true
+                and val_loss < best_recall_val_loss
+            )
         )
 
         if (epoch + 1) == MIN_SAVE_EPOCH and IS_MAIN_PROCESS:
-            snap_path = _unique_path(os.path.join(output_path, f"model_epoch_{MIN_SAVE_EPOCH}.pth"))
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': _state_dict(model),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'genotype_map': genotype_map,
-                'in_channels': 5
-            }, snap_path)
+            snap_path = _unique_path(
+                os.path.join(output_path, f"model_epoch_{MIN_SAVE_EPOCH}.pth")
+            )
+
+            torch.save(
+                {
+                    'epoch': epoch + 1,
+                    'model_state_dict': _state_dict(model),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'genotype_map': genotype_map,
+                    'in_channels': 5,
+                },
+                snap_path,
+            )
+
             print_and_log(f"Snapshot saved at epoch {epoch + 1}: {snap_path}", log_file)
 
-        if (epoch + 1) >= MIN_SAVE_EPOCH and improved and IS_MAIN_PROCESS:
+        if (epoch + 1) >= MIN_SAVE_EPOCH and improved_f1 and IS_MAIN_PROCESS:
             best_f1_true = val_f1_true
             best_rec_true = val_rec_true
             best_val_acc = val_acc
@@ -879,8 +930,12 @@ def train_model_sharded(train_shards,
             best_epoch = epoch + 1
 
             best_path = _unique_path(
-                os.path.join(output_path, f"model_e{best_epoch:03d}_f1_{best_f1_true:.4f}.pth")
+                os.path.join(
+                    output_path,
+                    f"model_e{best_epoch:03d}_f1_{best_f1_true:.4f}.pth",
+                )
             )
+
             payload = {
                 'epoch': best_epoch,
                 'model_state_dict': _state_dict(model),
@@ -893,87 +948,189 @@ def train_model_sharded(train_shards,
                 'best_val_acc': best_val_acc,
                 'best_val_loss': best_val_loss,
             }
+
             torch.save(payload, best_path)
             last_best_ckpt_path = best_path
+
             print_and_log(
-                f"New BEST @epoch {best_epoch}: F1(true) {best_f1_true:.4f} | "
+                f"New BEST F1 @epoch {best_epoch}: F1(true) {best_f1_true:.4f} | "
                 f"Rec(true) {best_rec_true*100:.2f}% | Val Acc {best_val_acc:.2f}% | "
                 f"Val Loss {best_val_loss:.4f}. Saved: {best_path}",
-                log_file
+                log_file,
             )
 
             if save_val_results:
                 result_path = _unique_path(
-                    os.path.join(output_path, f"validation_results_e{best_epoch:03d}_f1_{best_f1_true:.4f}.json")
+                    os.path.join(
+                        output_path,
+                        f"validation_results_e{best_epoch:03d}_f1_{best_f1_true:.4f}.json",
+                    )
                 )
+
                 try:
                     with open(result_path, 'w') as f:
-                        json.dump({
-                            'epoch': best_epoch,
-                            'f1_true': best_f1_true,
-                            'recall_true': best_rec_true,
-                            'val_acc': best_val_acc,
-                            'val_loss': best_val_loss,
-                            'inference_results': val_infer_lists
-                        }, f, indent=4)
-                    print_and_log(f"Saved best validation results to {result_path}", log_file)
+                        json.dump(
+                            {
+                                'epoch': best_epoch,
+                                'f1_true': best_f1_true,
+                                'recall_true': best_rec_true,
+                                'val_acc': best_val_acc,
+                                'val_loss': best_val_loss,
+                                'inference_results': val_infer_lists,
+                            },
+                            f,
+                            indent=4,
+                        )
+
+                    print_and_log(f"Saved best F1 validation results to {result_path}", log_file)
+
                 except Exception as e:
-                    print_and_log(f"Error saving best validation results: {e}", log_file)
+                    print_and_log(f"Error saving best F1 validation results: {e}", log_file)
+
+        if (epoch + 1) >= MIN_SAVE_EPOCH and improved_recall and IS_MAIN_PROCESS:
+            best_recall_true = val_rec_true
+            best_recall_f1_true = val_f1_true
+            best_recall_val_acc = val_acc
+            best_recall_val_loss = val_loss
+            best_recall_epoch = epoch + 1
+
+            best_recall_path = _unique_path(
+                os.path.join(
+                    output_path,
+                    f"model_e{best_recall_epoch:03d}_recall_{best_recall_true:.4f}.pth",
+                )
+            )
+
+            payload = {
+                'epoch': best_recall_epoch,
+                'model_state_dict': _state_dict(model),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'genotype_map': genotype_map,
+                'in_channels': 5,
+                'best_recall_true': best_recall_true,
+                'best_recall_f1_true': best_recall_f1_true,
+                'best_recall_val_acc': best_recall_val_acc,
+                'best_recall_val_loss': best_recall_val_loss,
+                'best_recall_epoch': best_recall_epoch,
+            }
+
+            torch.save(payload, best_recall_path)
+            last_best_recall_ckpt_path = best_recall_path
+
+            print_and_log(
+                f"New BEST Recall @epoch {best_recall_epoch}: "
+                f"Rec(true) {best_recall_true*100:.2f}% | "
+                f"F1(true) {best_recall_f1_true:.4f} | "
+                f"Val Acc {best_recall_val_acc:.2f}% | "
+                f"Val Loss {best_recall_val_loss:.4f}. Saved: {best_recall_path}",
+                log_file,
+            )
+
+            if save_val_results:
+                result_path = _unique_path(
+                    os.path.join(
+                        output_path,
+                        f"validation_results_e{best_recall_epoch:03d}_recall_{best_recall_true:.4f}.json",
+                    )
+                )
+
+                try:
+                    with open(result_path, 'w') as f:
+                        json.dump(
+                            {
+                                'epoch': best_recall_epoch,
+                                'recall_true': best_recall_true,
+                                'f1_true': best_recall_f1_true,
+                                'val_acc': best_recall_val_acc,
+                                'val_loss': best_recall_val_loss,
+                                'inference_results': val_infer_lists,
+                            },
+                            f,
+                            indent=4,
+                        )
+
+                    print_and_log(f"Saved best Recall validation results to {result_path}", log_file)
+
+                except Exception as e:
+                    print_and_log(f"Error saving best Recall validation results: {e}", log_file)
 
         scheduler.step()
         print_and_log("-" * 30, log_file)
 
         del train_iter
+
         if val_shards and (not ddp or world_size == 1 or IS_MAIN_PROCESS):
             del val_iter
+
         gc.collect()
 
     final_msg = (
-        f"Training complete. Best epoch: {best_epoch} "
-        f"| F1(true) {best_f1_true:.4f} | Rec(true) {best_rec_true*100:.2f}% "
-        f"| Val Acc {best_val_acc:.2f}% | Val Loss {best_val_loss:.4f}. "
-        f"{'Best model: ' + last_best_ckpt_path if last_best_ckpt_path else 'No best checkpoint saved.'}"
+        f"Training complete. "
+        f"Best F1 epoch: {best_epoch} | F1(true) {best_f1_true:.4f} | "
+        f"Rec(true) {best_rec_true*100:.2f}% | Val Acc {best_val_acc:.2f}% | "
+        f"Val Loss {best_val_loss:.4f}. "
+        f"{'Best F1 model: ' + last_best_ckpt_path if last_best_ckpt_path else 'No best F1 checkpoint saved.'} "
+        f"\nBest Recall epoch: {best_recall_epoch} | Rec(true) {best_recall_true*100:.2f}% | "
+        f"F1(true) {best_recall_f1_true:.4f} | Val Acc {best_recall_val_acc:.2f}% | "
+        f"Val Loss {best_recall_val_loss:.4f}. "
+        f"{'Best Recall model: ' + last_best_recall_ckpt_path if last_best_recall_ckpt_path else 'No best Recall checkpoint saved.'}"
     )
+
     print_and_log(final_msg, log_file)
 
 
-# ---------------- Main ----------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train ConvNeXtCBAM on 5-channel sharded .npy dataset (DDP-friendly, shard prefetching)."
+        description="Train ConvNeXtCBAM on 5-channel sharded .npy dataset."
     )
 
-    parser.add_argument("--data_paths", type=str, nargs='+', default=None,
-                        help="Sharded NPY roots. Each should contain train/ and val/ with *_data.npy and *_labels.npy.")
-    parser.add_argument("-o", "--output_path", default="./saved_models_5channel_sharded", type=str,
-                        help="Path to save model")
+    parser.add_argument(
+        "--data_paths",
+        type=str,
+        nargs='+',
+        default=None,
+        help="Sharded NPY roots. Each should contain train/ and val/ with *_data.npy and *_labels.npy.",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output_path",
+        default="./saved_models_5channel_sharded",
+        type=str,
+        help="Path to save model",
+    )
+
     parser.add_argument("--depths", type=int, nargs='+', default=[3, 3, 27, 3])
     parser.add_argument("--dims", type=int, nargs='+', default=[192, 384, 768, 1536])
     parser.add_argument("--epochs", type=int, default=70)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=32)
 
-    parser.add_argument("--num_workers", type=int, default=0,
-                        help="Unused in sharded mode; present for compatibility.")
-    parser.add_argument("--prefetch_factor", type=int, default=4,
-                        help="Unused in sharded mode; present for compatibility.")
-    parser.add_argument("--mp_context", type=str, default=None,
-                        choices=[None, "fork", "forkserver", "spawn"],
-                        help="Unused in sharded mode; present for compatibility.")
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument(
+        "--mp_context",
+        type=str,
+        default=None,
+        choices=[None, "fork", "forkserver", "spawn"],
+    )
 
     parser.add_argument("--warmup_epochs", type=int, default=3)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--save_val_results", action='store_true')
-    parser.add_argument("--loss_type", type=str, default="weighted_ce",
-                        choices=["combined", "weighted_ce"])
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="weighted_ce",
+        choices=["combined", "weighted_ce"],
+    )
 
     parser.add_argument("--training_data_ratio", type=float, default=1.0)
 
     parser.add_argument("--ddp", action="store_true")
-    parser.add_argument("--data_parallel", action="store_true",
-                        help="Ignored in shard mode; use --ddp instead.")
-    parser.add_argument("--local_rank", type=int, default=None,
-                        help="Torch launcher may pass this, but we mostly use LOCAL_RANK env.")
+    parser.add_argument("--data_parallel", action="store_true")
+    parser.add_argument("--local_rank", type=int, default=None)
 
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--pos_weight", type=float, default=88.0)
@@ -985,11 +1142,12 @@ if __name__ == "__main__":
 
     roots = [os.path.abspath(os.path.expanduser(p)) for p in args.data_paths]
 
-    # DDP init
     if args.ddp:
         if not torch.cuda.is_available():
             raise RuntimeError("DDP requires CUDA available.")
+
         local_rank_env = os.environ.get("LOCAL_RANK", None)
+
         if local_rank_env is None:
             local_rank = 0 if args.local_rank is None else int(args.local_rank)
         else:
@@ -997,34 +1155,52 @@ if __name__ == "__main__":
 
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+
         dist.init_process_group(backend="nccl", init_method="env://")
+
         world_size = dist.get_world_size()
         rank = dist.get_rank()
-        IS_MAIN_PROCESS = (rank == 0)
+        IS_MAIN_PROCESS = rank == 0
+
         if IS_MAIN_PROCESS:
             print(f"[DDP] World size={world_size} | Local rank={local_rank} | Global rank={rank}")
+
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         world_size = 1
         rank = 0
         IS_MAIN_PROCESS = True
 
-    # Replace these with recomputed 5-channel stats if available.
     NORM_MEAN = torch.tensor(
         [18.41781616, 12.64912987, -0.54525274, 24.72385406, 4.69061136],
-        device=device, dtype=torch.float32
+        device=device,
+        dtype=torch.float32,
     ).view(1, 5, 1, 1)
+
     NORM_STD = torch.tensor(
         [25.02832222, 14.80963230, 0.61813378, 29.97283554, 7.92317915],
-        device=device, dtype=torch.float32
+        device=device,
+        dtype=torch.float32,
     ).view(1, 5, 1, 1)
 
     train_shards, val_shards, genotype_map = _discover_all_shards(roots)
+
     if IS_MAIN_PROCESS:
         print(f"[Sharded NPY mode] roots={roots}")
         print(f"  Train shards: {len(train_shards)} | Val shards: {len(val_shards)}")
-        approx_train_samples = sum(int(s["num_samples"]) for s in train_shards) if train_shards else 0
-        approx_batches = (approx_train_samples // (args.batch_size * max(1, world_size))) if approx_train_samples > 0 else 0
+
+        approx_train_samples = (
+            sum(int(s["num_samples"]) for s in train_shards)
+            if train_shards
+            else 0
+        )
+
+        approx_batches = (
+            approx_train_samples // (args.batch_size * max(1, world_size))
+            if approx_train_samples > 0
+            else 0
+        )
+
         print(
             f"  Approx total train samples: {approx_train_samples:,} "
             f"({approx_batches:,} global batches @ batch_size={args.batch_size})"
