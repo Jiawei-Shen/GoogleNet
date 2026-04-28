@@ -6,7 +6,7 @@ import sys
 import gc
 import queue
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 import math
 
 import numpy as np
@@ -633,6 +633,7 @@ def train_model_sharded(
     best_recall_val_acc = float("-inf")
     best_recall_val_loss = float("inf")
     last_best_recall_ckpt_path = None
+    recall_window = deque(maxlen=5)
 
     if resume is not None and os.path.isfile(resume):
         try:
@@ -893,14 +894,16 @@ def train_model_sharded(
             )
         )
 
+        window_candidates = list(recall_window)
+        window_candidates.append((epoch + 1, val_rec_true, val_f1_true, val_loss, val_acc))
+        best_window_epoch, best_window_recall, best_window_f1, best_window_loss, best_window_acc = max(
+            window_candidates,
+            key=lambda item: (item[1], item[2], -item[3]),
+        )
+
         improved_recall = (
-            (val_rec_true > best_recall_true)
-            or (val_rec_true == best_recall_true and val_f1_true > best_recall_f1_true)
-            or (
-                val_rec_true == best_recall_true
-                and val_f1_true == best_recall_f1_true
-                and val_loss < best_recall_val_loss
-            )
+            (epoch + 1) == best_window_epoch
+            and (epoch + 1) >= MIN_SAVE_EPOCH
         )
 
         if (epoch + 1) == MIN_SAVE_EPOCH and IS_MAIN_PROCESS:
@@ -1019,7 +1022,7 @@ def train_model_sharded(
             last_best_recall_ckpt_path = best_recall_path
 
             print_and_log(
-                f"New BEST Recall @epoch {best_recall_epoch}: "
+                f"New BEST Recall in last 5 epochs @epoch {best_recall_epoch}: "
                 f"Rec(true) {best_recall_true*100:.2f}% | "
                 f"F1(true) {best_recall_f1_true:.4f} | "
                 f"Val Acc {best_recall_val_acc:.2f}% | "
@@ -1055,6 +1058,7 @@ def train_model_sharded(
                 except Exception as e:
                     print_and_log(f"Error saving best Recall validation results: {e}", log_file)
 
+        recall_window.append((epoch + 1, val_rec_true, val_f1_true, val_loss, val_acc))
         scheduler.step()
         print_and_log("-" * 30, log_file)
 
