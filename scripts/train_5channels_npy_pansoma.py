@@ -391,10 +391,7 @@ def evaluate_model(
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
 
-            if loss_type == "combined":
-                loss = criterion(outputs, labels, current_lr)
-            else:
-                loss = criterion(outputs, labels)
+            loss = criterion(outputs, labels)
 
             loss_sum += loss.detach()
             batch_count_eval += 1
@@ -496,6 +493,7 @@ def train_model_sharded(
     rank=0,
     resume=None,
     pos_weight=88.0,
+    gamma=2.0,
     genotype_map=None,
 ):
     os.makedirs(output_path, exist_ok=True)
@@ -582,12 +580,12 @@ def train_model_sharded(
         log_file,
     )
 
-    if loss_type == "combined":
-        criterion = CombinedFocalWeightedCELoss(
-            initial_lr=learning_rate,
-            pos_weight=class_weights,
+    if loss_type == "focal":
+        criterion = MultiClassFocalLoss(
+            gamma=gamma,
+            weight=class_weights,
         )
-        print_and_log("Using Combined(Focal + Weighted CE) Loss.", log_file)
+        print_and_log(f"Using Focal Loss (gamma={gamma}).", log_file)
     elif loss_type == "weighted_ce":
         criterion = nn.CrossEntropyLoss(weight=class_weights)
         print_and_log("Using Weighted CE Loss.", log_file)
@@ -734,30 +732,17 @@ def train_model_sharded(
                 optimizer.zero_grad(set_to_none=True)
                 outputs = model(images)
 
-                if loss_type == "combined":
-                    if isinstance(outputs, tuple) and len(outputs) == 3:
-                        main_output, aux1, aux2 = outputs
-                        loss = (
-                            criterion(main_output, labels, current_lr)
-                            + 0.3 * criterion(aux1, labels, current_lr)
-                            + 0.3 * criterion(aux2, labels, current_lr)
-                        )
-                        outputs_for_acc = main_output
-                    else:
-                        loss = criterion(outputs, labels, current_lr)
-                        outputs_for_acc = outputs
+                if isinstance(outputs, tuple) and len(outputs) == 3:
+                    main_output, aux1, aux2 = outputs
+                    loss = (
+                        criterion(main_output, labels)
+                        + 0.3 * criterion(aux1, labels)
+                        + 0.3 * criterion(aux2, labels)
+                    )
+                    outputs_for_acc = main_output
                 else:
-                    if isinstance(outputs, tuple) and len(outputs) == 3:
-                        main_output, aux1, aux2 = outputs
-                        loss = (
-                            criterion(main_output, labels)
-                            + 0.3 * criterion(aux1, labels)
-                            + 0.3 * criterion(aux2, labels)
-                        )
-                        outputs_for_acc = main_output
-                    else:
-                        loss = criterion(outputs, labels)
-                        outputs_for_acc = outputs
+                    loss = criterion(outputs, labels)
+                    outputs_for_acc = outputs
 
                 loss.backward()
                 optimizer.step()
@@ -1126,8 +1111,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--loss_type",
         type=str,
-        default="weighted_ce",
-        choices=["combined", "weighted_ce"],
+        default="focal",
+        choices=["focal", "weighted_ce"],
     )
 
     parser.add_argument("--training_data_ratio", type=float, default=1.0)
@@ -1138,6 +1123,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--pos_weight", type=float, default=88.0)
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=2.0,
+        help="Focal loss gamma parameter. Higher values focus more on hard examples. (default: 2.0)",
+    )
 
     args, _unknown = parser.parse_known_args()
 
@@ -1229,6 +1220,7 @@ if __name__ == "__main__":
         rank=rank,
         resume=args.resume,
         pos_weight=args.pos_weight,
+        gamma=args.gamma,
         genotype_map=genotype_map,
     )
 
