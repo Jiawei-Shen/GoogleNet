@@ -1094,8 +1094,8 @@ def main():
 
     # VCF outputs
     p.add_argument("--out_prefix", required=True,
-                   help="Output prefix. Files: <prefix>.linear.vcf.gz, <prefix>.all.vcf.gz, <prefix>.ref.vcf.gz")
-    p.add_argument("--emit", nargs="+", choices=["linear", "all", "ref"], default=["linear"],
+                   help="Output prefix. Files: <prefix>.linear.vcf.gz, <prefix>.all.vcf.gz, <prefix>.graph.vcf.gz")
+    p.add_argument("--emit", nargs="+", choices=["linear", "all", "graph"], default=["linear"],
                    help="Which VCF(s) to write. Default: linear.")
     p.add_argument("--sort", action="store_true", help="Sort VCF outputs (also enabled automatically for indexing).")
     p.add_argument("--no-index", action="store_true", help="Do not create Tabix indexes (.tbi).")
@@ -1120,9 +1120,9 @@ def main():
     want_index = (not args.no_index)
     want_sort = args.sort or want_index
 
-    needs_map = ("linear" in args.emit) or ("ref" in args.emit)
+    needs_map = ("linear" in args.emit) or ("graph" in args.emit)
     if needs_map and not args.map_json:
-        raise SystemExit("ERROR: --emit includes linear/ref, but --map_json was not provided.")
+        raise SystemExit("ERROR: --emit includes linear/graph, but --map_json was not provided.")
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1180,16 +1180,16 @@ def main():
 
     anchors: Dict[int, Tuple[str, int, str, int]] = {}
     nodes_seen: Set[int] = set()
-    ref_nodes_with_af: Set[int] = set()
+    nodes_with_genomead_af: Set[int] = set()
     alt_to_ref: Dict[int, int] = {}
 
     if needs_map:
-        anchors, nodes_seen, ref_nodes_with_af = load_node_map(
+        anchors, nodes_seen, nodes_with_genomead_af = load_node_map(
             args.map_json,
             jsonl=args.map_jsonl,
             node_start_is_1_based=args.node_start_is_1_based
         )
-        print(f"Node map loaded: anchors={len(anchors)}, nodes_seen={len(nodes_seen)}, ref_nodes={len(ref_nodes_with_af)}")
+        print(f"Node map loaded: anchors={len(anchors)}, nodes_seen={len(nodes_seen)}, genomead_af_nodes={len(nodes_with_genomead_af)}")
 
         if args.tsv:
             alt_to_ref, tsv_ref_nodes, tsv_alt_nodes = load_alt_to_ref_tsv(args.tsv)
@@ -1259,35 +1259,10 @@ def main():
         )
         print(f"[all]   {gz}" + (f"  (index: {tbi})" if tbi else ""))
 
-    if "ref" in args.emit:
-        if not ref_nodes_with_af:
-            print("WARNING: --emit ref requested but ref_nodes_with_af is empty (check --map_json).", file=sys.stderr)
-        ref_set = set(ref_nodes_with_af)
-        node_records_ref: List[Tuple[str, int, str, str, str, str, str, str]] = []
-        for r in node_records_all:
-            try:
-                nid = int(r[0])
-            except Exception:
-                continue
-            if nid in ref_set:
-                node_records_ref.append(r)
+    converted: List[Tuple[str, int, str, str, str, str, str, str]] = []
+    graph_records: List[Tuple[str, int, str, str, str, str, str, str]] = []
 
-        out_ref = out_prefix + ".ref.vcf.gz"
-        gz, tbi = write_vcf_bgzip(
-            records=node_records_ref,
-            out_vcfgz=out_ref,
-            meta_id="REF_NODE_ONLY",
-            extra_header_lines=None,
-            do_index=do_index,
-            sort_records=want_sort,
-            chrom_sort_mode="node",
-        )
-        print(f"[ref]   {gz}" + (f"  (index: {tbi})" if tbi else "") + f"  (records={len(node_records_ref)})")
-
-    if "linear" in args.emit:
-        converted: List[Tuple[str, int, str, str, str, str, str, str]] = []
-        unconverted_n = 0
-
+    if ("linear" in args.emit) or ("graph" in args.emit):
         for nr in node_records_all:
             lin = convert_node_record_to_linear(
                 node_rec=nr,
@@ -1296,10 +1271,24 @@ def main():
                 offset_is_0_based=args.offset_is_0_based,
             )
             if lin is None:
-                unconverted_n += 1
-                continue
-            converted.append(lin)
+                graph_records.append(nr)
+            else:
+                converted.append(lin)
 
+    if "graph" in args.emit:
+        out_graph = out_prefix + ".graph.vcf.gz"
+        gz, tbi = write_vcf_bgzip(
+            records=graph_records,
+            out_vcfgz=out_graph,
+            meta_id="GRAPH_NODE_ONLY",
+            extra_header_lines=None,
+            do_index=do_index,
+            sort_records=want_sort,
+            chrom_sort_mode="node",
+        )
+        print(f"[graph] {gz}" + (f"  (index: {tbi})" if tbi else "") + f"  (records={len(graph_records)})")
+
+    if "linear" in args.emit:
         if not converted:
             print("WARNING: No records could be converted to linear coordinates (anchors missing?).", file=sys.stderr)
 
@@ -1314,7 +1303,7 @@ def main():
             chrom_sort_mode="linear",
         )
         print(f"[linear] {gz}" + (f"  (index: {tbi})" if tbi else "") +
-              f"  (records={len(converted)}, dropped_unconverted={unconverted_n})")
+              f"  (records={len(converted)}, graph_unconverted={len(graph_records)})")
 
     print("\nDone.")
 

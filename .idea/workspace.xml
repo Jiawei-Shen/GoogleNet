@@ -6,7 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="8da3181b-7f23-4ab2-b5ab-9300d9b110e8" name="Changes" comment="Update">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/scripts/train_5channels_npy_pansoma.py" beforeDir="false" afterPath="$PROJECT_DIR$/scripts/train_5channels_npy_pansoma.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -82,7 +81,7 @@
       <updated>1775764264926</updated>
       <workItem from="1775764265930" duration="3191000" />
       <workItem from="1777391815675" duration="7571000" />
-      <workItem from="1777407098339" duration="2788000" />
+      <workItem from="1777407098339" duration="11306000" />
     </task>
     <task id="LOCAL-00001" summary="Update">
       <option name="closed" value="true" />
